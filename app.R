@@ -203,21 +203,28 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     observe({
       req(!inputs_initialized())
       req(expr, meta_cell)
-      req(active_tab() == embedding_name)
+    
       isolate({
-          numeric_markers <- colnames(expr)
-          meta_cols <- setdiff(colnames(meta_cell), c(".cell"))
-          cont_choices <- meta_cols[sapply(meta_cell[meta_cols], is.numeric)]
-          unit_candidates <- intersect(c("PatientID", "patient_ID", "patient", "source", "RunDate", "run_date"), colnames(meta_cell))
-          unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
-          updatePickerInput(session, "color_by", choices = c(numeric_markers, meta_cols), selected = numeric_markers[1])
-          updatePickerInput(session, "split_by", choices = c("", meta_cols), selected = "")
-          updatePickerInput(session, "group_var", choices = meta_cols)
-          updatePickerInput(session, "cont_var", choices = cont_choices)
-          updatePickerInput(session, "unit_var", choices = meta_cols, selected = unit_default)
-          message(sprintf("Picker inputs initialized for %s", embedding_name))
-          inputs_initialized(TRUE)
-        })
+        numeric_markers <- colnames(expr)
+        meta_cols <- setdiff(colnames(meta_cell), c(".cell"))
+        cont_choices <- meta_cols[sapply(meta_cell[meta_cols], is.numeric)]
+        unit_candidates <- intersect(
+          c("PatientID", "patient_ID", "patient", "source", "RunDate", "run_date"),
+          colnames(meta_cell)
+        )
+        unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
+    
+        updatePickerInput(session, "color_by",
+                          choices = c(numeric_markers, meta_cols),
+                          selected = numeric_markers[1])
+        updatePickerInput(session, "split_by", choices = c("", meta_cols), selected = "")
+        updatePickerInput(session, "group_var", choices = meta_cols)
+        updatePickerInput(session, "cont_var", choices = cont_choices)
+        updatePickerInput(session, "unit_var", choices = meta_cols, selected = unit_default)
+    
+        message(sprintf("Picker inputs initialized for %s", embedding_name))
+        inputs_initialized(TRUE)
+      })
     })
     
     observe({
@@ -751,6 +758,7 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
 
 
 
