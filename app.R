@@ -260,12 +260,14 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     ns <- session$ns
     
     # Build plotting dataframe defensively
+    # Build plotting dataframe defensively, with downsampling for rendering
+    # Build plotting dataframe defensively, with downsampling for rendering
     df <- reactive({
-      coords_val <- coords()
-      expr_val <- expr()
-      meta_val <- meta_cell()
-      clusters_val <- clusters()
-      cluster_map_val <- cluster_map()
+      coords_val       <- coords()
+      expr_val         <- expr()
+      meta_val         <- meta_cell()
+      clusters_val     <- clusters()
+      cluster_map_val  <- cluster_map()
       
       req(!is.null(coords_val))
       dd <- as.data.frame(coords_val)
@@ -277,8 +279,11 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       }
       
       names(dd)[1:2] <- c("x", "y")
+      
+      # IMPORTANT: .cell = original row number BEFORE downsampling
       dd$.cell <- seq_len(nrow(dd))
       
+      # Add cluster and celltype columns
       if (!is.null(clusters_val) && !is.null(clusters_val$assignments)) {
         if (length(clusters_val$assignments) == nrow(dd)) {
           dd$cluster <- clusters_val$assignments
@@ -300,7 +305,15 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         dd$celltype <- as.character(dd$cluster)
       }
       
-      message(sprintf("[%s] df(): built with rows=%s", embedding_name, nrow(dd)))
+      # ---- Downsample for plotting only ----
+      if (nrow(dd) > 100000) {
+        set.seed(123)  # reproducible sampling
+        keep_idx <- sample.int(nrow(dd), 100000)
+        dd <- dd[keep_idx, , drop = FALSE]
+        message(sprintf("[%s] df(): downsampled to %d rows for plotting",
+                        embedding_name, nrow(dd)))
+      }
+      
       tibble::as_tibble(dd)
     })
     
@@ -339,21 +352,20 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       }
     )
     
-    output$embed_plot <- renderPlotly({
-      message(sprintf("Tab: %s | input$color_by: %s",
-                      active_tab(), input$color_by %||% "NULL"))
-      message(sprintf("renderPlotly triggered for %s", embedding_name))
-      
-      # Only render when the corresponding tab is active
-      req(active_tab() == embedding_name)
-      
-      # Pull current values from reactives
+    # Cache the plot so it doesn't rebuild on tab switch
+    plot_cache <- reactiveVal(NULL)
+    
+    # Helper: clip values to reference distribution percentiles (1%–99%)
+    clip_to_ref <- function(values, ref, probs = c(0.01, 0.99)) {
+      qs <- stats::quantile(ref, probs = probs, na.rm = TRUE)
+      pmin(pmax(values, qs[1]), qs[2])
+    }
+    
+    # Rebuild plot when data or relevant inputs change
+    observeEvent(list(df(), expr(), meta_cell(), input$color_by, input$gate_mode, input$overlay_gate), {
       expr_val <- expr()
       meta_val <- meta_cell()
-      coords_val <- coords()
-      
-      # Require core data
-      req(expr_val, meta_val, coords_val)
+      req(expr_val, meta_val)
       
       # Pick a default color_by if NULL or invalid
       numeric_markers <- colnames(expr_val)
@@ -366,32 +378,46 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         message(sprintf("color_by was NULL/invalid — defaulting to: %s", color_by))
       }
       
-      # Build df safely
       dd <- df()
-      message(sprintf("[%s] render: df rows=%s", embedding_name, nrow(dd)))
       if (nrow(dd) == 0 || all(is.na(dd$x)) || all(is.na(dd$y))) {
         message("Empty or invalid coordinates in df()")
-        return(
+        plot_cache(
           plotly_empty(type = "scatter", mode = "markers", source = ns("embed")) %>%
             layout(
               xaxis = list(title = paste0(embedding_name, " 1")),
               yaxis = list(title = paste0(embedding_name, " 2"))
             )
         )
+        return()
       }
       
-      # Color mapping
+      # ----- Color mapping with correct alignment -----
+      # We always index by dd$.cell for plotted points,
+      # but compute palettes/domains from the full vectors for stability.
+      
       if (color_by %in% colnames(expr_val)) {
-        vals <- expr_val[, color_by]
-        cols <- col_numeric(viridis(256), domain = range(vals, na.rm = TRUE))(pct_clip(vals))
+        vals_full <- expr_val[, color_by]
+        vals_plot <- vals_full[dd$.cell]
+        
+        # Use full distribution for domain/clipping, apply to plotted subset
+        vals_plot_clipped <- clip_to_ref(vals_plot, vals_full)
+        dom <- range(clip_to_ref(vals_full, vals_full), na.rm = TRUE)
+        scale_num <- col_numeric(viridis(256), domain = dom)
+        cols <- scale_num(vals_plot_clipped)
+        
       } else {
-        vals <- meta_val[[color_by]]
-        if (is.numeric(vals)) {
-          cols <- col_numeric(viridis(256), domain = range(vals, na.rm = TRUE))(vals)
+        vals_full <- meta_val[[color_by]]
+        vals_plot <- vals_full[dd$.cell]
+        
+        if (is.numeric(vals_full)) {
+          vals_plot_clipped <- clip_to_ref(vals_plot, vals_full)
+          dom <- range(clip_to_ref(vals_full, vals_full), na.rm = TRUE)
+          scale_num <- col_numeric(viridis(256), domain = dom)
+          cols <- scale_num(vals_plot_clipped)
         } else {
-          levs <- unique(as.character(vals))
+          levs <- unique(as.character(vals_full))  # palette from full set
           pal <- setNames(viridis(max(2, length(levs))), levs)
-          cols <- pal[as.character(vals)]
+          cols <- pal[as.character(vals_plot)]
         }
       }
       
@@ -410,8 +436,37 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           dragmode = if (input$gate_mode == "Lasso select") "lasso" else "zoom"
         )
       
-      p
+      # Optional: overlay gates (unchanged)
+      gl <- gate_store$list()
+      og <- input$overlay_gate
+      if (length(gl) && length(og)) {
+        for (nm in og) {
+          g <- gl[[nm]]
+          if (!is.null(g) && !is.null(g$polygon) && g$embedding == embedding_name) {
+            p <- p %>% layout(
+              shapes = c(
+                p$x$layout$shapes,
+                list(
+                  type = "path",
+                  path = paste0("M ", paste(paste(g$polygon$x, g$polygon$y, sep=","), collapse = " L "), " Z"),
+                  line = list(color = g$color, width = 2)
+                )
+              )
+            )
+          }
+        }
+      }
+      
+      plot_cache(p)
     })
+    
+    output$embed_plot <- renderPlotly({
+      req(plot_cache())
+      plot_cache()
+    })
+    
+    # Keep the plot alive when hidden
+    outputOptions(output, "embed_plot", suspendWhenHidden = FALSE)
     
     # Ensure the plot renders even when the tab is hidden (prevents some init races)
     outputOptions(output, "embed_plot", suspendWhenHidden = FALSE)
@@ -647,7 +702,6 @@ server <- function(input, output, session) {
     if ("shinyAppInput" %in% ls(e)) {
       obj <- e$shinyAppInput
     } else {
-      # Try to find an object with the expected structure
       candidates <- ls(e)
       found <- FALSE
       for (nm in candidates) {
@@ -664,7 +718,15 @@ server <- function(input, output, session) {
       }
     }
     
-    obj <- e$shinyAppInput
+    if('tsne' %in% names(obj)) {
+      if (is.matrix(obj$tsne$coordinates))
+        obj$tsne$coordinates <- as.data.frame(obj$tsne$coordinates)
+    }
+    if('umap' %in% names(obj)) {
+      if (is.matrix(obj$umap$coordinates))
+        obj$umap$coordinates <- as.data.frame(obj$umap$coordinates)
+    }
+    
     validateInput(obj, id_col = NULL)
     
     # Guess ID column and merge metadata immediately
