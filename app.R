@@ -198,6 +198,10 @@ EmbeddingUI <- function(id, title = "UMAP") {
 # ---- Embedding module server ----
 EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, clusters, cluster_map, gate_store, active_tab, rv) {
   moduleServer(id, function(input, output, session) {
+    message(sprintf("EmbeddingServer %s started", embedding_name))
+    message(sprintf("coords NULL? %s | expr NULL? %s | meta_cell NULL? %s",
+                    is.null(coords), is.null(expr), is.null(meta_cell)))
+    
     inputs_initialized <- reactiveVal(FALSE)
 
     session$onFlushed(function() {
@@ -212,7 +216,9 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         colnames(meta_cell)
       )
       unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
-    
+
+      message(sprintf("[%s] onFlushed: expr cols=%d, meta_cell cols=%d",
+                embedding_name, ncol(expr), ncol(meta_cell)))
       updatePickerInput(session, "color_by",
                         choices = c(numeric_markers, meta_cols),
                         selected = numeric_markers[1])
@@ -232,18 +238,41 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     
     ns <- session$ns
     df <- reactive({
-      req(!is.null(coords))  # added
-      req(nrow(coords) == nrow(meta_cell), nrow(coords) == nrow(expr))
-      out <- tibble::as_tibble(coords)
-      names(out)[1:2] <- c("x","y")
-      out$.cell <- seq_len(nrow(out))
-      out$cluster <- clusters$assignments
-      out$celltype <- if (!is.null(cluster_map)) {
-        cluster_map$celltype[match(out$cluster, cluster_map$cluster)]
-      } else {
-        as.character(out$cluster)
+      req(!is.null(coords))
+      dd <- as.data.frame(coords)
+    
+      if (ncol(dd) < 2 || nrow(dd) == 0) {
+        message(sprintf("[%s] df(): coords invalid — ncol=%s nrow=%s",
+                        embedding_name, ncol(dd), nrow(dd)))
+        return(tibble::tibble(x = numeric(0), y = numeric(0), .cell = integer(0)))
       }
-      out
+    
+      names(dd)[1:2] <- c("x", "y")
+      dd$.cell <- seq_len(nrow(dd))
+    
+      if (!is.null(clusters) && !is.null(clusters$assignments)) {
+        if (length(clusters$assignments) == nrow(dd)) {
+          dd$cluster <- clusters$assignments
+        } else {
+          message(sprintf("[%s] df(): cluster length=%s != nrow(coords)=%s",
+                          embedding_name, length(clusters$assignments), nrow(dd)))
+          dd$cluster <- NA_integer_
+        }
+      } else {
+        dd$cluster <- NA_integer_
+      }
+    
+      if (!is.null(cluster_map) &&
+          all(c("cluster", "celltype") %in% names(cluster_map))) {
+        dd$celltype <- as.character(cluster_map$celltype[
+          match(dd$cluster, cluster_map$cluster)
+        ])
+      } else {
+        dd$celltype <- as.character(dd$cluster)
+      }
+    
+      message(sprintf("[%s] df(): built with rows=%s", embedding_name, nrow(dd)))
+      tibble::as_tibble(dd)
     })
     
     # observe({
@@ -333,6 +362,19 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     
       # Build df safely
       dd <- df()
+      message(sprintf("[%s] render: df rows=%s", embedding_name, nrow(dd)))
+      if (nrow(dd) == 0 || all(is.na(dd$x)) || all(is.na(dd$y))) {
+        message("Empty or invalid coordinates in df()")
+        return(
+          plotly_empty(type = "scatter", mode = "markers", source = ns("embed")) %>%
+            layout(
+              xaxis = list(title = paste0(embedding_name, " 1")),
+              yaxis = list(title = paste0(embedding_name, " 2"))
+            )
+        )
+      }
+
+
       if (nrow(dd) == 0 || all(is.na(dd$x)) || all(is.na(dd$y))) {
         message("Empty or invalid coordinates in df()")
         return(
@@ -523,6 +565,10 @@ server <- function(input, output, session) {
     rep_used = NULL
   )
   gate_store <- GateStore()
+
+  observeEvent(input$main_tab, {
+    message("Tab changed to: ", input$main_tab)
+  })
   
   observeEvent(input$rdata_upload, {
     req(input$rdata_upload)
@@ -578,12 +624,17 @@ server <- function(input, output, session) {
     rv$cluster_heat <- cluster_heat
     rv$pop_size <- pop_size
     rv$rep_used <- rep_used
-
+    message("Upload complete: expr rows=", nrow(rv$expr),
+        " meta_cell rows=", nrow(rv$meta_cell),
+        " UMAP coords=", if (!is.null(rv$UMAP)) nrow(rv$UMAP$coords) else "NULL",
+        " tSNE coords=", if (!is.null(rv$tSNE)) nrow(rv$tSNE$coords) else "NULL")
+    
     # Launch embedding modules immediately
     if (!is.null(rv$UMAP) && !is.null(rv$UMAP$coords)) {
       EmbeddingServer("umap", "UMAP", rv$UMAP$coords, rv$expr, rv$meta_cell,
                       rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
     }
+    
     if (!is.null(rv$tSNE) && !is.null(rv$tSNE$coords)) {
       EmbeddingServer("tsne", "tSNE", rv$tSNE$coords, rv$expr, rv$meta_cell,
                       rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
@@ -709,6 +760,7 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
 
 
 
