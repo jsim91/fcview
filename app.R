@@ -228,13 +228,18 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     # One-time picker initialization in a reactive context
     initialized <- FALSE
     
-    observeEvent(list(expr(), meta_cell()), ignoreInit = FALSE, {
+    observeEvent(list(expr(), meta_cell(), clusters()), ignoreInit = FALSE, {
       if (initialized) return()
-      # Data is ready; populate pickers
-      expr_val <- expr()
-      meta_val <- meta_cell()
+      expr_val     <- expr()
+      meta_val     <- meta_cell()
+      clusters_val <- clusters()
       
       req(!is.null(expr_val), !is.null(meta_val))
+      
+      # Add leiden_cluster column as factor
+      if (!"leiden_cluster" %in% colnames(meta_val) && !is.null(clusters_val$assignments)) {
+        meta_val$leiden_cluster <- factor(clusters_val$assignments)
+      }
       
       numeric_markers <- colnames(expr_val)
       meta_cols <- setdiff(colnames(meta_val), c(".cell"))
@@ -259,8 +264,6 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     
     ns <- session$ns
     
-    # Build plotting dataframe defensively
-    # Build plotting dataframe defensively, with downsampling for rendering
     # Build plotting dataframe defensively, with downsampling for rendering
     df <- reactive({
       coords_val       <- coords()
@@ -271,6 +274,18 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       
       req(!is.null(coords_val))
       dd <- as.data.frame(coords_val)
+      
+      coords_full <- as.data.frame(coords())
+      names(coords_full)[1:2] <- c("UMAP1", "UMAP2")
+      coords_full$cluster <- factor(clusters()$assignments)  # factor for discrete colors
+      
+      color_text_add <- coords_full %>%
+        group_by(cluster) %>%
+        summarise(
+          UMAP1 = mean(UMAP1, na.rm = TRUE),
+          UMAP2 = mean(UMAP2, na.rm = TRUE),
+          .groups = "drop"
+        )
       
       if (ncol(dd) < 2 || nrow(dd) == 0) {
         message(sprintf("[%s] df(): coords invalid — ncol=%s nrow=%s",
@@ -362,103 +377,144 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     }
     
     # Rebuild plot when data or relevant inputs change
-    observeEvent(list(df(), expr(), meta_cell(), input$color_by, input$gate_mode, input$overlay_gate), {
-      expr_val <- expr()
-      meta_val <- meta_cell()
-      req(expr_val, meta_val)
-      
-      # Pick a default color_by if NULL or invalid
-      numeric_markers <- colnames(expr_val)
-      meta_cols <- colnames(meta_val)
-      valid_cols <- c(numeric_markers, meta_cols)
-      
-      color_by <- input$color_by
-      if (is.null(color_by) || !(color_by %in% valid_cols)) {
-        color_by <- if (length(numeric_markers)) numeric_markers[1] else meta_cols[1]
-        message(sprintf("color_by was NULL/invalid — defaulting to: %s", color_by))
-      }
-      
-      dd <- df()
-      if (nrow(dd) == 0 || all(is.na(dd$x)) || all(is.na(dd$y))) {
-        message("Empty or invalid coordinates in df()")
-        plot_cache(
-          plotly_empty(type = "scatter", mode = "markers", source = ns("embed")) %>%
-            layout(
-              xaxis = list(title = paste0(embedding_name, " 1")),
-              yaxis = list(title = paste0(embedding_name, " 2"))
-            )
-        )
-        return()
-      }
-      
-      # ----- Color mapping with correct alignment -----
-      # We always index by dd$.cell for plotted points,
-      # but compute palettes/domains from the full vectors for stability.
-      
-      if (color_by %in% colnames(expr_val)) {
-        vals_full <- expr_val[, color_by]
-        vals_plot <- vals_full[dd$.cell]
+    observeEvent(
+      list(df(), expr(), meta_cell(), clusters(), input$color_by, input$gate_mode, input$overlay_gate),
+      {
+        expr_val     <- expr()
+        meta_val     <- meta_cell()
+        clusters_val <- clusters()
+        req(expr_val, meta_val, clusters_val)
         
-        # Use full distribution for domain/clipping, apply to plotted subset
-        vals_plot_clipped <- clip_to_ref(vals_plot, vals_full)
-        dom <- range(clip_to_ref(vals_full, vals_full), na.rm = TRUE)
-        scale_num <- col_numeric(viridis(256), domain = dom)
-        cols <- scale_num(vals_plot_clipped)
+        # --- Ensure leiden_cluster is available in meta_val for coloring ---
+        if (!"leiden_cluster" %in% colnames(meta_val) && !is.null(clusters_val$assignments)) {
+          meta_val$leiden_cluster <- factor(clusters_val$assignments)
+        }
         
-      } else {
-        vals_full <- meta_val[[color_by]]
-        vals_plot <- vals_full[dd$.cell]
+        # Pick a default color_by if NULL or invalid
+        numeric_markers <- colnames(expr_val)
+        meta_cols       <- colnames(meta_val)
+        valid_cols      <- c(numeric_markers, meta_cols)
         
-        if (is.numeric(vals_full)) {
+        color_by <- input$color_by
+        if (is.null(color_by) || !(color_by %in% valid_cols)) {
+          color_by <- if (length(numeric_markers)) numeric_markers[1] else meta_cols[1]
+          message(sprintf("color_by was NULL/invalid — defaulting to: %s", color_by))
+        }
+        
+        dd <- df()
+        if (nrow(dd) == 0 || all(is.na(dd$x)) || all(is.na(dd$y))) {
+          message("Empty or invalid coordinates in df()")
+          plot_cache(
+            plotly_empty(type = "scatter", mode = "markers", source = ns("embed")) %>%
+              layout(
+                xaxis = list(title = paste0(embedding_name, " 1")),
+                yaxis = list(title = paste0(embedding_name, " 2"))
+              )
+          )
+          return()
+        }
+        
+        # ----- Color mapping with correct alignment -----
+        if (color_by %in% colnames(expr_val)) {
+          vals_full <- expr_val[, color_by]
+          vals_plot <- vals_full[dd$.cell]
           vals_plot_clipped <- clip_to_ref(vals_plot, vals_full)
           dom <- range(clip_to_ref(vals_full, vals_full), na.rm = TRUE)
-          scale_num <- col_numeric(viridis(256), domain = dom)
-          cols <- scale_num(vals_plot_clipped)
-        } else {
-          levs <- unique(as.character(vals_full))  # palette from full set
-          pal <- setNames(viridis(max(2, length(levs))), levs)
+          cols <- col_numeric(viridis(256), domain = dom)(vals_plot_clipped)
+          
+        } else if (color_by == "leiden_cluster") {
+          vals_full <- factor(clusters_val$assignments)
+          vals_plot <- vals_full[dd$.cell]
+          levs <- levels(vals_full)
+          pal  <- setNames(viridis(max(2, length(levs))), levs)
           cols <- pal[as.character(vals_plot)]
-        }
-      }
-      
-      # Plot
-      p <- plot_ly(
-        data = dd,
-        x = ~x, y = ~y,
-        type = "scatter", mode = "markers",
-        marker = list(color = cols, size = 3),
-        source = ns("embed"),
-        customdata = ~.cell
-      ) %>%
-        layout(
-          xaxis = list(title = paste0(embedding_name, " 1")),
-          yaxis = list(title = paste0(embedding_name, " 2")),
-          dragmode = if (input$gate_mode == "Lasso select") "lasso" else "zoom"
-        )
-      
-      # Optional: overlay gates (unchanged)
-      gl <- gate_store$list()
-      og <- input$overlay_gate
-      if (length(gl) && length(og)) {
-        for (nm in og) {
-          g <- gl[[nm]]
-          if (!is.null(g) && !is.null(g$polygon) && g$embedding == embedding_name) {
-            p <- p %>% layout(
-              shapes = c(
-                p$x$layout$shapes,
-                list(
-                  type = "path",
-                  path = paste0("M ", paste(paste(g$polygon$x, g$polygon$y, sep=","), collapse = " L "), " Z"),
-                  line = list(color = g$color, width = 2)
-                )
-              )
-            )
+          
+        } else if (color_by == "leiden_cluster") {
+          vals_full <- factor(clusters()$assignments)
+          vals_plot <- vals_full[dd$.cell]
+          levs <- levels(vals_full)
+          pal  <- setNames(viridis(max(2, length(levs))), levs)
+          cols <- pal[as.character(vals_plot)]
+        } else {
+          vals_full <- meta_val[[color_by]]
+          vals_plot <- vals_full[dd$.cell]
+          if (is.numeric(vals_full)) {
+            vals_plot_clipped <- clip_to_ref(vals_plot, vals_full)
+            dom <- range(clip_to_ref(vals_full, vals_full), na.rm = TRUE)
+            cols <- col_numeric(viridis(256), domain = dom)(vals_plot_clipped)
+          } else {
+            levs <- unique(as.character(vals_full))
+            pal  <- setNames(viridis(max(2, length(levs))), levs)
+            cols <- pal[as.character(vals_plot)]
           }
         }
-      }
-      
-      plot_cache(p)
-    })
+        
+        # Base scatter plot
+        p <- plot_ly(
+          data = dd,
+          x = ~x, y = ~y,
+          type = "scatter", mode = "markers",
+          marker = list(color = cols, size = 3),
+          source = ns("embed"),
+          customdata = ~.cell
+        ) %>%
+          layout(
+            xaxis = list(title = paste0(embedding_name, " 1")),
+            yaxis = list(title = paste0(embedding_name, " 2")),
+            dragmode = if (input$gate_mode == "Lasso select") "lasso" else "zoom"
+          )
+        
+        # --- Cluster centroid labels (computed from full coords) ---
+        coords_full <- as.data.frame(coords())
+        names(coords_full)[1:2] <- c("x", "y")
+        coords_full$cluster <- clusters_val$assignments
+        
+        label_df <- coords_full %>%
+          group_by(cluster) %>%
+          summarise(
+            x = mean(x, na.rm = TRUE),
+            y = mean(y, na.rm = TRUE),
+            .groups = "drop"
+          )
+        
+        p <- p %>%
+          add_text(
+            data = label_df,
+            x = ~x, y = ~y,
+            text = ~as.character(cluster),
+            textposition = "middle center",
+            showlegend = FALSE,
+            inherit = FALSE,
+            textfont = list(color = "black", size = 14)
+          )
+        
+        # Overlay gates (unchanged)
+        gl <- gate_store$list()
+        og <- input$overlay_gate
+        if (length(gl) && length(og)) {
+          for (nm in og) {
+            g <- gl[[nm]]
+            if (!is.null(g) && !is.null(g$polygon) && g$embedding == embedding_name) {
+              p <- p %>% layout(
+                shapes = c(
+                  p$x$layout$shapes,
+                  list(
+                    type = "path",
+                    path = paste0(
+                      "M ",
+                      paste(paste(g$polygon$x, g$polygon$y, sep = ","), collapse = " L "),
+                      " Z"
+                    ),
+                    line = list(color = g$color, width = 2)
+                  )
+                )
+              )
+            }
+          }
+        }
+        
+        plot_cache(p)
+      })
     
     output$embed_plot <- renderPlotly({
       req(plot_cache())
