@@ -200,60 +200,30 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
   moduleServer(id, function(input, output, session) {
     inputs_initialized <- reactiveVal(FALSE)
 
-    observe({
-      req(!inputs_initialized())
+    session$onFlushed(function() {
+      if (isTRUE(inputs_initialized())) return()
       req(expr, meta_cell)
     
-      isolate({
-        numeric_markers <- colnames(expr)
-        meta_cols <- setdiff(colnames(meta_cell), c(".cell"))
-        cont_choices <- meta_cols[sapply(meta_cell[meta_cols], is.numeric)]
-        unit_candidates <- intersect(
-          c("PatientID", "patient_ID", "patient", "source", "RunDate", "run_date"),
-          colnames(meta_cell)
-        )
-        unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
+      numeric_markers <- colnames(expr)
+      meta_cols <- setdiff(colnames(meta_cell), c(".cell"))
+      cont_choices <- meta_cols[sapply(meta_cell[meta_cols], is.numeric)]
+      unit_candidates <- intersect(
+        c("PatientID", "patient_ID", "patient", "source", "RunDate", "run_date"),
+        colnames(meta_cell)
+      )
+      unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
     
-        updatePickerInput(session, "color_by",
-                          choices = c(numeric_markers, meta_cols),
-                          selected = numeric_markers[1])
-        updatePickerInput(session, "split_by", choices = c("", meta_cols), selected = "")
-        updatePickerInput(session, "group_var", choices = meta_cols)
-        updatePickerInput(session, "cont_var", choices = cont_choices)
-        updatePickerInput(session, "unit_var", choices = meta_cols, selected = unit_default)
+      updatePickerInput(session, "color_by",
+                        choices = c(numeric_markers, meta_cols),
+                        selected = numeric_markers[1])
+      updatePickerInput(session, "split_by", choices = c("", meta_cols), selected = "")
+      updatePickerInput(session, "group_var", choices = meta_cols)
+      updatePickerInput(session, "cont_var", choices = cont_choices)
+      updatePickerInput(session, "unit_var", choices = meta_cols, selected = unit_default)
     
-        message(sprintf("Picker inputs initialized for %s", embedding_name))
-        inputs_initialized(TRUE)
-      })
-    })
-    
-    observe({
-      req(!inputs_initialized())
-      req(expr, meta_cell)
-      
-      isolate({
-        numeric_markers <- colnames(expr)
-        meta_cols <- setdiff(colnames(meta_cell), c(".cell"))
-        cont_choices <- meta_cols[sapply(meta_cell[meta_cols], is.numeric)]
-        unit_candidates <- intersect(
-          c("PatientID", "patient_ID", "patient", "source", "RunDate", "run_date"),
-          colnames(meta_cell)
-        )
-        unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
-        
-        updatePickerInput(session, "color_by",
-                          choices = c(numeric_markers, meta_cols),
-                          selected = numeric_markers[1])
-        updatePickerInput(session, "split_by", choices = c("", meta_cols), selected = "")
-        updatePickerInput(session, "group_var", choices = meta_cols)
-        updatePickerInput(session, "cont_var", choices = cont_choices)
-        updatePickerInput(session, "unit_var", choices = meta_cols, selected = unit_default)
-        
-        message(sprintf("Picker inputs initialized for %s", embedding_name))
-        inputs_initialized(TRUE)
-      })
-    })
-    
+      message(sprintf("Picker inputs initialized for %s (onFlushed)", embedding_name))
+      inputs_initialized(TRUE)
+    }, once = TRUE)
     
     ui_ready <- reactive({
       input$color_by  # Will be NULL until the UI is rendered
@@ -262,6 +232,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     
     ns <- session$ns
     df <- reactive({
+      req(!is.null(coords))  # added
       req(nrow(coords) == nrow(meta_cell), nrow(coords) == nrow(expr))
       out <- tibble::as_tibble(coords)
       names(out)[1:2] <- c("x","y")
@@ -339,46 +310,40 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     )
     
     output$embed_plot <- renderPlotly({
-      message(sprintf("Tab: %s | input$color_by: %s", active_tab(), input$color_by %||% "NULL"))
-      
+      message(sprintf("Tab: %s | input$color_by: %s",
+                      active_tab(), input$color_by %||% "NULL"))
       message(sprintf("renderPlotly triggered for %s", embedding_name))
-      message(sprintf("color_by: %s", input$color_by))
-      message(sprintf("df rows: %d", nrow(df())))
-      message(sprintf("df x range: [%f, %f]", min(df()$x, na.rm = TRUE), max(df()$x, na.rm = TRUE)))
-      message(sprintf("df y range: [%f, %f]", min(df()$y, na.rm = TRUE), max(df()$y, na.rm = TRUE)))
-      message(sprintf("Rendering plot for %s with color_by: %s", embedding_name, input$color_by))
-      
-      if (is.null(input$color_by)) {
-        message("input$color_by is NULL — skipping plot render")
-        return(NULL)
-      }
-      
+    
       # Only render when the corresponding tab is active
       req(active_tab() == embedding_name)
-      req(expr, meta_cell, coords, input$color_by)
-      
+    
+      # Require core data
+      req(expr, meta_cell, coords)
+    
+      # Pick a default color_by if NULL or invalid
+      numeric_markers <- colnames(expr)
+      meta_cols <- colnames(meta_cell)
+      valid_cols <- c(numeric_markers, meta_cols)
+    
       color_by <- input$color_by
-      
-      # Validate color_by column
-      valid_cols <- c(colnames(expr), colnames(meta_cell))
-      message(sprintf("Is color_by valid? %s", color_by %in% valid_cols))
-      message(sprintf("Valid columns: %s", paste(valid_cols, collapse = ", ")))
-      message(sprintf("input$color_by: %s", color_by))
-      if (!(color_by %in% valid_cols)) {
-        message("Invalid color_by:", color_by)
-        return(plotly_empty(type = "scatter", mode = "markers", source = ns("embed")) %>%
-                 layout(xaxis = list(title = paste0(embedding_name, "1")),
-                        yaxis = list(title = paste0(embedding_name, "2"))))
+      if (is.null(color_by) || !(color_by %in% valid_cols)) {
+        color_by <- if (length(numeric_markers)) numeric_markers[1] else meta_cols[1]
+        message(sprintf("color_by was NULL/invalid — defaulting to: %s", color_by))
       }
-      
+    
+      # Build df safely
       dd <- df()
       if (nrow(dd) == 0 || all(is.na(dd$x)) || all(is.na(dd$y))) {
         message("Empty or invalid coordinates in df()")
-        return(plotly_empty(type = "scatter", mode = "markers", source = ns("embed")) %>%
-                 layout(xaxis = list(title = paste0(embedding_name, "1")),
-                        yaxis = list(title = paste0(embedding_name, "2"))))
+        return(
+          plotly_empty(type = "scatter", mode = "markers", source = ns("embed")) %>%
+            layout(
+              xaxis = list(title = paste0(embedding_name, " 1")),
+              yaxis = list(title = paste0(embedding_name, " 2"))
+            )
+        )
       }
-      
+    
       # Colors
       if (color_by %in% colnames(expr)) {
         vals <- expr[, color_by]
@@ -393,41 +358,23 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           cols <- pal[as.character(vals)]
         }
       }
-      
-      # Create base plot
-      p <- plot_ly(source = ns("embed"), type = "scattergl", mode = "markers",
-                   x = dd$x, y = dd$y, customdata = dd$.cell,
-                   marker = list(size = 4, color = cols, opacity = 0.85)) %>%
-        layout(xaxis = list(title = paste0(embedding_name, "1")),
-               yaxis = list(title = paste0(embedding_name, "2")),
-               dragmode = if (input$gate_mode == "Lasso select") "lasso" else "zoom")
-      
-      # Overlay gates
-      glist <- gate_store$list()
-      if (length(glist) > 0) {
-        overlay_names <- input$overlay_gate
-        active <- if (length(overlay_names)) glist[names(glist) %in% overlay_names] else list()
-        for (g in active) {
-          idx <- dd$.cell %in% g$cells
-          p <- add_trace(p, x = dd$x[idx], y = dd$y[idx], type = "scattergl", mode = "markers",
-                         marker = list(size = 5, color = g$color, opacity = 0.95),
-                         name = g$name, inherit = FALSE, showlegend = TRUE)
-        }
-      }
-      
-      # Add draw tools
-      mode_buttons <- if (input$gate_mode == "Draw polygon") {
-        c("drawclosedpath", "eraseshape", "lasso2d", "select2d", "toImage")
-      } else c("lasso2d", "select2d", "toImage")
-      
-      p <- config(p, modeBarButtonsToAdd = mode_buttons, edits = list(shapePosition = TRUE))
-      
-      # Optional: log rendering
-      message(sprintf("Rendering plot for %s with color_by: %s", embedding_name, color_by))
-      
-      return(p)
-    })
     
+      # Plot
+      plot_ly(
+        data = dd,
+        x = ~x, y = ~y,
+        type = "scatter", mode = "markers",
+        marker = list(color = cols, size = 3),
+        source = ns("embed"),
+        customdata = ~.cell
+      ) %>%
+        layout(
+          xaxis = list(title = paste0(embedding_name, " 1")),
+          yaxis = list(title = paste0(embedding_name, " 2")),
+          dragmode = if (input$gate_mode == "Lasso select") "lasso" else "zoom"
+        )
+    })
+
     # Ensure the plot renders even when the tab is hidden
     outputOptions(output, "embed_plot", suspendWhenHidden = FALSE)
     
@@ -633,10 +580,14 @@ server <- function(input, output, session) {
     rv$rep_used <- rep_used
 
     # Launch embedding modules immediately
-    EmbeddingServer("umap", "UMAP", rv$UMAP$coords, rv$expr, rv$meta_cell,
-                    rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
-    EmbeddingServer("tsne", "tSNE", rv$tSNE$coords, rv$expr, rv$meta_cell,
-                    rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
+    if (!is.null(rv$UMAP) && !is.null(rv$UMAP$coords)) {
+      EmbeddingServer("umap", "UMAP", rv$UMAP$coords, rv$expr, rv$meta_cell,
+                      rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
+    }
+    if (!is.null(rv$tSNE) && !is.null(rv$tSNE$coords)) {
+      EmbeddingServer("tsne", "tSNE", rv$tSNE$coords, rv$expr, rv$meta_cell,
+                      rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
+    }
 
     # Set default color_by
     valid_cols <- c(colnames(expr), colnames(meta_cell))
@@ -758,6 +709,7 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
 
 
 
