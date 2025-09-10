@@ -544,8 +544,7 @@ server <- function(input, output, session) {
     tSNE = NULL,
     cluster_heat = NULL,
     pop_size = NULL,
-    rep_used = NULL,
-    id_col = NULL
+    rep_used = NULL
   )
   gate_store <- GateStore()
   
@@ -730,4 +729,5 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
 
