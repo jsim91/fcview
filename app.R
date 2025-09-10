@@ -494,9 +494,6 @@ ui <- navbarPage("CyTOF Explorer", id = "main_tab",
                               fileInput("rdata_upload", "Upload .RData (contains shinyAppInput)", accept = ".RData"),
                               fileInput("json_upload", "Upload gates (.json)", accept = ".json"),
                               hr(),
-                              uiOutput("id_column_ui"),
-                              actionButton("apply_id_mapping", "Apply ID mapping"),
-                              hr(),
                               h4("Gate export"),
                               uiOutput("gate_export_ui"),
                               downloadButton("export_gates", "Download selected gates (.json)"),
@@ -552,78 +549,51 @@ server <- function(input, output, session) {
   )
   gate_store <- GateStore()
   
-  # Handle RData upload
   observeEvent(input$rdata_upload, {
     req(input$rdata_upload)
     e <- new.env(parent = emptyenv())
     load(input$rdata_upload$datapath, envir = e)
     if (!"shinyAppInput" %in% ls(e)) {
-      showNotification("No object named 'shinyAppInput' found in the .RData", type = "error")
-      return()
+        showNotification("No object named 'shinyAppInput' found", type = "error")
+        return()
     }
     obj <- e$shinyAppInput
-    # Try to guess ID column now; do initial validation without id_col name requirement
     validateInput(obj, id_col = NULL)
-    rv$obj <- obj
-    
-    # Suggest ID column mapping
+
+    # Guess ID column and merge metadata immediately
     guessed <- guess_id_col(obj$metadata, obj$source)
-    rv$id_col <- guessed
-    
-    showNotification(paste0("Loaded shinyAppInput. Guessed ID column: ", guessed %||% "none"), type = "message")
-  }, ignoreInit = FALSE)
-  
-  # UI to choose metadata ID column to match `source`
-  output$id_column_ui <- renderUI({
-    req(rv$obj)
-    selectInput("id_col_select", "Metadata ID column matching 'source'",
-                choices = colnames(rv$obj$metadata), selected = rv$id_col %||% colnames(rv$obj$metadata)[1])
-  })
-  
-  # Apply ID mapping and construct app datasets
-  observeEvent(input$apply_id_mapping, {
-    req(rv$obj)
-    id_col <- input$id_col_select
-    validateInput(rv$obj, id_col = id_col)
-    
-    expr <- rv$obj$data
-    source_vec <- rv$obj$source
-    run_date <- rv$obj$run_date %||% NULL
-    meta <- rv$obj$metadata
-    
-    meta_cell <- data.frame(
-      source = source_vec,
-      RunDate = if (!is.null(run_date)) run_date else NA
-    )
+    id_col <- guessed %||% colnames(obj$metadata)[1]
+
+    expr <- obj$data
+    source_vec <- obj$source
+    run_date <- obj$run_date %||% NULL
+
+    meta_cell <- data.frame(source = source_vec,
+                            RunDate = if (!is.null(run_date)) run_date else NA)
     colnames(meta_cell)[1] <- "source"
     meta_cell <- meta_cell %>%
-      left_join(meta %>% mutate(.__id = .data[[id_col]]), by = c("source" = ".__id"))
-    
+        left_join(obj$metadata %>% mutate(.__id = .data[[id_col]]),
+                  by = c("source" = ".__id"))
+
     if (!("PatientID" %in% names(meta_cell))) {
-      meta_cell$PatientID <- meta_cell$source
+        meta_cell$PatientID <- meta_cell$source
     }
-    if ("patient_ID" %in% names(meta_cell) && !"patient_ID" %in% c("source","PatientID")) {
-      # keep original too
+    if ("RunDate" %in% names(meta_cell)) {
+        meta_cell$RunDate <- as.factor(meta_cell$RunDate)
     }
-    if ("RunDate" %in% names(meta_cell)) meta_cell$RunDate <- as.factor(meta_cell$RunDate)
-    
-    clusters <- list(assignments = rv$obj$leiden$clusters,
-                     settings = rv$obj$leiden$settings %||% list())
-    cluster_map <- if (hasClusterMapping(rv$obj)) rv$obj$cluster_mapping else NULL
-    
-    UMAP <- if (hasUMAP(rv$obj)) {
-      list(coords = rv$obj$umap$coordinates, settings = rv$obj$umap$settings)
-    } else NULL
-    
-    tSNE <- if (hasTSNE(rv$obj)) {
-      list(coords = rv$obj$tsne$coordinates, settings = rv$obj$tsne$settings)
-    } else NULL
-    
-    cluster_heat <- if (hasHeatmap(rv$obj)) rv$obj$leiden_heatmap$heatmap_tile_data else NULL
-    pop_size <- if (hasHeatmap(rv$obj)) rv$obj$leiden_heatmap$population_size else NULL
-    rep_used <- if (hasHeatmap(rv$obj)) rv$obj$leiden_heatmap$rep_used else NA
-    
-    # Store
+
+    clusters <- list(assignments = obj$leiden$clusters,
+                     settings = obj$leiden$settings %||% list())
+    cluster_map <- if (hasClusterMapping(obj)) obj$cluster_mapping else NULL
+    UMAP <- if (hasUMAP(obj)) list(coords = obj$umap$coordinates,
+                                   settings = obj$umap$settings) else NULL
+    tSNE <- if (hasTSNE(obj)) list(coords = obj$tsne$coordinates,
+                                   settings = obj$tsne$settings) else NULL
+    cluster_heat <- if (hasHeatmap(obj)) obj$leiden_heatmap$heatmap_tile_data else NULL
+    pop_size <- if (hasHeatmap(obj)) obj$leiden_heatmap$population_size else NULL
+    rep_used <- if (hasHeatmap(obj)) obj$leiden_heatmap$rep_used else NA
+
+    # Store in rv
     rv$expr <- expr
     rv$meta_cell <- meta_cell
     rv$clusters <- clusters
@@ -633,16 +603,18 @@ server <- function(input, output, session) {
     rv$cluster_heat <- cluster_heat
     rv$pop_size <- pop_size
     rv$rep_used <- rep_used
-    
-    EmbeddingServer("umap", "UMAP", rv$UMAP$coords, rv$expr, rv$meta_cell, rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
-    EmbeddingServer("tsne", "tSNE", rv$tSNE$coords, rv$expr, rv$meta_cell, rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
-    
-    # ✅ Reset color_by to a valid default
+
+    # Launch embedding modules immediately
+    EmbeddingServer("umap", "UMAP", rv$UMAP$coords, rv$expr, rv$meta_cell,
+                    rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
+    EmbeddingServer("tsne", "tSNE", rv$tSNE$coords, rv$expr, rv$meta_cell,
+                    rv$clusters, rv$cluster_map, gate_store, reactive(input$main_tab), rv)
+
+    # Set default color_by
     valid_cols <- c(colnames(expr), colnames(meta_cell))
-    default_color <- valid_cols[1]
-    updatePickerInput(session, "color_by", choices = valid_cols, selected = default_color)
-    
-    showNotification("Metadata mapping applied. App initialized.", type = "message")
+    updatePickerInput(session, "color_by", choices = valid_cols, selected = valid_cols[1])
+
+    showNotification("Data loaded and initialized.", type = "message")
   })
   
   # Gate JSON upload
@@ -758,3 +730,4 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
