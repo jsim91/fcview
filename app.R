@@ -1150,10 +1150,15 @@ server <- function(input, output, session) {
     # Round p and padj to 3 decimal places if they exist
     if ("p" %in% names(res))    res$p    <- round(res$p, 3)
     if ("padj" %in% names(res)) res$padj <- round(res$padj, 3)
+    if ("rho" %in% names(res))  res$rho  <- round(res$rho, 2)
     
-    # Ensure column order: entity, test, n, p, padj, then all *_IQR
+    # Ensure column order: entity, test, n, p, padj, rho (if present), then all *_IQR
     iqr_cols <- grep("_IQR$", names(res), value = TRUE)
-    res <- res[, c("entity", "test", "n", "p", "padj", iqr_cols), drop = FALSE]
+    base_cols <- c("entity", "test", "n", "p", "padj")
+    if ("rho" %in% names(res)) {
+      base_cols <- c(base_cols, "rho")
+    }
+    res <- res[, c(base_cols, iqr_cols), drop = FALSE]
     
     res
   })
