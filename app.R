@@ -24,8 +24,7 @@ suppressPackageStartupMessages({
   })
 })
 
-options(shiny.maxRequestSize = .Machine$integer.max) # allow large uploads; adjust as needed
-
+options(shiny.maxRequestSize = 100000 * 1024^2)
 
 # ---- Helpers & validation ----
 `%||%` <- function(a, b) if (!is.null(a)) a else b
