@@ -125,7 +125,9 @@ EmbeddingUI <- function(id, title = "UMAP") {
       ),
       column(
         9,
-        plotlyOutput(ns("embed_plot"), height = "650px")
+        plotlyOutput(ns("embed_plot"), height = "650px"), 
+        br(),
+        downloadButton(ns("export_embed_pdf"), "Export embedding as PDF")
       )
     ),
   )
@@ -642,7 +644,7 @@ ui <- navbarPage(
           choices = c("viridis", "heat", "greyscale"),
           selected = "viridis"
         ), 
-        br(), br(),
+        br(), 
         downloadButton("export_heatmap_pdf", "Export heatmap as PDF")
       ),
       column(
@@ -1024,68 +1026,6 @@ server <- function(input, output, session) {
     )
   }, sanitize.text.function = function(x) x)
   
-  # output$cluster_heatmap <- renderPlot({
-  #   req(rv$cluster_heat)
-  #   M <- rv$cluster_heat
-  #   
-  #   # Replace any newline characters in row and column names with a space
-  #   if (!is.null(rownames(M))) {
-  #     rownames(M) <- gsub("\\n", " ", rownames(M))
-  #   }
-  #   if (!is.null(colnames(M))) {
-  #     colnames(M) <- gsub("\\n", " ", colnames(M))
-  #   }
-  #   
-  #   ranno <- NULL
-  #   if (!is.null(rv$pop_size)) {
-  #     size_vals <- rv$pop_size[, 1]
-  #     size_col_fun <- circlize::colorRamp2(
-  #       c(min(size_vals, na.rm = TRUE),
-  #         max(size_vals, na.rm = TRUE)),
-  #       c("white", "red")
-  #     )
-  #     
-  #     ranno <- rowAnnotation(
-  #       Size = size_vals,
-  #       col = list(Size = size_col_fun),
-  #       gp = grid::gpar(col = "black", lwd = 0.5)  # black border
-  #     )
-  #   }
-  #   
-  #   palette_choice <- switch(
-  #     input$heatmap_theme,
-  #     "viridis" = {
-  #       circlize::colorRamp2(
-  #         c(min(M), median(M), max(M)),
-  #         viridis(3), 
-  #       )
-  #     }, 
-  #     "heat" = {
-  #       col_seq <- seq(min(M), max(M), length.out = n <- 100)
-  #       circlize::colorRamp2(
-  #         col_seq,
-  #         colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(n)
-  #       )
-  #     },
-  #     "greyscale" = {
-  #       circlize::colorRamp2(
-  #         c(min(M), median(M), max(M)),
-  #         c("black", "grey50", "white")
-  #       )
-  #     }
-  #   )
-  #   
-  #   Heatmap(
-  #     M,
-  #     name = "expr",
-  #     cluster_rows = isTRUE(input$cluster_rows),
-  #     cluster_columns = isTRUE(input$cluster_columns),
-  #     right_annotation = ranno,
-  #     row_names_side = "left",
-  #     rect_gp = gpar(lwd = 0.33, col = "black"), 
-  #     col = palette_choice
-  #   )
-  # })
   heatmap_obj <- reactive({
     req(rv$cluster_heat)
     M <- rv$cluster_heat
@@ -1112,20 +1052,24 @@ server <- function(input, output, session) {
     # Palette
     palette_choice <- switch(
       input$heatmap_theme,
-      "viridis" = circlize::colorRamp2(
-        c(min(M), median(M), max(M)), viridis(3)
-      ),
+      "viridis" = {
+        col_seq <- seq(min(M), max(M), length.out = n <- 256)
+        circlize::colorRamp2(col_seq, viridis(n))
+      },
       "heat" = {
-        col_seq <- seq(min(M), max(M), length.out = n <- 100)
+        col_seq <- seq(min(M), max(M), length.out = n <- 256)
         circlize::colorRamp2(
           col_seq,
           colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(n)
         )
       },
-      "greyscale" = circlize::colorRamp2(
-        c(min(M), median(M), max(M)),
-        c("black", "grey50", "white")
-      )
+      "greyscale" = {
+        col_seq <- seq(min(M), max(M), length.out = n <- 256)
+        circlize::colorRamp2(
+          col_seq,
+          colorRampPalette(c("black", "grey50", "white"))(n)
+        )
+      }
     )
     
     # Return the Heatmap object
@@ -1150,7 +1094,14 @@ server <- function(input, output, session) {
       paste0("cluster_heatmap_", Sys.Date(), ".pdf")
     },
     content = function(file) {
-      pdf(file, width = 8, height = 10)  # adjust size as needed
+      # Get the underlying matrix from your reactive
+      M <- rv$cluster_heat  # or heatmap_obj()$matrix if you store it there
+      
+      # Calculate dimensions using the same factors as fcs_plot_heatmap
+      pdf_width  <- (ncol(M) * 0.33) + 3.25
+      pdf_height <- (nrow(M) * 0.3)  + 2.25
+      
+      pdf(file, width = pdf_width, height = pdf_height)
       draw(heatmap_obj())
       dev.off()
     },
