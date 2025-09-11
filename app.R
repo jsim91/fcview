@@ -682,13 +682,16 @@ ui <- navbarPage(
                                  "Kruskal–Wallis (multi-group)",
                                  "Spearman (continuous)")),
         checkboxInput("apply_bh", "BH adjust across entities", TRUE),
-        actionButton("run_test", "Run tests"), 
+        actionButton("run_test", "Run tests"),
         br(), br(),
-        downloadButton("export_results", "Export results as CSV")
-      ),
-      column(
-        9,
-        tableOutput("test_table")
+        conditionalPanel(
+          condition = "output.hasResults",
+          downloadButton("export_results", "Export results as CSV")
+        ),
+        column(
+          9,
+          tableOutput("test_table")
+        )
       )
     )
   )
@@ -1057,6 +1060,12 @@ server <- function(input, output, session) {
     )
   })
   
+  output$hasResults <- reactive({
+    df <- run_tests()
+    !is.null(df) && nrow(df) > 0
+  })
+  outputOptions(output, "hasResults", suspendWhenHidden = FALSE)
+  
   run_tests <- eventReactive(input$run_test, {
     req(rv$meta_cell)
     test_type <- input$test_type
@@ -1253,15 +1262,15 @@ server <- function(input, output, session) {
     df
   }, sanitize.text.function = function(x) x)  # allow formatted strings
   
-  observe({
-    df <- run_tests()
-    has_data <- !is.null(df) && nrow(df) > 0
-    if (has_data) {
-      shinyjs::enable("export_results")
-    } else {
-      shinyjs::disable("export_results")
-    }
-  })
+  # observe({
+  #   df <- run_tests()
+  #   has_data <- !is.null(df) && nrow(df) > 0
+  #   if (has_data) {
+  #     shinyjs::enable("export_results")
+  #   } else {
+  #     shinyjs::disable("export_results")
+  #   }
+  # })
   
   output$export_results <- downloadHandler(
     filename = function() {
@@ -1275,7 +1284,8 @@ server <- function(input, output, session) {
     content = function(file) {
       df <- run_tests()
       req(!is.null(df), nrow(df) > 0)
-      write.csv(df, file, row.names = FALSE, fileEncoding = "UTF-8-BOM")
+      # Remove BOM (this was crashing your connection)
+      write.csv(df, file, row.names = FALSE)
     },
     contentType = "text/csv"
   )
