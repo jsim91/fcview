@@ -198,27 +198,27 @@ EmbeddingUI <- function(id, title = "UMAP") {
     #   )
     # ),
     # hr(),
-    h4("Abundance testing"),
-    fluidRow(
-      column(
-        4,
-        pickerInput(ns("test_entity"), "Entity",
-                    choices = c("Selected gate(s)", "Clusters", "Celltypes")),
-        pickerInput(ns("test_gate"), "Gate(s)", choices = NULL, multiple = TRUE),
-        pickerInput(ns("group_var"), "Grouping factor (metadata)", choices = NULL),
-        pickerInput(ns("cont_var"), "Continuous metadata", choices = NULL),
-        radioButtons(ns("test_type"), "Test",
-                     choices = c("Wilcoxon (2-group)","Kruskal–Wallis (multi-group)","Spearman (continuous)")),
-        pickerInput(ns("unit_var"), "Aggregation unit", choices = NULL),
-        checkboxInput(ns("apply_bh"), "BH adjust across entities", TRUE),
-        actionButton(ns("run_test"), "Run tests")
-      ),
-      column(
-        8,
-        plotOutput(ns("abund_plot"), height = "300px"),
-        tableOutput(ns("test_table"))
-      )
-    )
+    # h4("Abundance testing"),
+    # fluidRow(
+    #   column(
+    #     4,
+    #     pickerInput(ns("test_entity"), "Entity",
+    #                 choices = c("Selected gate(s)", "Clusters", "Celltypes")),
+    #     pickerInput(ns("test_gate"), "Gate(s)", choices = NULL, multiple = TRUE),
+    #     pickerInput(ns("group_var"), "Grouping factor (metadata)", choices = NULL),
+    #     pickerInput(ns("cont_var"), "Continuous metadata", choices = NULL),
+    #     radioButtons(ns("test_type"), "Test",
+    #                  choices = c("Wilcoxon (2-group)","Kruskal–Wallis (multi-group)","Spearman (continuous)")),
+    #     pickerInput(ns("unit_var"), "Aggregation unit", choices = NULL),
+    #     checkboxInput(ns("apply_bh"), "BH adjust across entities", TRUE),
+    #     actionButton(ns("run_test"), "Run tests")
+    #   ),
+    #   column(
+    #     8,
+    #     plotOutput(ns("abund_plot"), height = "300px"),
+    #     tableOutput(ns("test_table"))
+    #   )
+    # )
   )
 }
 
@@ -745,92 +745,6 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       updatePickerInput(session, "overlay_gate", choices = names(gate_store$list()))
       updatePickerInput(session, "phenotype_gate", choices = names(gate_store$list()))
     })
-    
-    # Abundance testing
-    run_tests <- eventReactive(input$run_test, {
-      unit_var <- req(input$unit_var)
-      group_var <- req(input$group_var)
-      test_type <- input$test_type
-      
-      if (input$test_entity == "Selected gate(s)") {
-        req(length(input$test_gate) > 0)
-        tests <- lapply(input$test_gate, function(gn) {
-          gate <- gate_store$list()[[gn]]
-          dfreq <- freq_by(gate$cells, meta_cell, group_var, unit_var)
-          
-          if (test_type == "Wilcoxon (2-group)") {
-            g <- droplevels(factor(dfreq[[group_var]]))
-            if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
-            wt <- wilcox.test(freq ~ g, data = dfreq)
-            data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = nrow(dfreq))
-          } else if (test_type == "Kruskal–Wallis (multi-group)") {
-            kw <- kruskal.test(freq ~ dfreq[[group_var]], data = dfreq)
-            data.frame(entity = gn, test = "kruskal", p = kw$p.value, n = nrow(dfreq))
-          } else {
-            cont <- req(input$cont_var)
-            ct <- spearman_test(dfreq %>% dplyr::rename(!!cont := dplyr::all_of(cont)),
-                                cont_var = cont)
-            cbind(data.frame(entity = gn, test = "spearman"), ct)
-          }
-        })
-        out <- do.call(rbind, tests)
-        if (nrow(out) && isTRUE(input$apply_bh) && "p" %in% colnames(out))
-          out$padj <- p.adjust(out$p, method = "BH")
-        out
-      } else {
-        # Entities: clusters or celltypes (derived from df())
-        ent_var <- if (input$test_entity == "Clusters") "cluster" else "celltype"
-        dd <- df()
-        dd$entity <- if (ent_var == "cluster") dd$cluster else dd$celltype
-        
-        # Convert per-cell to per-unit frequencies using gate membership logic (example placeholder)
-        # In practice you'd compute membership per entity; here we aggregate per unit
-        unit_levels <- unique(meta_cell[[unit_var]])
-        res <- lapply(unit_levels, function(u) {
-          idx <- which(meta_cell[[unit_var]] == u)
-          data.frame(unit = u,
-                     group = unique(meta_cell[[group_var]][idx])[1],
-                     freq = sum(!is.na(dd$entity[idx]))/length(idx))
-        })
-        dfreq <- do.call(rbind, res)
-        
-        if (test_type == "Wilcoxon (2-group)") {
-          g <- droplevels(factor(dfreq$group))
-          if (length(levels(g)) != 2) return(data.frame(entity = ent_var, test = "wilcox", p = NA, n = nrow(dfreq)))
-          wt <- wilcox.test(freq ~ g, data = dfreq)
-          data.frame(entity = ent_var, test = "wilcox", p = wt$p.value, n = nrow(dfreq))
-        } else if (test_type == "Kruskal–Wallis (multi-group)") {
-          kw <- kruskal.test(freq ~ dfreq$group, data = dfreq)
-          data.frame(entity = ent_var, test = "kruskal", p = kw$p.value, n = nrow(dfreq))
-        } else {
-          cont <- req(input$cont_var)
-          names(dfreq)[names(dfreq) == cont] <- "CONT"
-          ct <- spearman_test(dfreq, cont_var = "CONT")
-          cbind(data.frame(entity = ent_var, test = "spearman"), ct)
-        }
-      }
-    })
-    
-    output$abund_plot <- renderPlot({
-      res <- req(run_tests())
-      if (!nrow(res)) return(NULL)
-      if ("rho" %in% names(res)) {
-        ggplot(res, aes(x = n, y = rho, color = p)) +
-          geom_point() +
-          scale_color_viridis_c() +
-          theme_minimal() +
-          labs(title = "Spearman results", x = "N", y = "rho")
-      } else {
-        ggplot(res, aes(x = entity %||% "", y = -log10(p))) +
-          geom_col(fill = "#2c7fb8") +
-          theme_minimal() +
-          labs(title = "Abundance test -log10(p)", x = "", y = "-log10(p)")
-      }
-    })
-    
-    output$test_table <- renderTable({
-      req(run_tests())
-    })
   })
 }
 
@@ -887,6 +801,30 @@ ui <- navbarPage(
       column(
         9,
         plotOutput("cluster_heatmap", height = "650px")
+      )
+    ),
+    hr(),
+    h4("Abundance testing"),
+    fluidRow(
+      column(
+        4,
+        pickerInput("test_entity", "Entity",
+                    choices = c("Clusters", "Celltypes")),  # no "Selected gate(s)" unless you want it here
+        pickerInput("test_gate", "Gate(s)", choices = NULL, multiple = TRUE),
+        pickerInput("group_var", "Grouping factor (metadata)", choices = NULL),
+        pickerInput("cont_var", "Continuous metadata", choices = NULL),
+        radioButtons("test_type", "Test",
+                     choices = c("Wilcoxon (2-group)",
+                                 "Kruskal–Wallis (multi-group)",
+                                 "Spearman (continuous)")),
+        pickerInput("unit_var", "Aggregation unit", choices = NULL),
+        checkboxInput("apply_bh", "BH adjust across entities", TRUE),
+        actionButton("run_test", "Run tests")
+      ),
+      column(
+        8,
+        plotOutput("abund_plot", height = "300px"),
+        tableOutput("test_table")
       )
     )
   )
@@ -1045,6 +983,21 @@ server <- function(input, output, session) {
     showNotification("Data loaded and initialized.", type = "message")
   })
   
+  observe({
+    req(rv$meta_cell)
+    meta_cols <- colnames(rv$meta_cell)
+    cont_choices <- meta_cols[sapply(rv$meta_cell, is.numeric)]
+    unit_candidates <- intersect(
+      c("PatientID", "patient_ID", "patient", "source", "RunDate", "run_date"),
+      meta_cols
+    )
+    unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
+    
+    updatePickerInput(session, "group_var", choices = meta_cols)
+    updatePickerInput(session, "cont_var", choices = cont_choices)
+    updatePickerInput(session, "unit_var", choices = meta_cols, selected = unit_default)
+  })
+  
   # Launch embedding modules as soon as data is ready (Option 1)
   observeEvent(rv$UMAP, {
     req(rv$UMAP, rv$expr, rv$meta_cell, rv$clusters)
@@ -1167,6 +1120,92 @@ server <- function(input, output, session) {
       row_names_side = "left",
       col = colorRamp2(c(min(M), median(M), max(M)), viridis(3))
     )
+  })
+  
+  # Abundance testing
+  run_tests <- eventReactive(input$run_test, {
+    unit_var <- req(input$unit_var)
+    group_var <- req(input$group_var)
+    test_type <- input$test_type
+    
+    if (input$test_entity == "Selected gate(s)") {
+      req(length(input$test_gate) > 0)
+      tests <- lapply(input$test_gate, function(gn) {
+        gate <- gate_store$list()[[gn]]
+        dfreq <- freq_by(gate$cells, meta_cell, group_var, unit_var)
+        
+        if (test_type == "Wilcoxon (2-group)") {
+          g <- droplevels(factor(dfreq[[group_var]]))
+          if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
+          wt <- wilcox.test(freq ~ g, data = dfreq)
+          data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = nrow(dfreq))
+        } else if (test_type == "Kruskal–Wallis (multi-group)") {
+          kw <- kruskal.test(freq ~ dfreq[[group_var]], data = dfreq)
+          data.frame(entity = gn, test = "kruskal", p = kw$p.value, n = nrow(dfreq))
+        } else {
+          cont <- req(input$cont_var)
+          ct <- spearman_test(dfreq %>% dplyr::rename(!!cont := dplyr::all_of(cont)),
+                              cont_var = cont)
+          cbind(data.frame(entity = gn, test = "spearman"), ct)
+        }
+      })
+      out <- do.call(rbind, tests)
+      if (nrow(out) && isTRUE(input$apply_bh) && "p" %in% colnames(out))
+        out$padj <- p.adjust(out$p, method = "BH")
+      out
+    } else {
+      # Entities: clusters or celltypes (derived from df())
+      ent_var <- if (input$test_entity == "Clusters") "cluster" else "celltype"
+      dd <- df()
+      dd$entity <- if (ent_var == "cluster") dd$cluster else dd$celltype
+      
+      # Convert per-cell to per-unit frequencies using gate membership logic (example placeholder)
+      # In practice you'd compute membership per entity; here we aggregate per unit
+      unit_levels <- unique(meta_cell[[unit_var]])
+      res <- lapply(unit_levels, function(u) {
+        idx <- which(meta_cell[[unit_var]] == u)
+        data.frame(unit = u,
+                   group = unique(meta_cell[[group_var]][idx])[1],
+                   freq = sum(!is.na(dd$entity[idx]))/length(idx))
+      })
+      dfreq <- do.call(rbind, res)
+      
+      if (test_type == "Wilcoxon (2-group)") {
+        g <- droplevels(factor(dfreq$group))
+        if (length(levels(g)) != 2) return(data.frame(entity = ent_var, test = "wilcox", p = NA, n = nrow(dfreq)))
+        wt <- wilcox.test(freq ~ g, data = dfreq)
+        data.frame(entity = ent_var, test = "wilcox", p = wt$p.value, n = nrow(dfreq))
+      } else if (test_type == "Kruskal–Wallis (multi-group)") {
+        kw <- kruskal.test(freq ~ dfreq$group, data = dfreq)
+        data.frame(entity = ent_var, test = "kruskal", p = kw$p.value, n = nrow(dfreq))
+      } else {
+        cont <- req(input$cont_var)
+        names(dfreq)[names(dfreq) == cont] <- "CONT"
+        ct <- spearman_test(dfreq, cont_var = "CONT")
+        cbind(data.frame(entity = ent_var, test = "spearman"), ct)
+      }
+    }
+  })
+  
+  output$abund_plot <- renderPlot({
+    res <- req(run_tests())
+    if (!nrow(res)) return(NULL)
+    if ("rho" %in% names(res)) {
+      ggplot(res, aes(x = n, y = rho, color = p)) +
+        geom_point() +
+        scale_color_viridis_c() +
+        theme_minimal() +
+        labs(title = "Spearman results", x = "N", y = "rho")
+    } else {
+      ggplot(res, aes(x = entity %||% "", y = -log10(p))) +
+        geom_col(fill = "#2c7fb8") +
+        theme_minimal() +
+        labs(title = "Abundance test -log10(p)", x = "", y = "-log10(p)")
+    }
+  })
+  
+  output$test_table <- renderTable({
+    req(run_tests())
   })
 }
 
