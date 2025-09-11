@@ -1204,9 +1204,12 @@ server <- function(input, output, session) {
         if (test_type == "Wilcoxon (2-group)") {
           if (!nzchar(group_var)) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
           g <- droplevels(factor(dfreq[[group_var]]))
-          if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
-          wt <- wilcox.test(freq ~ g, data = dfreq)
-          data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = nrow(dfreq))
+          ok <- !is.na(g)
+          g <- g[ok]
+          freq_ok <- dfreq$freq[ok]
+          if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = sum(ok)))
+          wt <- wilcox.test(freq_ok ~ g)
+          data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = sum(ok))
           
         } else if (test_type == "Kruskal–Wallis (multi-group)") {
           if (!nzchar(group_var)) return(data.frame(entity = gn, test = "kruskal", p = NA, n = nrow(dfreq)))
@@ -1237,9 +1240,12 @@ server <- function(input, output, session) {
       }
       
       sources <- rownames(abund)
+      
+      # Escape IDs like in upload block
       ids <- unique(rv$meta_cell$patient_ID)
-      ids <- ids[order(nchar(ids), decreasing = TRUE)]
-      pattern <- paste0("(", paste0(ids, collapse = "|"), ")")
+      ids_escaped <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
+      ids_escaped <- ids_escaped[order(nchar(ids_escaped), decreasing = TRUE)]
+      pattern <- paste0("(", paste0(ids_escaped, collapse = "|"), ")")
       pid <- stringr::str_extract(sources, pattern)
       
       abund_df <- as.data.frame(abund)
@@ -1248,6 +1254,12 @@ server <- function(input, output, session) {
         dplyr::distinct(patient_ID, .keep_all = TRUE)
       abund_df <- abund_df %>%
         dplyr::left_join(meta_unique, by = "patient_ID")
+      
+      # Debug: check grouping variable presence
+      if (nzchar(input$group_var) && input$group_var %in% names(abund_df)) {
+        message("Grouping var head after join:")
+        print(utils::head(abund_df[, c("patient_ID", input$group_var)], 10))
+      }
       
       abund_long <- abund_df %>%
         tidyr::pivot_longer(cols = colnames(abund),
@@ -1260,9 +1272,12 @@ server <- function(input, output, session) {
           if (test_type == "Wilcoxon (2-group)") {
             if (!nzchar(input$group_var)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
             g <- droplevels(factor(.x[[input$group_var]]))
-            if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
-            wt <- wilcox.test(freq ~ g, data = .x)
-            data.frame(test = "wilcox", p = wt$p.value, n = nrow(.x))
+            ok <- !is.na(g)
+            g <- g[ok]
+            freq_ok <- .x$freq[ok]
+            if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
+            wt <- wilcox.test(freq_ok ~ g)
+            data.frame(test = "wilcox", p = wt$p.value, n = sum(ok))
             
           } else if (test_type == "Kruskal–Wallis (multi-group)") {
             if (!nzchar(input$group_var)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
