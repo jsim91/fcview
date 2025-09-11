@@ -1022,6 +1022,28 @@ server <- function(input, output, session) {
     pop_size     <- if (hasHeatmap(obj)) obj$leiden_heatmap$population_size else NULL
     rep_used     <- if (hasHeatmap(obj)) obj$leiden_heatmap$rep_used else NA
     
+    # Add abundance matrix if present and well-formed
+    if (!is.null(obj$leiden$abundance) && is.matrix(obj$leiden$abundance)) {
+      clusters$abundance <- obj$leiden$abundance
+      
+      # Strongly recommended: require rownames(sources) for mapping to metadata
+      if (is.null(rownames(clusters$abundance)) || any(!nzchar(rownames(clusters$abundance)))) {
+        showNotification(
+          "leiden$abundance has missing rownames; cannot map to metadata. Please set rownames to source strings.",
+          type = "error",
+          duration = NULL
+        )
+        message("Abundance matrix rownames are missing or empty; mapping to metadata will fail.")
+      } else {
+        message(sprintf("Abundance matrix loaded: %d sources × %d entities",
+                        nrow(clusters$abundance), ncol(clusters$abundance)))
+      }
+    } else {
+      showNotification("No leiden$abundance matrix found in upload; abundance testing will be disabled.", type = "warning")
+      message("No obj$leiden$abundance; rv$clusters$abundance will remain NULL.")
+    }
+    
+    
     # Store in rv
     rv$expr         <- expr
     rv$meta_cell    <- meta_cell
@@ -1191,7 +1213,7 @@ server <- function(input, output, session) {
   run_tests <- eventReactive(input$run_test, {
     test_type <- input$test_type
     
-    # --- Gate-based testing (unchanged) ---
+    # --- Gate-based testing (kept for completeness; only runs if enabled in UI) ---
     if (input$test_entity == "Selected gate(s)") {
       req(length(input$test_gate) > 0)
       unit_var  <- req(input$unit_var)
@@ -1205,8 +1227,7 @@ server <- function(input, output, session) {
           if (!nzchar(group_var)) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
           g <- droplevels(factor(dfreq[[group_var]]))
           ok <- !is.na(g)
-          g <- g[ok]
-          freq_ok <- dfreq$freq[ok]
+          g <- g[ok]; freq_ok <- dfreq$freq[ok]
           if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = sum(ok)))
           wt <- wilcox.test(freq_ok ~ g)
           data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = sum(ok))
@@ -1225,79 +1246,118 @@ server <- function(input, output, session) {
       })
       
       out <- do.call(rbind, tests)
-      if (nrow(out) && isTRUE(input$apply_bh) && "p" %in% colnames(out))
-        out$padj <- p.adjust(out$p, method = "BH")
-      out
+      if (nrow(out) && isTRUE(input$apply_bh) && "p" %in% colnames(out)) out$padj <- p.adjust(out$p, method = "BH")
+      return(out)
+    }
+    
+    # --- Cluster or celltype testing using abundance matrix ---
+    abund0 <- rv$clusters$abundance
+    
+    if (is.null(abund0)) {
+      showNotification("No abundance matrix available. Ensure obj$leiden$abundance is present in the upload.", type = "error", duration = NULL)
+      message("run_tests: rv$clusters$abundance is NULL; aborting.")
+      return(data.frame(entity = NA, test = NA, p = NA, n = NA))
+    }
+    if (is.null(rownames(abund0)) || any(!nzchar(rownames(abund0)))) {
+      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.", type = "error", duration = NULL)
+      message("run_tests: abundance rownames missing/empty; aborting.")
+      return(data.frame(entity = NA, test = NA, p = NA, n = NA))
+    }
+    
+    # Aggregate to celltypes if requested and mapping exists
+    abund <- abund0
+    if (input$test_entity == "Celltypes" &&
+        !is.null(rv$cluster_map) &&
+        all(c("cluster", "celltype") %in% names(rv$cluster_map))) {
       
-    } else {
-      # --- Cluster or celltype testing using abundance matrix ---
-      abund <- rv$clusters$abundance
-      req(!is.null(abund), nrow(abund) > 0)
-      
-      # If both group_var and cont_var are blank, return NA row
-      if (!nzchar(input$group_var) && !nzchar(input$cont_var)) {
+      cm <- rv$cluster_map
+      # Keep only mapped clusters that exist as columns
+      keep <- cm$cluster %in% colnames(abund)
+      cm <- cm[keep, , drop = FALSE]
+      if (!nrow(cm)) {
+        showNotification("No overlapping clusters to aggregate into celltypes.", type = "error")
         return(data.frame(entity = NA, test = NA, p = NA, n = NA))
       }
-      
-      sources <- rownames(abund)
-      
-      # Escape IDs like in upload block
-      ids <- unique(rv$meta_cell$patient_ID)
-      ids_escaped <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
-      ids_escaped <- ids_escaped[order(nchar(ids_escaped), decreasing = TRUE)]
-      pattern <- paste0("(", paste0(ids_escaped, collapse = "|"), ")")
-      pid <- stringr::str_extract(sources, pattern)
-      
-      abund_df <- as.data.frame(abund)
-      abund_df$patient_ID <- pid
-      meta_unique <- rv$meta_cell %>%
-        dplyr::distinct(patient_ID, .keep_all = TRUE)
-      abund_df <- abund_df %>%
-        dplyr::left_join(meta_unique, by = "patient_ID")
-      
-      # Debug: check grouping variable presence
-      if (nzchar(input$group_var) && input$group_var %in% names(abund_df)) {
-        message("Grouping var head after join:")
-        print(utils::head(abund_df[, c("patient_ID", input$group_var)], 10))
-      }
-      
-      abund_long <- abund_df %>%
-        tidyr::pivot_longer(cols = colnames(abund),
-                            names_to = "entity",
-                            values_to = "freq")
-      
-      res <- abund_long %>%
-        dplyr::group_by(entity) %>%
-        dplyr::group_modify(~ {
-          if (test_type == "Wilcoxon (2-group)") {
-            if (!nzchar(input$group_var)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
-            g <- droplevels(factor(.x[[input$group_var]]))
-            ok <- !is.na(g)
-            g <- g[ok]
-            freq_ok <- .x$freq[ok]
-            if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
-            wt <- wilcox.test(freq_ok ~ g)
-            data.frame(test = "wilcox", p = wt$p.value, n = sum(ok))
-            
-          } else if (test_type == "Kruskal–Wallis (multi-group)") {
-            if (!nzchar(input$group_var)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
-            kw <- kruskal.test(freq ~ .x[[input$group_var]], data = .x)
-            data.frame(test = "kruskal", p = kw$p.value, n = nrow(.x))
-            
-          } else {
-            if (!nzchar(input$cont_var)) return(data.frame(test = "spearman", rho = NA, p = NA, n = nrow(.x)))
-            cont <- input$cont_var
-            ct <- spearman_test(.x, cont_var = cont)
-            cbind(data.frame(test = "spearman"), ct)
-          }
-        }) %>%
-        dplyr::ungroup()
-      
-      if (nrow(res) && isTRUE(input$apply_bh) && "p" %in% colnames(res))
-        res$padj <- p.adjust(res$p, method = "BH")
-      
-      res
+      # Sum clusters per celltype
+      split_idx <- split(cm$cluster, cm$celltype)
+      abund <- sapply(split_idx, function(cols) rowSums(abund0[, cols, drop = FALSE]))
+      # Keep matrix shape
+      abund <- as.matrix(abund)
     }
+    
+    # If both group_var and cont_var are blank, return NA row (UI will show a message)
+    if (!nzchar(input$group_var) && !nzchar(input$cont_var)) {
+      return(data.frame(entity = NA, test = NA, p = NA, n = NA))
+    }
+    
+    # Map abundance rows (sources) to patient_ID via escaped regex
+    sources <- rownames(abund)
+    ids <- unique(rv$meta_cell$patient_ID)
+    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\
+
+\[\\]
+
+{}\\\\]
+
+)", "\\\\\\\\1")
+    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
+    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
+    pid <- stringr::str_extract(sources, pattern)
+    
+    abund_df <- as.data.frame(abund)
+    abund_df$patient_ID <- pid
+    
+    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
+    abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
+    
+    # Debug: confirm grouping column presence
+    if (nzchar(input$group_var)) {
+      gv <- input$group_var
+      if (!(gv %in% names(abund_df))) {
+        message("run_tests: grouping variable not found after join: ", gv)
+        showNotification(paste0("Grouping variable '", gv, "' not found after join."), type = "error")
+      } else {
+        message("run_tests: grouping var head after join:")
+        print(utils::head(abund_df[, c("patient_ID", gv)], 10))
+      }
+    }
+    
+    abund_long <- abund_df %>%
+      tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq")
+    
+    res <- abund_long %>%
+      dplyr::group_by(entity) %>%
+      dplyr::group_modify(~ {
+        if (test_type == "Wilcoxon (2-group)") {
+          if (!nzchar(input$group_var)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
+          g <- droplevels(factor(.x[[input$group_var]]))
+          ok <- !is.na(g)
+          g <- g[ok]; freq_ok <- .x$freq[ok]
+          if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
+          wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
+          data.frame(test = "wilcox", p = wt$p.value, n = sum(ok))
+          
+        } else if (test_type == "Kruskal–Wallis (multi-group)") {
+          if (!nzchar(input$group_var)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
+          g <- .x[[input$group_var]]
+          ok <- !is.na(g)
+          if (!any(ok)) return(data.frame(test = "kruskal", p = NA, n = 0))
+          kw <- kruskal.test(.x$freq[ok] ~ as.factor(g[ok]))
+          data.frame(test = "kruskal", p = kw$p.value, n = sum(ok))
+          
+        } else {
+          if (!nzchar(input$cont_var)) return(data.frame(test = "spearman", rho = NA, p = NA, n = nrow(.x)))
+          cont <- input$cont_var
+          ct <- spearman_test(.x, cont_var = cont)
+          cbind(data.frame(test = "spearman"), ct)
+        }
+      }) %>% dplyr::ungroup()
+    
+    if (nrow(res) && isTRUE(input$apply_bh) && "p" %in% colnames(res)) {
+      res$padj <- p.adjust(res$p, method = "BH")
+    }
+    
+    res
   })
   
   # --- Plot with message if no variable selected ---
