@@ -652,8 +652,8 @@ ui <- navbarPage(
     fluidRow(
       column(
         3,
-        pickerInput("cluster_order_by", "Order markers by",
-                    choices = c("variance","none"), selected = "variance")
+        checkboxInput("cluster_rows", "Cluster rows", value = TRUE),
+        checkboxInput("cluster_columns", "Cluster columns", value = TRUE)
       ),
       column(
         9,
@@ -667,8 +667,7 @@ ui <- navbarPage(
         3,
         pickerInput("test_entity", "Entity",
                     choices = c("Clusters", "Celltypes")),
-        pickerInput("group_var", "Grouping factor (metadata)",
-                    choices = NULL,
+        pickerInput("group_var", "Categorical metadata", choices = NULL,
                     options = list(`none-selected-text` = "None")), 
         pickerInput("cont_var", "Continuous metadata",
                     choices = NULL,
@@ -677,7 +676,6 @@ ui <- navbarPage(
                      choices = c("Wilcoxon (2-group)",
                                  "Kruskal–Wallis (multi-group)",
                                  "Spearman (continuous)")),
-        pickerInput("unit_var", "Aggregation unit", choices = NULL),
         checkboxInput("apply_bh", "BH adjust across entities", TRUE),
         actionButton("run_test", "Run tests")
       ),
@@ -930,27 +928,22 @@ server <- function(input, output, session) {
     }
   })
   
+  # Auto-detect categorical vs continuous metadata
   observe({
     req(rv$meta_cell)
-    
     meta_cols <- colnames(rv$meta_cell)
-    cont_choices <- meta_cols[sapply(rv$meta_cell, is.numeric)]
     
-    unit_candidates <- intersect(
-      c("PatientID", "patient_ID", "patient", "source", "RunDate", "run_date"),
-      meta_cols
-    )
-    unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
+    categorical_choices <- meta_cols[sapply(rv$meta_cell, function(x)
+      is.character(x) || is.factor(x)
+    )]
+    continuous_choices <- meta_cols[sapply(rv$meta_cell, function(x)
+      is.numeric(x) || is.integer(x)
+    )]
     
     updatePickerInput(session, "group_var",
-                      choices = c("", meta_cols),
-                      selected = "")
+                      choices = c("", categorical_choices), selected = "")
     updatePickerInput(session, "cont_var",
-                      choices = c("", cont_choices),
-                      selected = "")
-    updatePickerInput(session, "unit_var",
-                      choices = meta_cols,
-                      selected = unit_default)
+                      choices = c("", continuous_choices), selected = "")
   })
   
   # Launch embedding modules as soon as data is ready (Option 1)
@@ -1007,23 +1000,31 @@ server <- function(input, output, session) {
     )
   }, sanitize.text.function = function(x) x)
   
-  # Cluster phenotype heatmap
   output$cluster_heatmap <- renderPlot({
     req(rv$cluster_heat)
     M <- rv$cluster_heat
-    if (!is.null(input$cluster_order_by) && input$cluster_order_by == "variance") {
-      ord <- order(apply(M, 2, stats::var, na.rm = TRUE), decreasing = TRUE)
-      M <- M[, ord, drop = FALSE]
+    
+    # Replace any newline characters in row and column names with a space
+    if (!is.null(rownames(M))) {
+      rownames(M) <- gsub("\\n", " ", rownames(M))
     }
+    if (!is.null(colnames(M))) {
+      colnames(M) <- gsub("\\n", " ", colnames(M))
+    }
+    
     ranno <- NULL
     if (!is.null(rv$pop_size)) {
-      ranno <- rowAnnotation(Size = rv$pop_size[,1])
+      ranno <- rowAnnotation(Size = rv$pop_size[, 1])
     }
+    
     Heatmap(
-      M, name = "expr",
-      cluster_rows = TRUE, cluster_columns = TRUE,
+      M,
+      name = "expr",
+      cluster_rows = isTRUE(input$cluster_rows),
+      cluster_columns = isTRUE(input$cluster_columns),
       right_annotation = ranno,
       row_names_side = "left",
+      rect_gp = gpar(lwd = 0.33, col = "black"), 
       col = colorRamp2(c(min(M), median(M), max(M)), viridis(3))
     )
   })
