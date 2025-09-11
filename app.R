@@ -283,221 +283,110 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     }
     
     # Add split_by to triggers for this observer
-    observeEvent(list(df(), expr(), meta_cell(), input$color_by, input$max_facets, input$plot_facets), {
-      expr_val <- expr()
-      meta_val <- meta_cell()
-      req(expr_val, meta_val)
-      
-      numeric_markers <- colnames(expr_val)
-      meta_cols       <- colnames(meta_val)
-      valid_cols      <- c(numeric_markers, meta_cols)
-      
-      color_by <- input$color_by
-      if (is.null(color_by) || !(color_by %in% valid_cols)) {
-        color_by <- if (length(numeric_markers)) numeric_markers[1] else meta_cols[1]
-      }
-      
-      dd <- df()
-      if (nrow(dd) == 0 || all(is.na(dd$x)) || all(is.na(dd$y))) {
-        plot_cache_base(
-          plotly_empty(type = "scatter", mode = "markers", source = ns("embed")) %>%
-            layout(
-              xaxis = list(title = paste0(embedding_name, " 1")),
-              yaxis = list(title = paste0(embedding_name, " 2"))
-            )
-        )
-        return()
-      }
-      
-      # Colour mapping (unchanged)
-      if (color_by %in% colnames(expr_val)) {
-        vals_full <- expr_val[, color_by]
-        vals_plot <- vals_full[dd$.cell]
-        vals_plot_clipped <- clip_to_ref(vals_plot, vals_full)
-        dom <- range(clip_to_ref(vals_full, vals_full), na.rm = TRUE)
-        cols <- col_numeric(viridis(256), domain = dom)(vals_plot_clipped)
-      } else {
-        vals_full <- meta_val[[color_by]]
-        vals_plot <- vals_full[dd$.cell]
-        if (is.numeric(vals_full)) {
-          vals_plot_clipped <- clip_to_ref(vals_plot, vals_full)
-          dom <- range(clip_to_ref(vals_full, vals_full), na.rm = TRUE)
-          cols <- col_numeric(viridis(256), domain = dom)(vals_plot_clipped)
-        } else {
-          levs <- unique(as.character(vals_full))
-          pal  <- setNames(viridis(max(2, length(levs))), levs)
-          cols <- pal[as.character(vals_plot)]
-        }
-      }
-      
-      # handle split_by
-      split_var <- input$split_by
-      if (!is.null(split_var) && nzchar(split_var)) {
-        # Attach split var to plotting data
-        dd[[split_var]] <- meta_val[[split_var]][dd$.cell]
+    observeEvent(
+      list(df(), expr(), meta_cell(), input$color_by, input$max_facets, input$plot_facets),
+      {
+        expr_val <- expr()
+        meta_val <- meta_cell()
+        req(expr_val, meta_val)
         
-        # Filter to selected categories (if provided)
-        shown_levels <- input$split_levels
-        if (!is.null(shown_levels) && length(shown_levels) > 0) {
-          dd <- dd[dd[[split_var]] %in% shown_levels, , drop = FALSE]
-        }
+        numeric_markers <- colnames(expr_val)
+        meta_cols <- colnames(meta_val)
+        valid_cols <- c(numeric_markers, meta_cols)
         
-        # Drop NAs and empty levels
-        dd <- dd[!is.na(dd[[split_var]]), , drop = FALSE]
-        dd[[split_var]] <- droplevels(as.factor(dd[[split_var]]))
-        
-        # Guard: nothing left after filtering
-        if (nrow(dd) == 0 || length(levels(dd[[split_var]])) == 0) {
-          plot_cache_base(NULL)
-          plot_cache(NULL)
-          showNotification("No data points available for the selected facet categories.", type = "error")
-          return()
-        }
-        
-        # --- Balanced downsampling across shown, nonempty facets ---
-        max_total <- input$max_cells_upload %||% 100000
-        
-        # Count only nonempty facets
-        facet_counts <- table(dd[[split_var]])
-        empty_levels <- names(facet_counts)[facet_counts == 0]
-        
-        # If any selected facets are empty, drop them and notify
-        if (length(empty_levels) > 0) {
-          dd <- dd[!(dd[[split_var]] %in% empty_levels), , drop = FALSE]
-          dd[[split_var]] <- droplevels(dd[[split_var]])
-          showNotification(
-            paste0("Dropped empty facet categories: ", paste(empty_levels, collapse = ", ")),
-            type = "warning"
-          )
-          facet_counts <- table(dd[[split_var]])  # recompute after drop
-        }
-        
-        n_facets <- length(facet_counts)
-        
-        # Guard: all selected facets ended up empty
-        if (n_facets == 0) {
-          plot_cache_base(NULL)
-          plot_cache(NULL)
-          showNotification("No nonempty facet categories to plot after filtering.", type = "error")
-          return()
-        }
-        
-        # Target per facet from nonempty categories
-        target_per_facet <- floor(max_total / n_facets)
-        
-        # Do not exceed the sparsest nonempty facet
-        min_facet_size <- min(facet_counts)
-        target_per_facet <- min(target_per_facet, min_facet_size)
-        
-        # Guard: target 0 means at least one chosen facet has 0 points after prior downsample
-        if (target_per_facet < 1) {
-          showNotification(
-            "Selected facets have too few points to plot. Try including more categories or reducing filters.",
-            type = "error"
-          )
-          plot_cache_base(NULL)
-          plot_cache(NULL)
-          return()
-        }
-        
-        # Sample the same number from each remaining facet
-        set.seed(123)
-        dd <- dd %>%
-          group_by(.data[[split_var]]) %>%
-          slice_sample(n = target_per_facet) %>%
-          ungroup()
-        
-        # Guard: ensure we still have data
-        if (nrow(dd) == 0) {
-          plot_cache_base(NULL)
-          plot_cache(NULL)
-          showNotification("No data to plot after balanced sampling.", type = "error")
-          return()
-        }
-        
-        # --- Color variable ---
         color_by <- input$color_by
-        if (color_by %in% colnames(expr_val)) {
-          dd[[color_by]] <- expr_val[, color_by][dd$.cell]
-        } else {
-          dd[[color_by]] <- meta_val[[color_by]][dd$.cell]
+        if (is.null(color_by) || !(color_by %in% valid_cols)) {
+          color_by <- if (length(numeric_markers)) numeric_markers[1] else meta_cols[1]
         }
         
-        # Choose scale
-        if (is.numeric(dd[[color_by]])) {
-          color_scale <- scale_color_viridis_c()
-        } else {
-          color_scale <- scale_color_viridis_d()
-        }
-        
-        # Build faceted plot
-        p_base <- ggplot(dd, aes(x = x, y = y, color = .data[[color_by]])) +
-          ggrastr::geom_point_rast(size = 0.25, alpha = 0.25) +
-          guides(color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
-          facet_wrap(as.formula(paste("~", split_var)), ncol = as.numeric(input$max_facets)) +
-          color_scale +
-          theme_minimal() +
-          theme(legend.position = "right") +
-          labs(
-            x = paste0(embedding_name, " 1"),
-            y = paste0(embedding_name, " 2"),
-            color = color_by
+        dd <- df()
+        if (nrow(dd) == 0 || all(is.na(dd$x)) || all(is.na(dd$y))) {
+          plot_cache_base(
+            plotly_empty(type = "scatter", mode = "markers", source = ns("embed")) %>%
+              layout(
+                xaxis = list(title = paste0(embedding_name, " 1")),
+                yaxis = list(title = paste0(embedding_name, " 2"))
+              )
           )
+          return()
+        }
         
-        # Optional: convert to plotly
-        p_base <- plotly::ggplotly(p_base)
-      } else {
-        # Original single‑panel scatter
-        p_base <- plot_ly(
-          data = dd,
-          x = ~x, y = ~y,
-          type = "scatter", mode = "markers",
-          marker = list(color = cols, size = 3),
-          source = ns("embed"),
-          customdata = ~.cell
-        ) %>%
-          layout(
+        # handle split_by
+        split_var <- input$split_by
+        if (!is.null(split_var) && nzchar(split_var)) {
+          dd[[split_var]] <- meta_val[[split_var]][dd$.cell]
+          shown_levels <- input$split_levels
+          if (!is.null(shown_levels) && length(shown_levels) > 0) {
+            dd <- dd[dd[[split_var]] %in% shown_levels, , drop = FALSE]
+          }
+          dd <- dd[!is.na(dd[[split_var]]), , drop = FALSE]
+          dd[[split_var]] <- droplevels(as.factor(dd[[split_var]]))
+          if (nrow(dd) == 0) {
+            plot_cache_base(NULL); plot_cache(NULL)
+            showNotification("No data points available for the selected facet categories.", type = "error")
+            return()
+          }
+          
+          # Balanced downsampling
+          max_total <- input$max_cells_upload %||% 100000
+          facet_counts <- table(dd[[split_var]])
+          n_facets <- length(facet_counts)
+          target_per_facet <- floor(max_total / n_facets)
+          target_per_facet <- min(target_per_facet, min(facet_counts))
+          if (target_per_facet < 1) {
+            showNotification("Selected facets have too few points to plot.", type = "error")
+            plot_cache_base(NULL); plot_cache(NULL)
+            return()
+          }
+          set.seed(123)
+          dd <- dd %>% group_by(.data[[split_var]]) %>% slice_sample(n = target_per_facet) %>% ungroup()
+          
+          # Build ggplot faceted
+          gg <- ggplot(dd, aes(x = x, y = y, color = .data[[color_by]])) +
+            ggrastr::geom_point_rast(size = 0.25, alpha = 0.25) +
+            guides(color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+            facet_wrap(as.formula(paste("~", split_var)), ncol = as.numeric(input$max_facets)) +
+            (if (is.numeric(dd[[color_by]])) scale_color_viridis_c() else scale_color_viridis_d()) +
+            theme_minimal() +
+            theme(legend.position = "right") +
+            labs(
+              x = paste0(embedding_name, " 1"),
+              y = paste0(embedding_name, " 2"),
+              color = color_by
+            )
+          
+          plot_cache_gg(gg)
+          p_base <- ggplotly(gg, tooltip = "text") %>% layout(dragmode = "pan")
+          
+        } else {
+          # Single-panel plotly scatter
+          # Build a ggplot for export even if we display plotly directly
+          gg <- ggplot(dd, aes(x = x, y = y, color = .data[[color_by]])) +
+            geom_point(size = 0.25, alpha = 0.25) +
+            theme_minimal() +
+            labs(
+              x = paste0(embedding_name, " 1"),
+              y = paste0(embedding_name, " 2"),
+              color = color_by
+            )
+          plot_cache_gg(gg)
+          
+          p_base <- plot_ly(
+            data = dd, x = ~x, y = ~y,
+            type = "scatter", mode = "markers",
+            marker = list(color = cols, size = 3),
+            source = ns("embed"), customdata = ~.cell
+          ) %>% layout(
             xaxis = list(title = paste0(embedding_name, " 1")),
             yaxis = list(title = paste0(embedding_name, " 2")),
             dragmode = "zoom"
           )
+        }
+        
+        plot_cache_base(p_base)
+        plot_cache(p_base)
       }
-      
-      # If labels are toggled on, add them immediately
-      if (isTRUE(input$show_labels)) {
-        coords_full <- as.data.frame(coords())
-        names(coords_full)[1:2] <- c("x", "y")
-        coords_full$cluster <- factor(clusters()$assignments)
-        
-        label_df <- coords_full %>%
-          group_by(cluster) %>%
-          summarise(
-            x = mean(x, na.rm = TRUE),
-            y = mean(y, na.rm = TRUE),
-            .groups = "drop"
-          )
-        
-        annots <- lapply(seq_len(nrow(label_df)), function(i) {
-          list(
-            x = label_df$x[i],
-            y = label_df$y[i],
-            xref = "x", yref = "y",
-            text = as.character(label_df$cluster[i]),
-            showarrow = FALSE,
-            xanchor = "center", yanchor = "middle", align = "center",
-            font = list(color = "black", size = 18),
-            bgcolor = "rgba(255,255,255,0.85)",
-            bordercolor = "rgba(0,0,0,0)",
-            borderpad = 2, opacity = 1
-          )
-        })
-        
-        p_base <- p_base %>% layout(annotations = annots)
-      }
-      
-      plot_cache_base(p_base)
-      plot_cache(p_base)
-    })
+    )
     
     # Update overlays without rebuilding points
     observeEvent(input$show_labels, {
@@ -547,54 +436,6 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       req(plot_cache())
       plot_cache()
     })
-    
-    gg <- ggplot(dd, aes(x = x, y = y, color = color_var)) +
-      geom_point(size = 0.25, alpha = 0.25) +
-      theme_minimal() +
-      labs(
-        x = paste0(embedding_name, " 1"),
-        y = paste0(embedding_name, " 2"),
-        color = legend_title
-      )
-    
-    # Faceting if requested
-    if (split_var != "") {
-      gg <- gg + facet_wrap(as.formula(paste("~", split_var)),
-                            ncol = as.numeric(input$max_facets))
-    }
-    
-    # Save ggplot for export
-    plot_cache_gg(gg)
-    
-    # Convert to plotly for interactive display
-    p <- ggplotly(gg, tooltip = "text") %>%
-      layout(dragmode = "pan")
-    plot_cache_base(p)
-    output$embed_plot <- renderPlotly(p)
-    
-    output$export_embed_pdf <- downloadHandler(
-      filename = function() {
-        paste0(tolower(embedding_name), "_embedding_", Sys.Date(), ".pdf")
-      },
-      content = function(file) {
-        gg <- plot_cache_gg()
-        if (is.null(gg)) {
-          showNotification("No plot available to export.", type = "error")
-          return()
-        }
-        
-        # Optional: dynamic sizing based on facets
-        n_facets <- if (!is.null(input$split_by) && input$split_by != "") {
-          length(unique(df()[[input$split_by]]))
-        } else 1
-        pdf_width  <- 6 * min(n_facets, as.numeric(input$max_facets))
-        pdf_height <- 6 * ceiling(n_facets / as.numeric(input$max_facets))
-        
-        ggsave(file, plot = gg, device = cairo_pdf,
-               width = pdf_width, height = pdf_height, units = "in")
-      },
-      contentType = "application/pdf"
-    )
     
     # Keep the plot alive when hidden
     outputOptions(output, "embed_plot", suspendWhenHidden = FALSE)
