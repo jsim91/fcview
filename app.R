@@ -164,6 +164,7 @@ EmbeddingUI <- function(id, title = "UMAP") {
         pickerInput(ns("split_by"), "Split by (optional) — metadata", choices = NULL,
                     options = list(`none-selected-text`="None")),
         uiOutput(ns("split_levels_ui")),
+        actionButton(ns("plot_facets"), "Plot facets"), 
         sliderInput(ns("max_facets"), "Max facets", min = 2, max = 3, value = 2, step = 1),
         hr(),
         # --- Gating controls (commented out for now) ---
@@ -396,7 +397,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     }
     
     # Add split_by to triggers for this observer
-    observeEvent(list(df(), expr(), meta_cell(), input$color_by, input$gate_mode, input$split_by, input$max_facets), {
+    observeEvent(list(df(), expr(), meta_cell(), input$color_by, input$gate_mode, input$max_facets, input$plot_facets), {
       expr_val <- expr()
       meta_val <- meta_cell()
       req(expr_val, meta_val)
@@ -444,32 +445,92 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       }
       
       # handle split_by
+      # handle split_by
       split_var <- input$split_by
       if (!is.null(split_var) && nzchar(split_var)) {
+        # Attach split var to plotting data
         dd[[split_var]] <- meta_val[[split_var]][dd$.cell]
         
-        # Filter to selected categories
+        # Filter to selected categories (if provided)
         shown_levels <- input$split_levels
         if (!is.null(shown_levels) && length(shown_levels) > 0) {
           dd <- dd[dd[[split_var]] %in% shown_levels, , drop = FALSE]
         }
         
-        # --- Balanced downsampling across shown facets ---
+        # Drop NAs and empty levels
+        dd <- dd[!is.na(dd[[split_var]]), , drop = FALSE]
+        dd[[split_var]] <- droplevels(as.factor(dd[[split_var]]))
+        
+        # Guard: nothing left after filtering
+        if (nrow(dd) == 0 || length(levels(dd[[split_var]])) == 0) {
+          plot_cache_base(NULL)
+          plot_cache(NULL)
+          showNotification("No data points available for the selected facet categories.", type = "error")
+          return()
+        }
+        
+        # --- Balanced downsampling across shown, nonempty facets ---
         max_total <- 200000
+        
+        # Count only nonempty facets
         facet_counts <- table(dd[[split_var]])
+        empty_levels <- names(facet_counts)[facet_counts == 0]
+        
+        # If any selected facets are empty, drop them and notify
+        if (length(empty_levels) > 0) {
+          dd <- dd[!(dd[[split_var]] %in% empty_levels), , drop = FALSE]
+          dd[[split_var]] <- droplevels(dd[[split_var]])
+          showNotification(
+            paste0("Dropped empty facet categories: ", paste(empty_levels, collapse = ", ")),
+            type = "warning"
+          )
+          facet_counts <- table(dd[[split_var]])  # recompute after drop
+        }
+        
         n_facets <- length(facet_counts)
         
+        # Guard: all selected facets ended up empty
+        if (n_facets == 0) {
+          plot_cache_base(NULL)
+          plot_cache(NULL)
+          showNotification("No nonempty facet categories to plot after filtering.", type = "error")
+          return()
+        }
+        
+        # Target per facet from nonempty categories
         target_per_facet <- floor(max_total / n_facets)
+        
+        # Do not exceed the sparsest nonempty facet
         min_facet_size <- min(facet_counts)
         target_per_facet <- min(target_per_facet, min_facet_size)
         
+        # Guard: target 0 means at least one chosen facet has 0 points after prior downsample
+        if (target_per_facet < 1) {
+          showNotification(
+            "Selected facets have too few points to plot. Try including more categories or reducing filters.",
+            type = "error"
+          )
+          plot_cache_base(NULL)
+          plot_cache(NULL)
+          return()
+        }
+        
+        # Sample the same number from each remaining facet
         set.seed(123)
         dd <- dd %>%
           group_by(.data[[split_var]]) %>%
           slice_sample(n = target_per_facet) %>%
           ungroup()
         
-        # Add color variable
+        # Guard: ensure we still have data
+        if (nrow(dd) == 0) {
+          plot_cache_base(NULL)
+          plot_cache(NULL)
+          showNotification("No data to plot after balanced sampling.", type = "error")
+          return()
+        }
+        
+        # --- Color variable ---
         color_by <- input$color_by
         if (color_by %in% colnames(expr_val)) {
           dd[[color_by]] <- expr_val[, color_by][dd$.cell]
@@ -486,22 +547,24 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         
         # Build faceted plot
         p_base <- ggplot(dd, aes(x = x, y = y, color = .data[[color_by]])) +
-          ggrastr::geom_point_rast(size = 0.1, alpha = 0.1) +
+          ggrastr::geom_point_rast(size = 0.25, alpha = 0.25) +
           guides(color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
           facet_wrap(as.formula(paste("~", split_var)), ncol = input$max_facets) +
           color_scale +
           theme_minimal() +
           theme(legend.position = "right") +
-          labs(x = paste0(embedding_name, " 1"),
-               y = paste0(embedding_name, " 2"),
-               color = color_by)
+          labs(
+            x = paste0(embedding_name, " 1"),
+            y = paste0(embedding_name, " 2"),
+            color = color_by
+          )
         
         # Optional: convert to plotly
-        # p_base <- plotly::ggplotly(p_base)
+        p_base <- plotly::ggplotly(p_base)
       } else {
-        # Original single‐panel scatter
+        # Original single‑panel scatter
         p_base <- plot_ly(
-          data = dd,  
+          data = dd,
           x = ~x, y = ~y,
           type = "scatter", mode = "markers",
           marker = list(color = cols, size = 3),
@@ -751,6 +814,8 @@ ui <- navbarPage(
       sidebarPanel(
         h4("Upload inputs"),
         fileInput("rdata_upload", "Upload .RData (contains shinyAppInput)", accept = ".RData"),
+        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time."), 
+        numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
         fileInput("json_upload", "Upload gates (.json)", accept = ".json"),
         hr(),
         h4("Gate export"),
@@ -794,7 +859,6 @@ ui <- navbarPage(
     )
   )
 )
-
 
 # ---- Server ----
 server <- function(input, output, session) {
@@ -845,15 +909,44 @@ server <- function(input, output, session) {
       }
     }
     
-    if('tsne' %in% names(obj)) {
-      if (is.matrix(obj$tsne$coordinates))
-        obj$tsne$coordinates <- as.data.frame(obj$tsne$coordinates)
+    # Ensure embeddings are data.frames
+    if ("tsne" %in% names(obj) && is.matrix(obj$tsne$coordinates)) {
+      obj$tsne$coordinates <- as.data.frame(obj$tsne$coordinates)
     }
-    if('umap' %in% names(obj)) {
-      if (is.matrix(obj$umap$coordinates))
-        obj$umap$coordinates <- as.data.frame(obj$umap$coordinates)
+    if ("umap" %in% names(obj) && is.matrix(obj$umap$coordinates)) {
+      obj$umap$coordinates <- as.data.frame(obj$umap$coordinates)
     }
     
+    # --- Downsample entire object if needed ---
+    n_cells <- nrow(obj$data)
+    max_cells <- input$max_cells_upload %||% 300000
+    
+    if (n_cells > max_cells) {
+      set.seed(123)
+      keep_idx <- sort(sample.int(n_cells, max_cells))
+      
+      obj$data     <- obj$data[keep_idx, , drop = FALSE]
+      obj$source   <- obj$source[keep_idx]
+      obj$metadata <- obj$metadata[keep_idx, , drop = FALSE]
+      
+      if (!is.null(obj$leiden$clusters) && length(obj$leiden$clusters) == n_cells) {
+        obj$leiden$clusters <- obj$leiden$clusters[keep_idx]
+      }
+      if (hasUMAP(obj) && nrow(obj$umap$coordinates) == n_cells) {
+        obj$umap$coordinates <- obj$umap$coordinates[keep_idx, , drop = FALSE]
+      }
+      if (hasTSNE(obj) && nrow(obj$tsne$coordinates) == n_cells) {
+        obj$tsne$coordinates <- obj$tsne$coordinates[keep_idx, , drop = FALSE]
+      }
+      if (!is.null(obj$run_date) && length(obj$run_date) == n_cells) {
+        obj$run_date <- obj$run_date[keep_idx]
+      }
+      
+      message(sprintf("Downsampled from %d to %d cells at upload stage", n_cells, max_cells))
+      showNotification(sprintf("Downsampled from %d to %d cells", n_cells, max_cells), type = "message")
+    }
+    
+    # Now validate the already-downsampled object
     validateInput(obj, id_col = NULL)
     
     # Guess ID column and merge metadata immediately
@@ -880,6 +973,11 @@ server <- function(input, output, session) {
     if ("RunDate" %in% names(meta_cell)) {
       meta_cell$RunDate <- as.factor(meta_cell$RunDate)
     }
+    if (!"leiden_cluster" %in% names(meta_cell) &&
+        !is.null(obj$leiden$clusters) &&
+        length(obj$leiden$clusters) == nrow(obj$data)) {
+      meta_cell$leiden_cluster <- factor(obj$leiden$clusters, levels = sort(unique(obj$leiden$clusters)))
+    }
     
     clusters <- list(
       assignments = obj$leiden$clusters,
@@ -893,8 +991,8 @@ server <- function(input, output, session) {
                                    settings = obj$tsne$settings) else NULL
     
     cluster_heat <- if (hasHeatmap(obj)) obj$leiden_heatmap$heatmap_tile_data else NULL
-    pop_size <- if (hasHeatmap(obj)) obj$leiden_heatmap$population_size else NULL
-    rep_used <- if (hasHeatmap(obj)) obj$leiden_heatmap$rep_used else NA
+    pop_size     <- if (hasHeatmap(obj)) obj$leiden_heatmap$population_size else NULL
+    rep_used     <- if (hasHeatmap(obj)) obj$leiden_heatmap$rep_used else NA
     
     # Store in rv
     rv$expr <- expr
