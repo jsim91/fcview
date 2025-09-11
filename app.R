@@ -1351,6 +1351,10 @@ server <- function(input, output, session) {
       res$padj <- p.adjust(res$p, method = "BH")
     }
     
+    # Round p and padj to 3 decimal places if they exist
+    if ("p" %in% names(res))    res$p    <- round(res$p, 3)
+    if ("padj" %in% names(res)) res$padj <- round(res$padj, 3)
+    
     res
   })
   
@@ -1383,7 +1387,18 @@ server <- function(input, output, session) {
   })
   
   output$test_table <- renderTable({
-    req(run_tests())
+    df <- req(run_tests())
+    
+    # Round p and padj to 3 decimal places if they exist
+    num_cols <- intersect(c("p", "padj"), names(df))
+    df[num_cols] <- lapply(df[num_cols], function(x) round(x, 3))
+    
+    # If padj exists, order by it ascending (lowest at top)
+    if ("padj" %in% names(df)) {
+      df <- df[order(df$padj, na.last = TRUE), ]
+    }
+    
+    df
   })
 }
 
