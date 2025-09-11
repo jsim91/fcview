@@ -1172,6 +1172,20 @@ server <- function(input, output, session) {
       res$padj <- p.adjust(res$p, method = "BH")
     }
     
+    if (nrow(res) && isTRUE(input$apply_bh) && "p" %in% colnames(res)) {
+      res$padj <- p.adjust(res$p, method = "BH")
+    }
+    
+    # Add metadata column name being tested
+    tested_var <- if (nzchar(input$group_var)) {
+      input$group_var
+    } else if (nzchar(input$cont_var)) {
+      input$cont_var
+    } else {
+      NA_character_
+    }
+    res$metadata <- tested_var
+    
     # Ensure column order: entity, test, n, p, padj, rho (if present), then all *_IQR
     iqr_cols <- grep("_IQR$", names(res), value = TRUE)
     base_cols <- c("entity", "test", "n", "p", "padj")
