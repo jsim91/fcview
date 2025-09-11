@@ -831,8 +831,7 @@ ui <- navbarPage(
         actionButton("run_test", "Run tests")
       ),
       column(
-        8,
-        plotOutput("abund_plot", height = "300px"),
+        9,
         tableOutput("test_table")
       )
     )
@@ -1351,7 +1350,8 @@ server <- function(input, output, session) {
             med <- median(v, na.rm = TRUE)
             q25 <- quantile(v, 0.25, na.rm = TRUE)
             q75 <- quantile(v, 0.75, na.rm = TRUE)
-            sprintf("%.3f (%.3f–%.3f)", med, q25, q75)
+            n_grp <- sum(!is.na(v))
+            sprintf("%.2f (%.2f–%.2f, n=%d)", med, q25, q75, n_grp)
           })
           sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
           names(sum_df) <- paste0(names(sum_df), "_IQR")
@@ -1368,7 +1368,8 @@ server <- function(input, output, session) {
             med <- median(v, na.rm = TRUE)
             q25 <- quantile(v, 0.25, na.rm = TRUE)
             q75 <- quantile(v, 0.75, na.rm = TRUE)
-            sprintf("%.3f (%.3f–%.3f)", med, q25, q75)
+            n_grp <- sum(!is.na(v))
+            sprintf("%.2f (%.2f–%.2f, n=%d)", med, q25, q75, n_grp)
           })
           sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
           names(sum_df) <- paste0(names(sum_df), "_IQR")
@@ -1392,43 +1393,11 @@ server <- function(input, output, session) {
     if ("p" %in% names(res))    res$p    <- round(res$p, 3)
     if ("padj" %in% names(res)) res$padj <- round(res$padj, 3)
     
-    if (nrow(res) && isTRUE(input$apply_bh) && "p" %in% colnames(res)) {
-      res$padj <- p.adjust(res$p, method = "BH")
-    }
-    
     # Ensure column order: entity, test, n, p, padj, then all *_IQR
     iqr_cols <- grep("_IQR$", names(res), value = TRUE)
     res <- res[, c("entity", "test", "n", "p", "padj", iqr_cols), drop = FALSE]
     
     res
-  })
-  
-  # --- Plot with message if no variable selected ---
-  output$abund_plot <- renderPlot({
-    res <- req(run_tests())
-    
-    # If both vars are None, show message instead of plot
-    if (!nzchar(input$group_var) && !nzchar(input$cont_var)) {
-      grid::grid.newpage()
-      grid::grid.text("Select a grouping or continuous variable to run tests",
-                      gp = grid::gpar(fontsize = 14))
-      return()
-    }
-    
-    if (!nrow(res)) return(NULL)
-    
-    if ("rho" %in% names(res)) {
-      ggplot(res, aes(x = n, y = rho, color = p)) +
-        geom_point() +
-        scale_color_viridis_c() +
-        theme_minimal() +
-        labs(title = "Spearman results", x = "N", y = "rho")
-    } else {
-      ggplot(res, aes(x = entity %||% "", y = -log10(p))) +
-        geom_col(fill = "#2c7fb8") +
-        theme_minimal() +
-        labs(title = "Abundance test -log10(p)", x = "", y = "-log10(p)")
-    }
   })
   
   output$test_table <- renderTable({
