@@ -143,6 +143,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     
     # One-time picker initialization in a reactive context
     initialized <- FALSE
+    plot_cache_gg <- reactiveVal(NULL)
     
     observeEvent(list(expr(), meta_cell(), clusters()), ignoreInit = FALSE, {
       if (initialized) return()
@@ -329,7 +330,6 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         }
       }
       
-      # handle split_by
       # handle split_by
       split_var <- input$split_by
       if (!is.null(split_var) && nzchar(split_var)) {
@@ -543,11 +543,58 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       plot_cache(p)
     })
     
-    
     output$embed_plot <- renderPlotly({
       req(plot_cache())
       plot_cache()
     })
+    
+    gg <- ggplot(dd, aes(x = x, y = y, color = color_var)) +
+      geom_point(size = 0.25, alpha = 0.25) +
+      theme_minimal() +
+      labs(
+        x = paste0(embedding_name, " 1"),
+        y = paste0(embedding_name, " 2"),
+        color = legend_title
+      )
+    
+    # Faceting if requested
+    if (split_var != "") {
+      gg <- gg + facet_wrap(as.formula(paste("~", split_var)),
+                            ncol = as.numeric(input$max_facets))
+    }
+    
+    # Save ggplot for export
+    plot_cache_gg(gg)
+    
+    # Convert to plotly for interactive display
+    p <- ggplotly(gg, tooltip = "text") %>%
+      layout(dragmode = "pan")
+    plot_cache_base(p)
+    output$embed_plot <- renderPlotly(p)
+    
+    output$export_embed_pdf <- downloadHandler(
+      filename = function() {
+        paste0(tolower(embedding_name), "_embedding_", Sys.Date(), ".pdf")
+      },
+      content = function(file) {
+        gg <- plot_cache_gg()
+        if (is.null(gg)) {
+          showNotification("No plot available to export.", type = "error")
+          return()
+        }
+        
+        # Optional: dynamic sizing based on facets
+        n_facets <- if (!is.null(input$split_by) && input$split_by != "") {
+          length(unique(df()[[input$split_by]]))
+        } else 1
+        pdf_width  <- 6 * min(n_facets, as.numeric(input$max_facets))
+        pdf_height <- 6 * ceiling(n_facets / as.numeric(input$max_facets))
+        
+        ggsave(file, plot = gg, device = cairo_pdf,
+               width = pdf_width, height = pdf_height, units = "in")
+      },
+      contentType = "application/pdf"
+    )
     
     # Keep the plot alive when hidden
     outputOptions(output, "embed_plot", suspendWhenHidden = FALSE)
