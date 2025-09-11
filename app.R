@@ -1056,7 +1056,18 @@ server <- function(input, output, session) {
     
     ranno <- NULL
     if (!is.null(rv$pop_size)) {
-      ranno <- rowAnnotation(Size = rv$pop_size[, 1])
+      size_vals <- rv$pop_size[, 1]
+      size_col_fun <- circlize::colorRamp2(
+        c(min(size_vals, na.rm = TRUE),
+          max(size_vals, na.rm = TRUE)),
+        c("white", "red")
+      )
+      
+      ranno <- rowAnnotation(
+        Size = size_vals,
+        col = list(Size = size_col_fun),
+        gp = grid::gpar(col = "black", lwd = 0.5)  # black border
+      )
     }
     
     palette_choice <- switch(
