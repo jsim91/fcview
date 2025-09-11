@@ -665,8 +665,11 @@ ui <- navbarPage(
     fluidRow(
       column(
         3,
-        pickerInput("test_entity", "Entity",
-                    choices = c("Clusters", "Celltypes")),
+        conditionalPanel(
+          condition = "output.hasClusterMap",
+          pickerInput("test_entity", "Entity",
+                      choices = c("Clusters", "Celltypes"),
+                      selected = "Clusters")), 
         pickerInput("group_var", "Categorical metadata", choices = NULL,
                     options = list(`none-selected-text` = "None")), 
         pickerInput("cont_var", "Continuous metadata",
@@ -911,6 +914,8 @@ server <- function(input, output, session) {
     rv$pop_size     <- pop_size
     rv$rep_used     <- rep_used
     
+    rv$cluster_map <- cluster_map
+    
     message("Upload complete: expr rows=", nrow(rv$expr),
             " meta_cell rows=", nrow(rv$meta_cell),
             " UMAP coords=", if (!is.null(rv$UMAP)) nrow(rv$UMAP$coords) else "NULL",
@@ -925,6 +930,19 @@ server <- function(input, output, session) {
   observeEvent(input$main_tab, {
     if (!rv$data_ready() && !identical(input$main_tab, "Home")) {
       updateNavbarPage(session, "main_tab", selected = "Home")
+    }
+  })
+  
+  # Reactive flag for whether cluster_map is present and valid
+  output$hasClusterMap <- reactive({
+    !is.null(rv$cluster_map) &&
+      all(c("cluster", "celltype") %in% names(rv$cluster_map))
+  })
+  outputOptions(output, "hasClusterMap", suspendWhenHidden = FALSE)
+  
+  observe({
+    if (!output$hasClusterMap()) {
+      updatePickerInput(session, "test_entity", selected = "Clusters")
     }
   })
   
