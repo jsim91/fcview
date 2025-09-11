@@ -21,6 +21,7 @@ suppressPackageStartupMessages({
     library(viridis)
     library(scales)
     library(sf)         # point-in-polygon
+    library(shinyjs)
   })
 })
 
@@ -613,6 +614,8 @@ tags$head(
   "))
 )
 
+useShinyjs()
+
 # --- Main UI ---
 ui <- navbarPage(
   "FCView",
@@ -680,7 +683,9 @@ ui <- navbarPage(
                                  "Kruskal–Wallis (multi-group)",
                                  "Spearman (continuous)")),
         checkboxInput("apply_bh", "BH adjust across entities", TRUE),
-        actionButton("run_test", "Run tests")
+        actionButton("run_test", "Run tests"), 
+        br(), br(),
+        downloadButton("export_results", "Export results as CSV")
       ),
       column(
         9,
@@ -1134,7 +1139,7 @@ server <- function(input, output, session) {
             q25 <- quantile(v, 0.25, na.rm = TRUE)
             q75 <- quantile(v, 0.75, na.rm = TRUE)
             n_grp <- sum(!is.na(v))
-            sprintf("%.2f (%.2f–%.2f, n=%d)", med, q25, q75, n_grp)
+            sprintf("%.2f (%.2f-%.2f, n=%d)", med, q25, q75, n_grp)
           })
           sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
           names(sum_df) <- paste0(names(sum_df), "_IQR")
@@ -1152,7 +1157,7 @@ server <- function(input, output, session) {
             q25 <- quantile(v, 0.25, na.rm = TRUE)
             q75 <- quantile(v, 0.75, na.rm = TRUE)
             n_grp <- sum(!is.na(v))
-            sprintf("%.2f (%.2f–%.2f, n=%d)", med, q25, q75, n_grp)
+            sprintf("%.2f (%.2f-%.2f, n=%d)", med, q25, q75, n_grp)
           })
           sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
           names(sum_df) <- paste0(names(sum_df), "_IQR")
@@ -1176,19 +1181,51 @@ server <- function(input, output, session) {
       res$padj <- p.adjust(res$p, method = "BH")
     }
     
-    # Add metadata column name being tested
-    tested_var <- if (nzchar(input$group_var)) {
-      input$group_var
-    } else if (nzchar(input$cont_var)) {
-      input$cont_var
+    # Add metadata column name being tested based on test type
+    tested_var <- if (test_type == "Spearman (continuous)") {
+      if (nzchar(input$cont_var)) input$cont_var else NA_character_
+    } else if (test_type %in% c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")) {
+      if (nzchar(input$group_var)) input$group_var else NA_character_
     } else {
       NA_character_
     }
+    
+    # Determine entity used in this run
+    entity_used <- if (!hasClusterMap()) {
+      "clusters"
+    } else {
+      tolower(input$test_entity)
+    }
+    
+    # Determine test short name
+    test_map <- c(
+      "Wilcoxon (2-group)" = "wilcoxon",
+      "Kruskal–Wallis (multi-group)" = "kruskal_wallis",
+      "Spearman (continuous)" = "spearman"
+    )
+    test_used <- test_map[[input$test_type]]
+    
+    # Determine metadata used based on test type
+    metadata_used <- if (input$test_type == "Spearman (continuous)") {
+      if (nzchar(input$cont_var)) input$cont_var else "none"
+    } else if (input$test_type %in% c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")) {
+      if (nzchar(input$group_var)) input$group_var else "none"
+    } else {
+      "none"
+    }
+    
+    # Save for later use in downloadHandler
+    rv$last_test_info <- list(
+      entity = entity_used,
+      test = test_used,
+      metadata = metadata_used
+    )
+    
     res$metadata <- tested_var
     
-    # Ensure column order: entity, test, n, p, padj, rho (if present), then all *_IQR
+    # Ensure column order: entity, metadata, test, n, p, padj, rho (if present), then all *_IQR
     iqr_cols <- grep("_IQR$", names(res), value = TRUE)
-    base_cols <- c("entity", "test", "n", "p", "padj")
+    base_cols <- c("entity", "metadata", "test", "n", "p", "padj")
     if ("rho" %in% names(res)) {
       base_cols <- c(base_cols, "rho")
     }
@@ -1216,6 +1253,31 @@ server <- function(input, output, session) {
     
     df
   }, sanitize.text.function = function(x) x)  # allow formatted strings
+  
+  observe({
+    has_data <- !is.null(run_tests()) && nrow(run_tests()) > 0
+    if (has_data) {
+      shinyjs::enable("export_results")
+    } else {
+      shinyjs::disable("export_results")
+    }
+  })
+  
+  output$export_results <- downloadHandler(
+    filename = function() {
+      info <- rv$last_test_info
+      if (is.null(info)) return("results.csv")  # fallback
+      
+      fname <- paste(info$entity, info$test, info$metadata, sep = "_")
+      fname <- gsub(" ", "_", fname)
+      fname <- tolower(fname)
+      paste0(fname, ".csv")
+    },
+    content = function(file) {
+      df <- run_tests()
+      write.csv(df, file, row.names = FALSE, fileEncoding = "UTF-8-BOM")
+    }
+  )
 }
 
 shinyApp(ui, server)
