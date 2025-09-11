@@ -111,11 +111,16 @@ EmbeddingUI <- function(id, title = "UMAP") {
         3,
         pickerInput(ns("color_by"), "Color by", choices = NULL),
         checkboxInput(ns("show_labels"), "Show cluster labels", value = FALSE),
-        pickerInput(ns("split_by"), "Split by (optional) — metadata", choices = NULL,
+        pickerInput(ns("split_by"), "Facet by", choices = NULL,
                     options = list(`none-selected-text`="None")),
         uiOutput(ns("split_levels_ui")),
-        actionButton(ns("plot_facets"), "Plot facets"), 
-        sliderInput(ns("max_facets"), "Max facets", min = 2, max = 3, value = 2, step = 1),
+        selectInput(
+          ns("max_facets"),
+          "Facet columns",
+          choices = c(1, 2, 3, 4),
+          selected = 2
+        ),
+        actionButton(ns("plot_facets"), "Plot facets"),
         hr(),
       ),
       column(
@@ -424,7 +429,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         p_base <- ggplot(dd, aes(x = x, y = y, color = .data[[color_by]])) +
           ggrastr::geom_point_rast(size = 0.25, alpha = 0.25) +
           guides(color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
-          facet_wrap(as.formula(paste("~", split_var)), ncol = input$max_facets) +
+          facet_wrap(as.formula(paste("~", split_var)), ncol = as.numeric(input$max_facets)) +
           color_scale +
           theme_minimal() +
           theme(legend.position = "right") +
@@ -549,80 +554,53 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
   })
 }
 
-
-# --- UI: hard-disable all tabs until data is ready ---
-tags$head(
-  tags$style(HTML("
-    /* Grey out disabled tabs */
-    #main_tab li.disabled > a,
-    #main_tab li.disabled > a:hover {
-      color: #aaa !important;
-      cursor: not-allowed;
-      text-decoration: none;
-    }
-  ")),
-  tags$script(HTML("
-    (function() {
-      // Global-ish lock flag for this page
-      var tabsLocked = true;
-
-      function disableTabs() {
-        tabsLocked = true;
-        // Mark all tabs disabled (including Home, if you want)
-        // To keep Home clickable, change selector to '#main_tab li:not(:first)'
-        $('#main_tab li').addClass('disabled');
-      }
-      function enableTabs() {
-        tabsLocked = false;
-        $('#main_tab li').removeClass('disabled');
-      }
-
-      // Intercept all Bootstrap tab show events while locked
-      $(document).on('show.bs.tab', '#main_tab a[data-toggle=\"tab\"]', function(e) {
-        if (tabsLocked) {
-          e.preventDefault();
-          e.stopImmediatePropagation();
-          return false;
-        }
-      });
-
-      // Also intercept raw clicks as a fallback
-      $(document).on('click', '#main_tab a[data-toggle=\"tab\"]', function(e) {
-        if (tabsLocked) {
-          e.preventDefault();
-          e.stopImmediatePropagation();
-          return false;
-        }
-      });
-
-      // Handle enable/disable messages from server
-      Shiny.addCustomMessageHandler('enableTabs', function(enable) {
-        if (enable) {
-          enableTabs();
-        } else {
-          disableTabs();
-          // Force UI back to Home immediately on the client
-          var $home = $('#main_tab a[data-toggle=\"tab\"]').first();
-          if ($home.length) $home.tab('show');
-        }
-      });
-
-      // Lock tabs immediately on page ready and on Shiny connect
-      $(document).ready(function() { disableTabs(); });
-      $(document).on('shiny:connected', function() { disableTabs(); });
-    })();
-  "))
-)
-
 # --- Main UI ---
 ui <- navbarPage(
   "FCView",
-  windowTitle = "FCView",
   id = "main_tab",
-  useShinyjs(),
-  
-  tabPanel(
-    "Home",
+  header = tags$head(
+    tags$style(HTML("
+      /* Grey out disabled tabs */
+      #main_tab li.disabled > a,
+      #main_tab li.disabled > a:hover {
+        color: #aaa !important;
+        cursor: not-allowed;
+        text-decoration: none;
+      }
+    ")),
+    tags$script(HTML("
+      (function() {
+        var tabsLocked = true;
+        function disableTabs() {
+          tabsLocked = true;
+          $('#main_tab li').addClass('disabled');
+        }
+        function enableTabs() {
+          tabsLocked = false;
+          $('#main_tab li').removeClass('disabled');
+        }
+        $(document).on('show.bs.tab click', '#main_tab a[data-toggle=\"tab\"]', function(e) {
+          if (tabsLocked) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return false;
+          }
+        });
+        Shiny.addCustomMessageHandler('enableTabs', function(enable) {
+          if (enable) {
+            enableTabs();
+          } else {
+            disableTabs();
+            var $home = $('#main_tab a[data-toggle=\"tab\"]').first();
+            if ($home.length) $home.tab('show');
+          }
+        });
+        $(document).ready(disableTabs);
+        $(document).on('shiny:connected', disableTabs);
+      })();
+    "))
+  ),
+  tabPanel("Home",
     sidebarLayout(
       sidebarPanel(
         h4("Upload inputs"),
