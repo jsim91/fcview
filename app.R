@@ -42,32 +42,6 @@ spearman_test <- function(df, freq_col = "freq", cont_var) {
   data.frame(rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
 }
 
-freq_by <- function(cell_ids, meta_cell, group_var, unit_var) {
-  dt <- as.data.table(meta_cell)
-  dt[, .idx := .I]
-  dt[, .in := .idx %in% cell_ids]
-  
-  tot <- dt[, .(total = .N), by = unit_var]
-  inc <- dt[.in == TRUE, .(count = .N), by = unit_var]
-  res <- merge(tot, inc, by = unit_var, all.x = TRUE)
-  res$count[is.na(res$count)] <- 0
-  
-  gv <- unique(dt[, c(unit_var, group_var), with = FALSE])
-  res <- merge(res, gv, by = unit_var, all.x = TRUE)
-  res$freq <- res$count / res$total
-  as.data.frame(res)
-}
-
-# Parse SVG path "M x,y L x,y ... Z" into numeric coords
-parse_svg_path <- function(path) {
-  path <- gsub("[MmZz]", "", path)
-  coords <- unlist(strsplit(path, "[Ll]"))
-  coords <- trimws(coords)
-  coords <- coords[nzchar(coords)]
-  xy <- do.call(rbind, strsplit(coords, ","))
-  data.frame(x = as.numeric(xy[,1]), y = as.numeric(xy[,2]))
-}
-
 # Validate minimal structure
 validateInput <- function(obj, id_col = NULL) {
   required <- c("data", "source", "metadata", "leiden")
@@ -127,30 +101,6 @@ guess_id_col <- function(metadata, source_vec) {
   colnames(metadata)[which.max(overlaps)]
 }
 
-
-# ---- Gate store ----
-GateStore <- function() {
-  rv <- reactiveValues(.list = list())
-  list(
-    add = function(g) { rv$.list[[g$name]] <- g },
-    list = reactive(rv$.list),
-    remove = function(name) { rv$.list[[name]] <- NULL },
-    clear = function() { rv$.list <- list() }
-  )
-}
-
-new_gate <- function(name, cells, embedding, polygon = NULL, color = "#E45756") {
-  list(
-    name = name,
-    cells = sort(unique(as.integer(cells))),
-    embedding = embedding, # "UMAP" or "tSNE"
-    polygon = polygon,     # list(x=..., y=...) if drawn
-    color = color,
-    created = as.character(Sys.time())
-  )
-}
-
-
 # ---- Embedding module UI ----
 EmbeddingUI <- function(id, title = "UMAP") {
   ns <- NS(id)
@@ -167,58 +117,12 @@ EmbeddingUI <- function(id, title = "UMAP") {
         actionButton(ns("plot_facets"), "Plot facets"), 
         sliderInput(ns("max_facets"), "Max facets", min = 2, max = 3, value = 2, step = 1),
         hr(),
-        # --- Gating controls (commented out for now) ---
-        radioButtons(ns("gate_mode"), "Gating mode",
-                     choices = c("Lasso select", "Draw polygon"),
-                     selected = "Draw polygon"),
-        # textInput(ns("gate_name"), "Gate name", value = ""),
-        colourInput(ns("gate_color"), "Gate color", value = "#E45756"),
-        # actionButton(ns("save_gate"), "Save gate"),
-        # actionButton(ns("clear_selection"), "Clear current selection"),
-        # hr(),
-        # pickerInput(ns("overlay_gate"), "Overlay gate(s)", choices = NULL, multiple = TRUE)
       ),
       column(
         9,
         plotlyOutput(ns("embed_plot"), height = "650px")
       )
     ),
-    # hr(),
-    # --- Gate phenotype and abundance section (commented out for now) ---
-    # h4("Gate phenotype and abundance"),
-    # fluidRow(
-    #   column(
-    #     4,
-    #     pickerInput(ns("phenotype_gate"), "Gate for phenotype", choices = NULL),
-    #     pickerInput(ns("phenotype_fun"), "Summary", choices = c("median", "p90"), selected = "median")
-    #   ),
-    #   column(
-    #     8,
-    #     plotOutput(ns("inout_heatmap"), height = "400px")
-    #   )
-    # ),
-    # hr(),
-    # h4("Abundance testing"),
-    # fluidRow(
-    #   column(
-    #     4,
-    #     pickerInput(ns("test_entity"), "Entity",
-    #                 choices = c("Selected gate(s)", "Clusters", "Celltypes")),
-    #     pickerInput(ns("test_gate"), "Gate(s)", choices = NULL, multiple = TRUE),
-    #     pickerInput(ns("group_var"), "Grouping factor (metadata)", choices = NULL),
-    #     pickerInput(ns("cont_var"), "Continuous metadata", choices = NULL),
-    #     radioButtons(ns("test_type"), "Test",
-    #                  choices = c("Wilcoxon (2-group)","Kruskal–Wallis (multi-group)","Spearman (continuous)")),
-    #     pickerInput(ns("unit_var"), "Aggregation unit", choices = NULL),
-    #     checkboxInput(ns("apply_bh"), "BH adjust across entities", TRUE),
-    #     actionButton(ns("run_test"), "Run tests")
-    #   ),
-    #   column(
-    #     8,
-    #     plotOutput(ns("abund_plot"), height = "300px"),
-    #     tableOutput(ns("test_table"))
-    #   )
-    # )
   )
 }
 
@@ -358,39 +262,6 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     
     current_sel <- reactiveVal(integer(0))
     
-    # Lasso selection observer (suspended until first plot)
-    sel_obs <- observeEvent(
-      event_data("plotly_selected", source = ns("embed")),
-      suspended = TRUE, ignoreInit = TRUE, {
-        if (input$gate_mode != "Lasso select") return()
-        sel <- event_data("plotly_selected", source = ns("embed"))
-        req(!is.null(sel), nrow(sel) > 0)
-        current_sel(unique(as.integer(sel$customdata)))
-      }
-    )
-    
-    # Polygon draw observer (suspended until first plot)
-    rel_obs <- observeEvent(
-      event_data("plotly_relayout", source = ns("embed")),
-      suspended = TRUE, ignoreInit = TRUE, {
-        if (input$gate_mode != "Draw polygon") return()
-        ev <- event_data("plotly_relayout", source = ns("embed"))
-        req(!is.null(ev), length(ev) > 0)
-        shape_keys <- names(ev)[grepl("^shapes\\[\\d+\\]\\.path$", names(ev))]
-        if (!length(shape_keys)) return()
-        path <- ev[[shape_keys[length(shape_keys)]]]
-        poly_df <- parse_svg_path(path)
-        if (!nrow(poly_df)) return()
-        
-        # Build sf polygon and test points
-        pg <- st_sfc(st_polygon(list(as.matrix(poly_df))), crs = NA)
-        dd <- df()
-        pts <- st_as_sf(dd, coords = c("x","y"))
-        inside <- st_within(pts, pg, sparse = FALSE)[,1]
-        current_sel(dd$.cell[inside])
-      }
-    )
-    
     plot_cache_base <- reactiveVal(NULL)  # base plot without gates
     plot_cache      <- reactiveVal(NULL)  # final plot with overlays
     
@@ -401,7 +272,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     }
     
     # Add split_by to triggers for this observer
-    observeEvent(list(df(), expr(), meta_cell(), input$color_by, input$gate_mode, input$max_facets, input$plot_facets), {
+    observeEvent(list(df(), expr(), meta_cell(), input$color_by, input$max_facets, input$plot_facets), {
       expr_val <- expr()
       meta_val <- meta_cell()
       req(expr_val, meta_val)
@@ -578,7 +449,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           layout(
             xaxis = list(title = paste0(embedding_name, " 1")),
             yaxis = list(title = paste0(embedding_name, " 2")),
-            dragmode = if (input$gate_mode == "Lasso select") "lasso" else "zoom"
+            dragmode = "zoom"
           )
       }
       
@@ -618,8 +489,8 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       plot_cache(p_base)
     })
     
-    # Update overlays (gates + labels) without rebuilding points
-    observeEvent(list(input$overlay_gate, input$show_labels), {
+    # Update overlays without rebuilding points
+    observeEvent(input$show_labels, {
       p <- plot_cache_base()
       req(p)
       
@@ -659,32 +530,9 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         p <- p %>% layout(annotations = annots)
       }
       
-      # Add gate shapes
-      gl <- gate_store$list()
-      og <- input$overlay_gate
-      if (length(gl) && length(og)) {
-        shapes <- list()
-        for (nm in og) {
-          g <- gl[[nm]]
-          if (!is.null(g) && !is.null(g$polygon) && g$embedding == embedding_name) {
-            shapes <- c(shapes, list(
-              type = "path",
-              path = paste0(
-                "M ",
-                paste(paste(g$polygon$x, g$polygon$y, sep = ","), collapse = " L "),
-                " Z"
-              ),
-              line = list(color = g$color, width = 2)
-            ))
-          }
-        }
-        if (length(shapes)) {
-          p <- p %>% layout(shapes = shapes)
-        }
-      }
-      
       plot_cache(p)
     })
+    
     
     output$embed_plot <- renderPlotly({
       req(plot_cache())
@@ -698,26 +546,6 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     outputOptions(output, "embed_plot", suspendWhenHidden = FALSE)
     
     observeEvent(input$clear_selection, current_sel(integer(0)))
-    
-    # Save gate
-    observeEvent(input$save_gate, {
-      cells <- current_sel()
-      req(length(cells) > 0)
-      name <- input$gate_name
-      if (!nzchar(name)) name <- paste0(embedding_name, "_gate_", format(Sys.time(), "%H%M%S"))
-      col <- input$gate_color
-      polygon <- NULL
-      gate <- new_gate(name, cells, embedding_name, polygon = polygon, color = col)
-      
-      gate_store$add(gate)
-      updatePickerInput(session, "overlay_gate", choices = names(gate_store$list()),
-                        selected = unique(c(input$overlay_gate, name)))
-      updatePickerInput(session, "phenotype_gate", choices = names(gate_store$list()), selected = name)
-      updatePickerInput(session, "test_gate", choices = names(gate_store$list()),
-                        selected = unique(c(input$test_gate, name)))
-      
-      showNotification(paste("Saved gate:", name), type = "message")
-    })
     
     # Phenotype heatmap
     output$inout_heatmap <- renderPlot({
@@ -833,10 +661,6 @@ ui <- navbarPage(
         helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time."), 
         fileInput("json_upload", "Upload gates (.json)", accept = ".json"),
         hr(),
-        h4("Gate export"),
-        uiOutput("gate_export_ui"),
-        downloadButton("export_gates", "Download selected gates (.json)"),
-        actionButton("clear_gates", "Clear all gates"),
         width = 3
       ),
       mainPanel(
@@ -926,8 +750,6 @@ server <- function(input, output, session) {
       session$sendCustomMessage("enableTabs", FALSE)
     }
   })
-  
-  gate_store <- GateStore()
   
   observeEvent(input$main_tab, {
     message("Tab changed to: ", input$main_tab)
@@ -1294,68 +1116,6 @@ server <- function(input, output, session) {
   
   run_tests <- eventReactive(input$run_test, {
     test_type <- input$test_type
-    
-    # --- Gate-based testing (kept; fixed .x references) ---
-    if (input$test_entity == "Selected gate(s)") {
-      req(length(input$test_gate) > 0)
-      unit_var  <- req(input$unit_var)
-      group_var <- input$group_var
-      
-      tests <- lapply(input$test_gate, function(gn) {
-        gate <- gate_store$list()[[gn]]
-        dfreq <- freq_by(gate$cells, rv$meta_cell, group_var, unit_var)
-        
-        if (test_type == "Wilcoxon (2-group)") {
-          if (!nzchar(group_var)) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
-          g <- droplevels(factor(dfreq[[group_var]]))
-          ok <- !is.na(g)
-          g <- g[ok]; freq_ok <- dfreq$freq[ok]
-          if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = sum(ok)))
-          
-          # Per-group summaries -> one-row data.frame with names like Group_med, Group_q25, Group_q75
-          summaries <- tapply(freq_ok, g, function(v) c(med = median(v, na.rm = TRUE),
-                                                        q25 = quantile(v, 0.25, na.rm = TRUE),
-                                                        q75 = quantile(v, 0.75, na.rm = TRUE)))
-          vec <- unlist(summaries, use.names = TRUE)
-          names(vec) <- gsub("\\.", "_", names(vec))  # "male.med" -> "male_med"
-          sum_df <- as.data.frame(as.list(vec), stringsAsFactors = FALSE)
-          
-          wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
-          cbind(data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = sum(ok)), sum_df)
-          
-        } else if (test_type == "Kruskal–Wallis (multi-group)") {
-          if (!nzchar(group_var)) return(data.frame(entity = gn, test = "kruskal", p = NA, n = nrow(dfreq)))
-          g <- dfreq[[group_var]]
-          ok <- !is.na(g)
-          if (!any(ok)) return(data.frame(entity = gn, test = "kruskal", p = NA, n = 0))
-          
-          summaries <- tapply(dfreq$freq[ok], as.factor(g[ok]), function(v) c(med = median(v, na.rm = TRUE),
-                                                                              q25 = quantile(v, 0.25, na.rm = TRUE),
-                                                                              q75 = quantile(v, 0.75, na.rm = TRUE)))
-          vec <- unlist(summaries, use.names = TRUE)
-          names(vec) <- gsub("\\.", "_", names(vec))
-          sum_df <- as.data.frame(as.list(vec), stringsAsFactors = FALSE)
-          
-          kw <- kruskal.test(dfreq$freq[ok] ~ as.factor(g[ok]))
-          cbind(data.frame(entity = gn, test = "kruskal", p = kw$p.value, n = sum(ok)), sum_df)
-          
-        } else {
-          cont <- input$cont_var
-          if (!nzchar(cont)) return(data.frame(entity = gn, test = "spearman", rho = NA, p = NA, n = nrow(dfreq)))
-          ct <- spearman_test(dfreq, cont_var = cont)
-          cbind(data.frame(entity = gn, test = "spearman"), ct)
-        }
-      })
-      
-      out <- do.call(rbind, tests)
-      if (nrow(out) && isTRUE(input$apply_bh) && "p" %in% colnames(out))
-        out$padj <- p.adjust(out$p, method = "BH")
-      
-      # Round p and padj
-      if ("p" %in% names(out)) out$p <- round(out$p, 3)
-      if ("padj" %in% names(out)) out$padj <- round(out$padj, 3)
-      return(out)
-    }
     
     # --- Cluster or celltype testing using abundance matrix ---
     abund0 <- rv$clusters$abundance
