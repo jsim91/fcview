@@ -9,6 +9,7 @@ suppressPackageStartupMessages({
     library(colourpicker)
     library(plotly)
     library(ggplot2)
+    library(ggrastr)
     library(ggrepel)
     library(dplyr)
     library(tidyr)
@@ -162,7 +163,8 @@ EmbeddingUI <- function(id, title = "UMAP") {
         checkboxInput(ns("show_labels"), "Show cluster labels", value = FALSE),
         pickerInput(ns("split_by"), "Split by (optional) — metadata", choices = NULL,
                     options = list(`none-selected-text`="None")),
-        sliderInput(ns("max_facets"), "Max facets", min = 2, max = 16, value = 6, step = 1),
+        uiOutput(ns("split_levels_ui")),
+        sliderInput(ns("max_facets"), "Max facets", min = 2, max = 3, value = 2, step = 1),
         hr(),
         # --- Gating controls (commented out for now) ---
         radioButtons(ns("gate_mode"), "Gating mode",
@@ -262,6 +264,21 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       
       message(sprintf("Picker inputs initialized for %s (reactive observer)", embedding_name))
       initialized <<- TRUE
+    })
+    
+    observeEvent(input$split_by, {
+      split_var <- input$split_by
+      meta_val <- meta_cell()
+      if (!is.null(split_var) && nzchar(split_var) && split_var %in% colnames(meta_val)) {
+        levs <- sort(unique(as.character(meta_val[[split_var]])))
+        updatePickerInput(session, "split_levels", choices = levs, selected = levs)
+      }
+    })
+    
+    output$split_levels_ui <- renderUI({
+      req(input$split_by, nzchar(input$split_by))
+      pickerInput(ns("split_levels"), "Facet categories to show",
+                  choices = NULL, multiple = TRUE)
     })
     
     ns <- session$ns
@@ -378,8 +395,8 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       pmin(pmax(values, qs[1]), qs[2])
     }
     
-    # Build base plot only when data/colouring changes
-    observeEvent(list(df(), expr(), meta_cell(), input$color_by, input$gate_mode), {
+    # Add split_by to triggers for this observer
+    observeEvent(list(df(), expr(), meta_cell(), input$color_by, input$gate_mode, input$split_by, input$max_facets), {
       expr_val <- expr()
       meta_val <- meta_cell()
       req(expr_val, meta_val)
@@ -405,7 +422,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         return()
       }
       
-      # Colour mapping
+      # Colour mapping (unchanged)
       if (color_by %in% colnames(expr_val)) {
         vals_full <- expr_val[, color_by]
         vals_plot <- vals_full[dd$.cell]
@@ -426,23 +443,80 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         }
       }
       
-      # Base scatter without gates
-      p_base <- plot_ly(
-        data = dd,
-        x = ~x, y = ~y,
-        type = "scatter", mode = "markers",
-        marker = list(color = cols, size = 3),
-        source = ns("embed"),
-        customdata = ~.cell
-      ) %>%
-        layout(
-          xaxis = list(title = paste0(embedding_name, " 1")),
-          yaxis = list(title = paste0(embedding_name, " 2")),
-          dragmode = if (input$gate_mode == "Lasso select") "lasso" else "zoom"
-        )
+      # handle split_by
+      split_var <- input$split_by
+      if (!is.null(split_var) && nzchar(split_var)) {
+        dd[[split_var]] <- meta_val[[split_var]][dd$.cell]
+        
+        # Filter to selected categories
+        shown_levels <- input$split_levels
+        if (!is.null(shown_levels) && length(shown_levels) > 0) {
+          dd <- dd[dd[[split_var]] %in% shown_levels, , drop = FALSE]
+        }
+        
+        # --- Balanced downsampling across shown facets ---
+        max_total <- 200000
+        facet_counts <- table(dd[[split_var]])
+        n_facets <- length(facet_counts)
+        
+        target_per_facet <- floor(max_total / n_facets)
+        min_facet_size <- min(facet_counts)
+        target_per_facet <- min(target_per_facet, min_facet_size)
+        
+        set.seed(123)
+        dd <- dd %>%
+          group_by(.data[[split_var]]) %>%
+          slice_sample(n = target_per_facet) %>%
+          ungroup()
+        
+        # Add color variable
+        color_by <- input$color_by
+        if (color_by %in% colnames(expr_val)) {
+          dd[[color_by]] <- expr_val[, color_by][dd$.cell]
+        } else {
+          dd[[color_by]] <- meta_val[[color_by]][dd$.cell]
+        }
+        
+        # Choose scale
+        if (is.numeric(dd[[color_by]])) {
+          color_scale <- scale_color_viridis_c()
+        } else {
+          color_scale <- scale_color_viridis_d()
+        }
+        
+        # Build faceted plot
+        p_base <- ggplot(dd, aes(x = x, y = y, color = .data[[color_by]])) +
+          ggrastr::geom_point_rast(size = 0.1, alpha = 0.1) +
+          guides(color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+          facet_wrap(as.formula(paste("~", split_var)), ncol = input$max_facets) +
+          color_scale +
+          theme_minimal() +
+          theme(legend.position = "right") +
+          labs(x = paste0(embedding_name, " 1"),
+               y = paste0(embedding_name, " 2"),
+               color = color_by)
+        
+        # Optional: convert to plotly
+        # p_base <- plotly::ggplotly(p_base)
+      } else {
+        # Original single‐panel scatter
+        p_base <- plot_ly(
+          data = dd,  
+          x = ~x, y = ~y,
+          type = "scatter", mode = "markers",
+          marker = list(color = cols, size = 3),
+          source = ns("embed"),
+          customdata = ~.cell
+        ) %>%
+          layout(
+            xaxis = list(title = paste0(embedding_name, " 1")),
+            yaxis = list(title = paste0(embedding_name, " 2")),
+            dragmode = if (input$gate_mode == "Lasso select") "lasso" else "zoom"
+          )
+      }
       
       plot_cache_base(p_base)
-      plot_cache(p_base)  # initialise final plot
+      plot_cache(p_base)
     })
     
     # Update overlays (gates + labels) without rebuilding points
