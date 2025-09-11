@@ -478,11 +478,12 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           return()
         }
         
-        # Decide sizing based on whether faceting is active
         if (!is.null(input$split_by) && nzchar(input$split_by)) {
           # Faceted → dynamic sizing
           n_facets <- length(unique(df()[[input$split_by]]))
-          ncol_facets <- if (!is.null(input$max_facets)) as.numeric(input$max_facets) else 1
+          # Ensure ncol_facets is a valid number
+          ncol_facets <- suppressWarnings(as.numeric(input$max_facets))
+          if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
           nrow_facets <- ceiling(n_facets / ncol_facets)
           
           pdf_width  <- 6 * ncol_facets
