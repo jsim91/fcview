@@ -655,7 +655,13 @@ ui <- navbarPage(
       column(
         3,
         checkboxInput("cluster_rows", "Cluster rows", value = TRUE),
-        checkboxInput("cluster_columns", "Cluster columns", value = TRUE)
+        checkboxInput("cluster_columns", "Cluster columns", value = TRUE), 
+        selectInput(
+          "heatmap_theme",
+          "Heatmap color theme",
+          choices = c("viridis", "greyscale"),
+          selected = "viridis"
+        )
       ),
       column(
         9,
@@ -671,27 +677,32 @@ ui <- navbarPage(
           condition = "output.hasClusterMap",
           pickerInput("test_entity", "Entity",
                       choices = c("Clusters", "Celltypes"),
-                      selected = "Clusters")), 
+                      selected = "Clusters")
+        ),
         pickerInput("group_var", "Categorical metadata", choices = NULL,
-                    options = list(`none-selected-text` = "None")), 
-        pickerInput("cont_var", "Continuous metadata",
-                    choices = NULL,
-                    options = list(`none-selected-text` = "None")), 
+                    options = list(`none-selected-text` = "None")),
+        pickerInput("cont_var", "Continuous metadata", choices = NULL,
+                    options = list(`none-selected-text` = "None")),
         radioButtons("test_type", "Test",
                      choices = c("Wilcoxon (2-group)",
                                  "Kruskal–Wallis (multi-group)",
                                  "Spearman (continuous)")),
-        checkboxInput("apply_bh", "BH adjust across entities", TRUE),
+        selectInput(
+          "p_adj_method",
+          "P‑value adjustment method",
+          choices = c("BH", "bonferroni", "BY", "fdr"),
+          selected = "BH"
+        ),
         actionButton("run_test", "Run tests"),
         br(), br(),
         conditionalPanel(
           condition = "output.hasResults",
           downloadButton("export_results", "Export results as CSV")
-        ),
-        column(
-          9,
-          tableOutput("test_table")
         )
+      ),
+      column(
+        9,
+        tableOutput("test_table")
       )
     )
   )
@@ -1048,6 +1059,28 @@ server <- function(input, output, session) {
       ranno <- rowAnnotation(Size = rv$pop_size[, 1])
     }
     
+    palette_choice <- switch(
+      input$heatmap_theme,
+      
+      "viridis" = {
+        # This matches your current default
+        z <- rnorm(n = 100, mean = 0, sd = 10)
+        col_seq <- seq(min(z), max(z), length.out = n <- 100)
+        circlize::colorRamp2(
+          col_seq,
+          colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(n)
+        )
+      },
+      
+      "greyscale" = {
+        z <- rnorm(n = 100, mean = 0, sd = 10)
+        circlize::colorRamp2(
+          c(min(z), median(z), max(z)),
+          c("black", "grey50", "white")
+        )
+      }
+    )
+    
     Heatmap(
       M,
       name = "expr",
@@ -1056,7 +1089,7 @@ server <- function(input, output, session) {
       right_annotation = ranno,
       row_names_side = "left",
       rect_gp = gpar(lwd = 0.33, col = "black"), 
-      col = colorRamp2(c(min(M), median(M), max(M)), viridis(3))
+      col = palette_choice
     )
   })
   
@@ -1181,12 +1214,9 @@ server <- function(input, output, session) {
       }) %>%
       dplyr::ungroup()
     
-    if (nrow(res) && isTRUE(input$apply_bh) && "p" %in% colnames(res)) {
-      res$padj <- p.adjust(res$p, method = "BH")
-    }
-    
-    if (nrow(res) && isTRUE(input$apply_bh) && "p" %in% colnames(res)) {
-      res$padj <- p.adjust(res$p, method = "BH")
+    if (nrow(res) && "p" %in% colnames(res) && nzchar(input$p_adj_method)) {
+      adj_col <- paste0(tolower(input$p_adj_method), "_padj")
+      res[[adj_col]] <- p.adjust(res$p, method = input$p_adj_method)
     }
     
     # Add metadata column name being tested based on test type
@@ -1233,7 +1263,11 @@ server <- function(input, output, session) {
     
     # Ensure column order: entity, metadata, test, n, p, padj, rho (if present), then all *_IQR
     iqr_cols <- grep("_IQR$", names(res), value = TRUE)
-    base_cols <- c("entity", "metadata", "test", "n", "p", "padj")
+    adj_col <- paste0(tolower(input$p_adj_method), "_padj")
+    base_cols <- c("entity", "metadata", "test", "n", "p")
+    if (adj_col %in% names(res)) {
+      base_cols <- c(base_cols, adj_col)
+    }
     if ("rho" %in% names(res)) {
       base_cols <- c(base_cols, "rho")
     }
@@ -1245,22 +1279,25 @@ server <- function(input, output, session) {
   output$test_table <- renderTable({
     df <- req(run_tests())
     
-    # Format p and padj to exactly 3 decimal places (with trailing zeros)
-    num_cols <- intersect(c("p", "padj"), names(df))
+    # Detect adjusted p-value column
+    adj_col <- paste0(tolower(input$p_adj_method), "_padj")
+    
+    # Format p and adjusted p
+    num_cols <- intersect(c("p", adj_col), names(df))
     df[num_cols] <- lapply(df[num_cols], function(x) formatC(x, format = "f", digits = 3))
     
-    # If rho exists, also format it to 3 decimals
+    # Format rho if present
     if ("rho" %in% names(df)) {
       df$rho <- formatC(df$rho, format = "f", digits = 2)
     }
     
-    # If padj exists, order by it ascending (lowest at top)
-    if ("padj" %in% names(df)) {
-      df <- df[order(as.numeric(df$padj), na.last = TRUE), ]
+    # Order by adjusted p if present
+    if (adj_col %in% names(df)) {
+      df <- df[order(as.numeric(df[[adj_col]]), na.last = TRUE), ]
     }
     
     df
-  }, sanitize.text.function = function(x) x)  # allow formatted strings
+  }, sanitize.text.function = function(x) x)
   
   # observe({
   #   df <- run_tests()
