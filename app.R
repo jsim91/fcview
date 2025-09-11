@@ -1224,19 +1224,50 @@ server <- function(input, output, session) {
         dfreq <- freq_by(gate$cells, rv$meta_cell, group_var, unit_var)
         
         if (test_type == "Wilcoxon (2-group)") {
-          if (!nzchar(group_var)) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
-          g <- droplevels(factor(dfreq[[group_var]]))
+          if (!nzchar(input$group_var)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
+          g <- droplevels(factor(.x[[input$group_var]]))
           ok <- !is.na(g)
-          g <- g[ok]; freq_ok <- dfreq$freq[ok]
-          if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = sum(ok)))
-          wt <- wilcox.test(freq_ok ~ g)
-          data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = sum(ok))
+          g <- g[ok]; freq_ok <- .x$freq[ok]
+          if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
           
+          # Compute per-group summaries safely
+          summaries <- tapply(freq_ok, g, function(v) {
+            c(med = median(v, na.rm = TRUE),
+              q25 = quantile(v, 0.25, na.rm = TRUE),
+              q75 = quantile(v, 0.75, na.rm = TRUE))
+          })
+          summaries <- summaries[!vapply(summaries, function(x) all(is.na(x)), logical(1))]
+          sum_df <- as.data.frame(do.call(cbind, summaries))
+          if (ncol(sum_df) > 0) {
+            names(sum_df) <- unlist(lapply(names(summaries), function(grp) {
+              paste0(grp, c("_med", "_q25", "_q75"))
+            }))
+          }
+          
+          wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
+          cbind(data.frame(test = "wilcox", p = wt$p.value, n = sum(ok)), sum_df)
         } else if (test_type == "Kruskal–Wallis (multi-group)") {
-          if (!nzchar(group_var)) return(data.frame(entity = gn, test = "kruskal", p = NA, n = nrow(dfreq)))
-          kw <- kruskal.test(freq ~ dfreq[[group_var]], data = dfreq)
-          data.frame(entity = gn, test = "kruskal", p = kw$p.value, n = nrow(dfreq))
+          if (!nzchar(input$group_var)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
+          g <- .x[[input$group_var]]
+          ok <- !is.na(g)
+          if (!any(ok)) return(data.frame(test = "kruskal", p = NA, n = 0))
           
+          # Compute per-group summaries safely
+          summaries <- tapply(.x$freq[ok], g[ok], function(v) {
+            c(med = median(v, na.rm = TRUE),
+              q25 = quantile(v, 0.25, na.rm = TRUE),
+              q75 = quantile(v, 0.75, na.rm = TRUE))
+          })
+          summaries <- summaries[!vapply(summaries, function(x) all(is.na(x)), logical(1))]
+          sum_df <- as.data.frame(do.call(cbind, summaries))
+          if (ncol(sum_df) > 0) {
+            names(sum_df) <- unlist(lapply(names(summaries), function(grp) {
+              paste0(grp, c("_med", "_q25", "_q75"))
+            }))
+          }
+          
+          kw <- kruskal.test(.x$freq[ok] ~ as.factor(g[ok]))
+          cbind(data.frame(test = "kruskal", p = kw$p.value, n = sum(ok)), sum_df)
         } else {
           cont <- input$cont_var
           if (!nzchar(cont)) return(data.frame(entity = gn, test = "spearman", rho = NA, p = NA, n = nrow(dfreq)))
