@@ -473,18 +473,21 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       },
       content = function(file) {
         gg <- plot_cache_gg()
-        if (is.null(gg)) {
-          showNotification("No plot available to export.", type = "error")
+        if (is.null(gg) || !inherits(gg, "ggplot")) {
+          showNotification("No ggplot available to export. Try re‑plotting before exporting.", type = "error")
           return()
         }
         
         if (!is.null(input$split_by) && nzchar(input$split_by)) {
           # Faceted → dynamic sizing
           n_facets <- length(unique(df()[[input$split_by]]))
-          # Ensure ncol_facets is a valid number
+          if (n_facets < 1) n_facets <- 1
+          
           ncol_facets <- suppressWarnings(as.numeric(input$max_facets))
           if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+          
           nrow_facets <- ceiling(n_facets / ncol_facets)
+          if (!is.finite(nrow_facets) || nrow_facets < 1) nrow_facets <- 1
           
           pdf_width  <- 6 * ncol_facets
           pdf_height <- 6 * nrow_facets
