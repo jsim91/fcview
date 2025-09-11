@@ -753,7 +753,35 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
 }
 
 
-# ---- UI ----
+# --- UI: disable all tabs except Home until data is ready ---
+tags$head(
+  tags$style(HTML("
+    /* Grey out and disable pointer events for disabled tabs */
+    #main_tab li.disabled > a,
+    #main_tab li.disabled > a:hover {
+      pointer-events: none;
+      color: #aaa !important;
+      cursor: not-allowed;
+    }
+  ")),
+  tags$script(HTML("
+    // Handle enable/disable from server
+    Shiny.addCustomMessageHandler('enableTabs', function(enable) {
+      if (enable) {
+        $('#main_tab li').removeClass('disabled');
+      } else {
+        // keep Home (first) enabled; disable others
+        $('#main_tab li:not(:first)').addClass('disabled');
+      }
+    });
+    // On initial connection, disable all but Home
+    $(document).on('shiny:connected', function() {
+      $('#main_tab li:not(:first)').addClass('disabled');
+    });
+  "))
+),
+
+# --- Main UI ---
 ui <- navbarPage(
   "FCView",
   windowTitle = "FCView",
@@ -814,7 +842,7 @@ ui <- navbarPage(
       column(
         3,
         pickerInput("test_entity", "Entity",
-                    choices = c("Clusters", "Celltypes")),  # no "Selected gate(s)" unless you want it here
+                    choices = c("Clusters", "Celltypes")),
         pickerInput("test_gate", "Gate(s)", choices = NULL, multiple = TRUE),
         pickerInput("group_var", "Grouping factor (metadata)",
                     choices = NULL,
@@ -854,6 +882,14 @@ server <- function(input, output, session) {
     pop_size = NULL,
     rep_used = NULL
   )
+  rv$data_ready <- reactiveVal(FALSE)
+  
+  # Disable tabs at startup
+  observe({
+    if (!rv$data_ready()) {
+      session$sendCustomMessage("enableTabs", FALSE)
+    }
+  })
   
   gate_store <- GateStore()
   
@@ -1060,6 +1096,15 @@ server <- function(input, output, session) {
             " tSNE coords=", if (!is.null(rv$tSNE)) nrow(rv$tSNE$coords) else "NULL")
     
     showNotification("Data loaded and initialized.", type = "message")
+    
+    rv$data_ready(TRUE)
+    session$sendCustomMessage("enableTabs", TRUE)
+  })
+  
+  observeEvent(input$main_tab, {
+    if (!rv$data_ready() && !identical(input$main_tab, "Home")) {
+      updateNavbarPage(session, "main_tab", selected = "Home")
+    }
   })
   
   observe({
