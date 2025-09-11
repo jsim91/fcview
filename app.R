@@ -805,14 +805,14 @@ ui <- navbarPage(
       ),
       column(
         9,
-        plotOutput("cluster_heatmap", height = "650px")
+        plotOutput("cluster_heatmap", height = "700px")
       )
     ),
     hr(),
     h4("Abundance testing"),
     fluidRow(
       column(
-        4,
+        3,
         pickerInput("test_entity", "Entity",
                     choices = c("Clusters", "Celltypes")),  # no "Selected gate(s)" unless you want it here
         pickerInput("test_gate", "Gate(s)", choices = NULL, multiple = TRUE),
