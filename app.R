@@ -1213,7 +1213,7 @@ server <- function(input, output, session) {
   run_tests <- eventReactive(input$run_test, {
     test_type <- input$test_type
     
-    # --- Gate-based testing (kept for completeness; only runs if enabled in UI) ---
+    # --- Gate-based testing (kept; fixed .x references) ---
     if (input$test_entity == "Selected gate(s)") {
       req(length(input$test_gate) > 0)
       unit_var  <- req(input$unit_var)
@@ -1224,50 +1224,39 @@ server <- function(input, output, session) {
         dfreq <- freq_by(gate$cells, rv$meta_cell, group_var, unit_var)
         
         if (test_type == "Wilcoxon (2-group)") {
-          if (!nzchar(input$group_var)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
-          g <- droplevels(factor(.x[[input$group_var]]))
+          if (!nzchar(group_var)) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
+          g <- droplevels(factor(dfreq[[group_var]]))
           ok <- !is.na(g)
-          g <- g[ok]; freq_ok <- .x$freq[ok]
-          if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
+          g <- g[ok]; freq_ok <- dfreq$freq[ok]
+          if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = sum(ok)))
           
-          # Compute per-group summaries safely
-          summaries <- tapply(freq_ok, g, function(v) {
-            c(med = median(v, na.rm = TRUE),
-              q25 = quantile(v, 0.25, na.rm = TRUE),
-              q75 = quantile(v, 0.75, na.rm = TRUE))
-          })
-          summaries <- summaries[!vapply(summaries, function(x) all(is.na(x)), logical(1))]
-          sum_df <- as.data.frame(do.call(cbind, summaries))
-          if (ncol(sum_df) > 0) {
-            names(sum_df) <- unlist(lapply(names(summaries), function(grp) {
-              paste0(grp, c("_med", "_q25", "_q75"))
-            }))
-          }
+          # Per-group summaries -> one-row data.frame with names like Group_med, Group_q25, Group_q75
+          summaries <- tapply(freq_ok, g, function(v) c(med = median(v, na.rm = TRUE),
+                                                        q25 = quantile(v, 0.25, na.rm = TRUE),
+                                                        q75 = quantile(v, 0.75, na.rm = TRUE)))
+          vec <- unlist(summaries, use.names = TRUE)
+          names(vec) <- gsub("\\.", "_", names(vec))  # "male.med" -> "male_med"
+          sum_df <- as.data.frame(as.list(vec), stringsAsFactors = FALSE)
           
           wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
-          cbind(data.frame(test = "wilcox", p = wt$p.value, n = sum(ok)), sum_df)
+          cbind(data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = sum(ok)), sum_df)
+          
         } else if (test_type == "Kruskal–Wallis (multi-group)") {
-          if (!nzchar(input$group_var)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
-          g <- .x[[input$group_var]]
+          if (!nzchar(group_var)) return(data.frame(entity = gn, test = "kruskal", p = NA, n = nrow(dfreq)))
+          g <- dfreq[[group_var]]
           ok <- !is.na(g)
-          if (!any(ok)) return(data.frame(test = "kruskal", p = NA, n = 0))
+          if (!any(ok)) return(data.frame(entity = gn, test = "kruskal", p = NA, n = 0))
           
-          # Compute per-group summaries safely
-          summaries <- tapply(.x$freq[ok], g[ok], function(v) {
-            c(med = median(v, na.rm = TRUE),
-              q25 = quantile(v, 0.25, na.rm = TRUE),
-              q75 = quantile(v, 0.75, na.rm = TRUE))
-          })
-          summaries <- summaries[!vapply(summaries, function(x) all(is.na(x)), logical(1))]
-          sum_df <- as.data.frame(do.call(cbind, summaries))
-          if (ncol(sum_df) > 0) {
-            names(sum_df) <- unlist(lapply(names(summaries), function(grp) {
-              paste0(grp, c("_med", "_q25", "_q75"))
-            }))
-          }
+          summaries <- tapply(dfreq$freq[ok], as.factor(g[ok]), function(v) c(med = median(v, na.rm = TRUE),
+                                                                              q25 = quantile(v, 0.25, na.rm = TRUE),
+                                                                              q75 = quantile(v, 0.75, na.rm = TRUE)))
+          vec <- unlist(summaries, use.names = TRUE)
+          names(vec) <- gsub("\\.", "_", names(vec))
+          sum_df <- as.data.frame(as.list(vec), stringsAsFactors = FALSE)
           
-          kw <- kruskal.test(.x$freq[ok] ~ as.factor(g[ok]))
-          cbind(data.frame(test = "kruskal", p = kw$p.value, n = sum(ok)), sum_df)
+          kw <- kruskal.test(dfreq$freq[ok] ~ as.factor(g[ok]))
+          cbind(data.frame(entity = gn, test = "kruskal", p = kw$p.value, n = sum(ok)), sum_df)
+          
         } else {
           cont <- input$cont_var
           if (!nzchar(cont)) return(data.frame(entity = gn, test = "spearman", rho = NA, p = NA, n = nrow(dfreq)))
@@ -1277,13 +1266,17 @@ server <- function(input, output, session) {
       })
       
       out <- do.call(rbind, tests)
-      if (nrow(out) && isTRUE(input$apply_bh) && "p" %in% colnames(out)) out$padj <- p.adjust(out$p, method = "BH")
+      if (nrow(out) && isTRUE(input$apply_bh) && "p" %in% colnames(out))
+        out$padj <- p.adjust(out$p, method = "BH")
+      
+      # Round p and padj
+      if ("p" %in% names(out)) out$p <- round(out$p, 3)
+      if ("padj" %in% names(out)) out$padj <- round(out$padj, 3)
       return(out)
     }
     
     # --- Cluster or celltype testing using abundance matrix ---
     abund0 <- rv$clusters$abundance
-    
     if (is.null(abund0)) {
       showNotification("No abundance matrix available. Ensure obj$leiden$abundance is present in the upload.", type = "error", duration = NULL)
       message("run_tests: rv$clusters$abundance is NULL; aborting.")
@@ -1295,28 +1288,23 @@ server <- function(input, output, session) {
       return(data.frame(entity = NA, test = NA, p = NA, n = NA))
     }
     
-    # Aggregate to celltypes if requested and mapping exists
     abund <- abund0
     if (input$test_entity == "Celltypes" &&
         !is.null(rv$cluster_map) &&
         all(c("cluster", "celltype") %in% names(rv$cluster_map))) {
       
       cm <- rv$cluster_map
-      # Keep only mapped clusters that exist as columns
       keep <- cm$cluster %in% colnames(abund)
       cm <- cm[keep, , drop = FALSE]
       if (!nrow(cm)) {
         showNotification("No overlapping clusters to aggregate into celltypes.", type = "error")
         return(data.frame(entity = NA, test = NA, p = NA, n = NA))
       }
-      # Sum clusters per celltype
       split_idx <- split(cm$cluster, cm$celltype)
       abund <- sapply(split_idx, function(cols) rowSums(abund0[, cols, drop = FALSE]))
-      # Keep matrix shape
       abund <- as.matrix(abund)
     }
     
-    # If both group_var and cont_var are blank, return NA row (UI will show a message)
     if (!nzchar(input$group_var) && !nzchar(input$cont_var)) {
       return(data.frame(entity = NA, test = NA, p = NA, n = NA))
     }
@@ -1331,7 +1319,6 @@ server <- function(input, output, session) {
     
     abund_df <- as.data.frame(abund)
     abund_df$patient_ID <- pid
-    
     meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
     abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
     
@@ -1360,39 +1347,34 @@ server <- function(input, output, session) {
           g <- g[ok]; freq_ok <- .x$freq[ok]
           if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
           
-          # Compute per-group summaries
           summaries <- tapply(freq_ok, g, function(v) {
-            c(med = median(v, na.rm = TRUE),
-              q25 = quantile(v, 0.25, na.rm = TRUE),
-              q75 = quantile(v, 0.75, na.rm = TRUE))
+            med <- median(v, na.rm = TRUE)
+            q25 <- quantile(v, 0.25, na.rm = TRUE)
+            q75 <- quantile(v, 0.75, na.rm = TRUE)
+            sprintf("%.3f (%.3f–%.3f)", med, q25, q75)
           })
-          # Flatten into named columns
-          sum_df <- as.data.frame(do.call(cbind, summaries))
-          names(sum_df) <- paste0(rep(names(summaries), each = 3),
-                                  c("_med", "_q25", "_q75"))
+          sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
+          names(sum_df) <- paste0(names(sum_df), "_IQR")
           
           wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
-          cbind(data.frame(test = "wilcox", p = wt$p.value, n = sum(ok)), sum_df)
-          
+          cbind(data.frame(test = "wilcox", n = sum(ok), p = wt$p.value), sum_df)
         } else if (test_type == "Kruskal–Wallis (multi-group)") {
           if (!nzchar(input$group_var)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
           g <- .x[[input$group_var]]
           ok <- !is.na(g)
           if (!any(ok)) return(data.frame(test = "kruskal", p = NA, n = 0))
           
-          # Compute per-group summaries
           summaries <- tapply(.x$freq[ok], g[ok], function(v) {
-            c(med = median(v, na.rm = TRUE),
-              q25 = quantile(v, 0.25, na.rm = TRUE),
-              q75 = quantile(v, 0.75, na.rm = TRUE))
+            med <- median(v, na.rm = TRUE)
+            q25 <- quantile(v, 0.25, na.rm = TRUE)
+            q75 <- quantile(v, 0.75, na.rm = TRUE)
+            sprintf("%.3f (%.3f–%.3f)", med, q25, q75)
           })
-          sum_df <- as.data.frame(do.call(cbind, summaries))
-          names(sum_df) <- paste0(rep(names(summaries), each = 3),
-                                  c("_med", "_q25", "_q75"))
+          sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
+          names(sum_df) <- paste0(names(sum_df), "_IQR")
           
           kw <- kruskal.test(.x$freq[ok] ~ as.factor(g[ok]))
-          cbind(data.frame(test = "kruskal", p = kw$p.value, n = sum(ok)), sum_df)
-          
+          cbind(data.frame(test = "kruskal", n = sum(ok), p = kw$p.value), sum_df)
         } else {
           if (!nzchar(input$cont_var)) return(data.frame(test = "spearman", rho = NA, p = NA, n = nrow(.x)))
           cont <- input$cont_var
@@ -1409,6 +1391,14 @@ server <- function(input, output, session) {
     # Round p and padj to 3 decimal places if they exist
     if ("p" %in% names(res))    res$p    <- round(res$p, 3)
     if ("padj" %in% names(res)) res$padj <- round(res$padj, 3)
+    
+    if (nrow(res) && isTRUE(input$apply_bh) && "p" %in% colnames(res)) {
+      res$padj <- p.adjust(res$p, method = "BH")
+    }
+    
+    # Ensure column order: entity, test, n, p, padj, then all *_IQR
+    iqr_cols <- grep("_IQR$", names(res), value = TRUE)
+    res <- res[, c("entity", "test", "n", "p", "padj", iqr_cols), drop = FALSE]
     
     res
   })
