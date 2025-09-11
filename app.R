@@ -1,5 +1,5 @@
 # app.R
-# CyTOF Explorer — upload-enabled, polygon-gating Shiny app
+# App used to explore FCSimple results
 
 # ---- Packages ----
 suppressPackageStartupMessages({
@@ -21,7 +21,6 @@ suppressPackageStartupMessages({
     library(viridis)
     library(scales)
     library(sf)         # point-in-polygon
-    library(jsonlite)   # gate import/export
   })
 })
 
@@ -262,7 +261,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     
     current_sel <- reactiveVal(integer(0))
     
-    plot_cache_base <- reactiveVal(NULL)  # base plot without gates
+    plot_cache_base <- reactiveVal(NULL)  # base plot
     plot_cache      <- reactiveVal(NULL)  # final plot with overlays
     
     # Helper: clip values to reference distribution percentiles (1%–99%)
@@ -637,7 +636,7 @@ ui <- navbarPage(
         tableOutput("meta_overview"),
         h4("App capabilities"),
         tags$ul(
-          tags$li(tags$b("Embeddings:"), " UMAP and tSNE with marker overlays and metadata faceting (shown if uploaded)"),
+          tags$li(tags$b("Embeddings:"), " UMAP and tSNE with marker overlays and metadata faceting"),
           tags$li(tags$b("Abundance testing:"), " Wilcoxon, Kruskal–Wallis, Spearman with BH correction"),
           tags$li(tags$b("Clusters:"), " Heatmap of cluster phenotypes when provided")
         )
