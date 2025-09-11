@@ -624,9 +624,9 @@ ui <- navbarPage(
     sidebarLayout(
       sidebarPanel(
         h4("Upload inputs"),
-        fileInput("rdata_upload", "Upload .RData (contains shinyAppInput)", accept = ".RData"),
+        fileInput("rdata_upload", "Upload .RData (FCSimple analysis object)", accept = ".RData"),
         numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
-        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time."), 
+        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time. This is done to speed up plotting."), 
         width = 3
       ),
       mainPanel(
@@ -1147,11 +1147,6 @@ server <- function(input, output, session) {
       res$padj <- p.adjust(res$p, method = "BH")
     }
     
-    # Round p and padj to 3 decimal places if they exist
-    if ("p" %in% names(res))    res$p    <- round(res$p, 3)
-    if ("padj" %in% names(res)) res$padj <- round(res$padj, 3)
-    if ("rho" %in% names(res))  res$rho  <- round(res$rho, 2)
-    
     # Ensure column order: entity, test, n, p, padj, rho (if present), then all *_IQR
     iqr_cols <- grep("_IQR$", names(res), value = TRUE)
     base_cols <- c("entity", "test", "n", "p", "padj")
@@ -1166,17 +1161,22 @@ server <- function(input, output, session) {
   output$test_table <- renderTable({
     df <- req(run_tests())
     
-    # Round p and padj to 3 decimal places if they exist
+    # Format p and padj to exactly 3 decimal places (with trailing zeros)
     num_cols <- intersect(c("p", "padj"), names(df))
-    df[num_cols] <- lapply(df[num_cols], function(x) round(x, 3))
+    df[num_cols] <- lapply(df[num_cols], function(x) formatC(x, format = "f", digits = 3))
+    
+    # If rho exists, also format it to 3 decimals
+    if ("rho" %in% names(df)) {
+      df$rho <- formatC(df$rho, format = "f", digits = 2)
+    }
     
     # If padj exists, order by it ascending (lowest at top)
     if ("padj" %in% names(df)) {
-      df <- df[order(df$padj, na.last = TRUE), ]
+      df <- df[order(as.numeric(df$padj), na.last = TRUE), ]
     }
     
     df
-  })
+  }, sanitize.text.function = function(x) x)  # allow formatted strings
 }
 
 shinyApp(ui, server)
