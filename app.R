@@ -779,7 +779,7 @@ tags$head(
       $('#main_tab li:not(:first)').addClass('disabled');
     });
   "))
-),
+)
 
 # --- Main UI ---
 ui <- navbarPage(
