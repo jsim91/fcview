@@ -614,13 +614,12 @@ tags$head(
   "))
 )
 
-useShinyjs()
-
 # --- Main UI ---
 ui <- navbarPage(
   "FCView",
   windowTitle = "FCView",
   id = "main_tab",
+  useShinyjs(),
   
   tabPanel(
     "Home",
@@ -1255,7 +1254,8 @@ server <- function(input, output, session) {
   }, sanitize.text.function = function(x) x)  # allow formatted strings
   
   observe({
-    has_data <- !is.null(run_tests()) && nrow(run_tests()) > 0
+    df <- run_tests()
+    has_data <- !is.null(df) && nrow(df) > 0
     if (has_data) {
       shinyjs::enable("export_results")
     } else {
@@ -1266,8 +1266,7 @@ server <- function(input, output, session) {
   output$export_results <- downloadHandler(
     filename = function() {
       info <- rv$last_test_info
-      if (is.null(info)) return("results.csv")  # fallback
-      
+      if (is.null(info)) return("results.csv")
       fname <- paste(info$entity, info$test, info$metadata, sep = "_")
       fname <- gsub(" ", "_", fname)
       fname <- tolower(fname)
@@ -1275,8 +1274,10 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       df <- run_tests()
+      req(!is.null(df), nrow(df) > 0)
       write.csv(df, file, row.names = FALSE, fileEncoding = "UTF-8-BOM")
-    }
+    },
+    contentType = "text/csv"
   )
 }
 
