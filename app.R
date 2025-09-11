@@ -259,8 +259,12 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
                         choices = c(numeric_markers, meta_cols),
                         selected = if (length(numeric_markers)) numeric_markers[1] else meta_cols[1])
       updatePickerInput(session, "split_by", choices = c("", meta_cols), selected = "")
-      updatePickerInput(session, "group_var", choices = meta_cols)
-      updatePickerInput(session, "cont_var", choices = cont_choices)
+      updatePickerInput(session, "group_var",
+                        choices = c("", meta_cols),
+                        selected = "")
+      updatePickerInput(session, "cont_var",
+                        choices = c("", cont_choices),
+                        selected = "")
       updatePickerInput(session, "unit_var", choices = meta_cols, selected = unit_default)
       
       message(sprintf("Picker inputs initialized for %s (reactive observer)", embedding_name))
@@ -812,8 +816,12 @@ ui <- navbarPage(
         pickerInput("test_entity", "Entity",
                     choices = c("Clusters", "Celltypes")),  # no "Selected gate(s)" unless you want it here
         pickerInput("test_gate", "Gate(s)", choices = NULL, multiple = TRUE),
-        pickerInput("group_var", "Grouping factor (metadata)", choices = NULL),
-        pickerInput("cont_var", "Continuous metadata", choices = NULL),
+        pickerInput("group_var", "Grouping factor (metadata)",
+                    choices = NULL,
+                    options = list(`none-selected-text` = "None")), 
+        pickerInput("cont_var", "Continuous metadata",
+                    choices = NULL,
+                    options = list(`none-selected-text` = "None")), 
         radioButtons("test_type", "Test",
                      choices = c("Wilcoxon (2-group)",
                                  "Kruskal–Wallis (multi-group)",
@@ -1172,37 +1180,34 @@ server <- function(input, output, session) {
     )
   })
   
-  # ---- Abundance testing ----
   run_tests <- eventReactive(input$run_test, {
     test_type <- input$test_type
     
-    # --- Gate-based testing (optional) ---
     if (input$test_entity == "Selected gate(s)") {
       req(length(input$test_gate) > 0)
       unit_var  <- req(input$unit_var)
-      group_var <- req(input$group_var)
+      group_var <- input$group_var
       
       tests <- lapply(input$test_gate, function(gn) {
         gate <- gate_store$list()[[gn]]
         dfreq <- freq_by(gate$cells, rv$meta_cell, group_var, unit_var)
         
         if (test_type == "Wilcoxon (2-group)") {
+          if (!nzchar(group_var)) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
           g <- droplevels(factor(dfreq[[group_var]]))
-          if (length(levels(g)) != 2)
-            return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
+          if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
           wt <- wilcox.test(freq ~ g, data = dfreq)
           data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = nrow(dfreq))
           
         } else if (test_type == "Kruskal–Wallis (multi-group)") {
+          if (!nzchar(group_var)) return(data.frame(entity = gn, test = "kruskal", p = NA, n = nrow(dfreq)))
           kw <- kruskal.test(freq ~ dfreq[[group_var]], data = dfreq)
           data.frame(entity = gn, test = "kruskal", p = kw$p.value, n = nrow(dfreq))
           
         } else {
-          cont <- req(input$cont_var)
-          ct <- spearman_test(
-            dfreq %>% dplyr::rename(!!cont := dplyr::all_of(cont)),
-            cont_var = cont
-          )
+          cont <- input$cont_var
+          if (!nzchar(cont)) return(data.frame(entity = gn, test = "spearman", rho = NA, p = NA, n = nrow(dfreq)))
+          ct <- spearman_test(dfreq, cont_var = cont)
           cbind(data.frame(entity = gn, test = "spearman"), ct)
         }
       })
@@ -1213,19 +1218,15 @@ server <- function(input, output, session) {
       out
       
     } else {
-      # --- Cluster or celltype testing using abundance matrix ---
       abund <- rv$clusters$abundance
       req(!is.null(abund), nrow(abund) > 0)
       
       sources <- rownames(abund)
-      
-      # Map sources to patient_ID using regex from metadata
       ids <- unique(rv$meta_cell$patient_ID)
       ids <- ids[order(nchar(ids), decreasing = TRUE)]
       pattern <- paste0("(", paste0(ids, collapse = "|"), ")")
       pid <- stringr::str_extract(sources, pattern)
       
-      # Build abundance data.frame with metadata
       abund_df <- as.data.frame(abund)
       abund_df$patient_ID <- pid
       meta_unique <- rv$meta_cell %>%
@@ -1233,23 +1234,18 @@ server <- function(input, output, session) {
       abund_df <- abund_df %>%
         dplyr::left_join(meta_unique, by = "patient_ID")
       
-      # Melt to long format: one row per sample × cluster
       abund_long <- abund_df %>%
-        tidyr::pivot_longer(
-          cols = colnames(abund),
-          names_to = "entity",
-          values_to = "freq"
-        )
+        tidyr::pivot_longer(cols = colnames(abund),
+                            names_to = "entity",
+                            values_to = "freq")
       
-      # Run the chosen test per entity
       res <- abund_long %>%
         dplyr::group_by(entity) %>%
         dplyr::group_modify(~ {
           if (test_type == "Wilcoxon (2-group)") {
             if (!nzchar(input$group_var)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
             g <- droplevels(factor(.x[[input$group_var]]))
-            if (length(levels(g)) != 2)
-              return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
+            if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
             wt <- wilcox.test(freq ~ g, data = .x)
             data.frame(test = "wilcox", p = wt$p.value, n = nrow(.x))
             
