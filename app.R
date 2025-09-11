@@ -659,7 +659,7 @@ ui <- navbarPage(
         selectInput(
           "heatmap_theme",
           "Heatmap color theme",
-          choices = c("viridis", "greyscale"),
+          choices = c("viridis", "heat", "greyscale"),
           selected = "viridis"
         )
       ),
@@ -1061,21 +1061,22 @@ server <- function(input, output, session) {
     
     palette_choice <- switch(
       input$heatmap_theme,
-      
       "viridis" = {
-        # This matches your current default
-        z <- rnorm(n = 100, mean = 0, sd = 10)
-        col_seq <- seq(min(z), max(z), length.out = n <- 100)
+        circlize::colorRamp2(
+          c(min(M), median(M), max(M)),
+          viridis(3), 
+        )
+      }, 
+      "heat" = {
+        col_seq <- seq(min(M), max(M), length.out = n <- 100)
         circlize::colorRamp2(
           col_seq,
           colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(n)
         )
       },
-      
       "greyscale" = {
-        z <- rnorm(n = 100, mean = 0, sd = 10)
         circlize::colorRamp2(
-          c(min(z), median(z), max(z)),
+          c(min(M), median(M), max(M)),
           c("black", "grey50", "white")
         )
       }
