@@ -350,7 +350,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
         }
         
         # --- Balanced downsampling across shown, nonempty facets ---
-        max_total <- 200000
+        max_total <- input$max_cells_upload %||% 100000
         
         # Count only nonempty facets
         facet_counts <- table(dd[[split_var]])
