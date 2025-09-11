@@ -360,7 +360,6 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           
         } else {
           # Single-panel plotly scatter
-          # Build a ggplot for export even if we display plotly directly
           gg <- ggplot(dd, aes(x = x, y = y, color = .data[[color_by]])) +
             geom_point(size = 0.25, alpha = 0.25) +
             theme_minimal() +
@@ -370,6 +369,15 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
               color = color_by
             )
           plot_cache_gg(gg)
+          
+          # Compute colours for plotly to match ggplot
+          if (is.numeric(dd[[color_by]])) {
+            cols <- scales::col_numeric(viridis::viridis(256),
+                                        domain = range(dd[[color_by]], na.rm = TRUE))(dd[[color_by]])
+          } else {
+            pal <- viridis::viridis(length(unique(dd[[color_by]])))
+            cols <- setNames(pal, sort(unique(dd[[color_by]])))[as.character(dd[[color_by]])]
+          }
           
           p_base <- plot_ly(
             data = dd, x = ~x, y = ~y,
@@ -437,8 +445,37 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       plot_cache()
     })
     
-    # Keep the plot alive when hidden
-    outputOptions(output, "embed_plot", suspendWhenHidden = FALSE)
+    output$export_embed_pdf <- downloadHandler(
+      filename = function() {
+        paste0(tolower(embedding_name), "_embedding_", Sys.Date(), ".pdf")
+      },
+      content = function(file) {
+        gg <- plot_cache_gg()
+        if (is.null(gg)) {
+          showNotification("No plot available to export.", type = "error")
+          return()
+        }
+        
+        # Decide sizing based on whether faceting is active
+        if (!is.null(input$split_by) && nzchar(input$split_by)) {
+          # Faceted → dynamic sizing
+          n_facets <- length(unique(df()[[input$split_by]]))
+          ncol_facets <- if (!is.null(input$max_facets)) as.numeric(input$max_facets) else 1
+          nrow_facets <- ceiling(n_facets / ncol_facets)
+          
+          pdf_width  <- 6 * ncol_facets
+          pdf_height <- 6 * nrow_facets
+        } else {
+          # Single panel → fixed size
+          pdf_width  <- 8
+          pdf_height <- 8
+        }
+        
+        ggsave(file, plot = gg, device = cairo_pdf,
+               width = pdf_width, height = pdf_height, units = "in")
+      },
+      contentType = "application/pdf"
+    )
     
     # Ensure the plot renders even when the tab is hidden (prevents some init races)
     outputOptions(output, "embed_plot", suspendWhenHidden = FALSE)
