@@ -1293,13 +1293,7 @@ server <- function(input, output, session) {
     # Map abundance rows (sources) to patient_ID via escaped regex
     sources <- rownames(abund)
     ids <- unique(rv$meta_cell$patient_ID)
-    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\
-
-\[\\]
-
-{}\\\\]
-
-)", "\\\\\\\\1")
+    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\\\1")
     ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
     pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
     pid <- stringr::str_extract(sources, pattern)
