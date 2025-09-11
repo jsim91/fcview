@@ -167,7 +167,10 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       updatePickerInput(session, "color_by",
                         choices = c(numeric_markers, meta_cols),
                         selected = if (length(numeric_markers)) numeric_markers[1] else meta_cols[1])
-      updatePickerInput(session, "split_by", choices = c("", meta_cols), selected = "")
+      factor_cols <- meta_cols[sapply(meta_val[meta_cols], is.factor)]
+      char_cols   <- meta_cols[sapply(meta_val[meta_cols], is.character)]
+      categorical_choices <- c(factor_cols, char_cols)
+      updatePickerInput(session, "split_by", choices = c("", categorical_choices), selected = "")
       updatePickerInput(session, "group_var",
                         choices = c("", meta_cols),
                         selected = "")
@@ -606,7 +609,7 @@ ui <- navbarPage(
         h4("Upload inputs"),
         fileInput("rdata_upload", "Upload .RData (FCSimple analysis object)", accept = ".RData"),
         numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
-        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time. This is done to speed up plotting."), 
+        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time. This is done to speed up facet (split) plotting."), 
         width = 3
       ),
       mainPanel(
@@ -616,9 +619,8 @@ ui <- navbarPage(
         tableOutput("meta_overview"),
         h4("App capabilities"),
         tags$ul(
-          tags$li(tags$b("Embeddings:"), " UMAP and tSNE with marker overlays and metadata faceting"),
-          tags$li(tags$b("Abundance testing:"), " Wilcoxon, Kruskal–Wallis, Spearman with BH correction"),
-          tags$li(tags$b("Clusters:"), " Heatmap of cluster phenotypes when provided")
+          tags$li(tags$b("Embeddings:"), " UMAP and tSNE with marker overlays, metadata overlays, and metadata faceting"),
+          tags$li(tags$b("Clusters:"), " Heatmap of cluster phenotypes and abundance testing of cluster size by metadata features")
         )
       )
     )
@@ -639,7 +641,9 @@ ui <- navbarPage(
           "Heatmap color theme",
           choices = c("viridis", "heat", "greyscale"),
           selected = "viridis"
-        )
+        ), 
+        br(), br(),
+        downloadButton("export_heatmap_pdf", "Export heatmap as PDF")
       ),
       column(
         9,
@@ -1020,42 +1024,97 @@ server <- function(input, output, session) {
     )
   }, sanitize.text.function = function(x) x)
   
-  output$cluster_heatmap <- renderPlot({
+  # output$cluster_heatmap <- renderPlot({
+  #   req(rv$cluster_heat)
+  #   M <- rv$cluster_heat
+  #   
+  #   # Replace any newline characters in row and column names with a space
+  #   if (!is.null(rownames(M))) {
+  #     rownames(M) <- gsub("\\n", " ", rownames(M))
+  #   }
+  #   if (!is.null(colnames(M))) {
+  #     colnames(M) <- gsub("\\n", " ", colnames(M))
+  #   }
+  #   
+  #   ranno <- NULL
+  #   if (!is.null(rv$pop_size)) {
+  #     size_vals <- rv$pop_size[, 1]
+  #     size_col_fun <- circlize::colorRamp2(
+  #       c(min(size_vals, na.rm = TRUE),
+  #         max(size_vals, na.rm = TRUE)),
+  #       c("white", "red")
+  #     )
+  #     
+  #     ranno <- rowAnnotation(
+  #       Size = size_vals,
+  #       col = list(Size = size_col_fun),
+  #       gp = grid::gpar(col = "black", lwd = 0.5)  # black border
+  #     )
+  #   }
+  #   
+  #   palette_choice <- switch(
+  #     input$heatmap_theme,
+  #     "viridis" = {
+  #       circlize::colorRamp2(
+  #         c(min(M), median(M), max(M)),
+  #         viridis(3), 
+  #       )
+  #     }, 
+  #     "heat" = {
+  #       col_seq <- seq(min(M), max(M), length.out = n <- 100)
+  #       circlize::colorRamp2(
+  #         col_seq,
+  #         colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(n)
+  #       )
+  #     },
+  #     "greyscale" = {
+  #       circlize::colorRamp2(
+  #         c(min(M), median(M), max(M)),
+  #         c("black", "grey50", "white")
+  #       )
+  #     }
+  #   )
+  #   
+  #   Heatmap(
+  #     M,
+  #     name = "expr",
+  #     cluster_rows = isTRUE(input$cluster_rows),
+  #     cluster_columns = isTRUE(input$cluster_columns),
+  #     right_annotation = ranno,
+  #     row_names_side = "left",
+  #     rect_gp = gpar(lwd = 0.33, col = "black"), 
+  #     col = palette_choice
+  #   )
+  # })
+  heatmap_obj <- reactive({
     req(rv$cluster_heat)
     M <- rv$cluster_heat
     
-    # Replace any newline characters in row and column names with a space
-    if (!is.null(rownames(M))) {
-      rownames(M) <- gsub("\\n", " ", rownames(M))
-    }
-    if (!is.null(colnames(M))) {
-      colnames(M) <- gsub("\\n", " ", colnames(M))
-    }
+    # Clean row/col names
+    if (!is.null(rownames(M))) rownames(M) <- gsub("\\n", " ", rownames(M))
+    if (!is.null(colnames(M))) colnames(M) <- gsub("\\n", " ", colnames(M))
     
+    # Annotation
     ranno <- NULL
     if (!is.null(rv$pop_size)) {
       size_vals <- rv$pop_size[, 1]
       size_col_fun <- circlize::colorRamp2(
-        c(min(size_vals, na.rm = TRUE),
-          max(size_vals, na.rm = TRUE)),
+        c(min(size_vals, na.rm = TRUE), max(size_vals, na.rm = TRUE)),
         c("white", "red")
       )
-      
       ranno <- rowAnnotation(
         Size = size_vals,
         col = list(Size = size_col_fun),
-        gp = grid::gpar(col = "black", lwd = 0.5)  # black border
+        gp = grid::gpar(col = "black", lwd = 0.5)
       )
     }
     
+    # Palette
     palette_choice <- switch(
       input$heatmap_theme,
-      "viridis" = {
-        circlize::colorRamp2(
-          c(min(M), median(M), max(M)),
-          viridis(3), 
-        )
-      }, 
+      "viridis" = circlize::colorRamp2(
+        c(min(M), median(M), max(M)), viridis(3)
+      ),
       "heat" = {
         col_seq <- seq(min(M), max(M), length.out = n <- 100)
         circlize::colorRamp2(
@@ -1063,14 +1122,13 @@ server <- function(input, output, session) {
           colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdYlBu")))(n)
         )
       },
-      "greyscale" = {
-        circlize::colorRamp2(
-          c(min(M), median(M), max(M)),
-          c("black", "grey50", "white")
-        )
-      }
+      "greyscale" = circlize::colorRamp2(
+        c(min(M), median(M), max(M)),
+        c("black", "grey50", "white")
+      )
     )
     
+    # Return the Heatmap object
     Heatmap(
       M,
       name = "expr",
@@ -1078,10 +1136,26 @@ server <- function(input, output, session) {
       cluster_columns = isTRUE(input$cluster_columns),
       right_annotation = ranno,
       row_names_side = "left",
-      rect_gp = gpar(lwd = 0.33, col = "black"), 
+      rect_gp = gpar(lwd = 0.33, col = "black"),
       col = palette_choice
     )
   })
+  
+  output$cluster_heatmap <- renderPlot({
+    draw(heatmap_obj())
+  })
+  
+  output$export_heatmap_pdf <- downloadHandler(
+    filename = function() {
+      paste0("cluster_heatmap_", Sys.Date(), ".pdf")
+    },
+    content = function(file) {
+      pdf(file, width = 8, height = 10)  # adjust size as needed
+      draw(heatmap_obj())
+      dev.off()
+    },
+    contentType = "application/pdf"
+  )
   
   output$hasResults <- reactive({
     df <- run_tests()
