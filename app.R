@@ -1313,23 +1313,6 @@ server <- function(input, output, session) {
     }
   })
   
-  output$abund_plot <- renderPlot({
-    res <- req(run_tests())
-    if (!nrow(res)) return(NULL)
-    if ("rho" %in% names(res)) {
-      ggplot(res, aes(x = n, y = rho, color = p)) +
-        geom_point() +
-        scale_color_viridis_c() +
-        theme_minimal() +
-        labs(title = "Spearman results", x = "N", y = "rho")
-    } else {
-      ggplot(res, aes(x = entity %||% "", y = -log10(p))) +
-        geom_col(fill = "#2c7fb8") +
-        theme_minimal() +
-        labs(title = "Abundance test -log10(p)", x = "", y = "-log10(p)")
-    }
-  })
-  
   output$test_table <- renderTable({
     req(run_tests())
   })
