@@ -1043,17 +1043,25 @@ server <- function(input, output, session) {
   
   observe({
     req(rv$meta_cell)
+    
     meta_cols <- colnames(rv$meta_cell)
     cont_choices <- meta_cols[sapply(rv$meta_cell, is.numeric)]
+    
     unit_candidates <- intersect(
       c("PatientID", "patient_ID", "patient", "source", "RunDate", "run_date"),
       meta_cols
     )
     unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
     
-    updatePickerInput(session, "group_var", choices = meta_cols)
-    updatePickerInput(session, "cont_var", choices = cont_choices)
-    updatePickerInput(session, "unit_var", choices = meta_cols, selected = unit_default)
+    updatePickerInput(session, "group_var",
+                      choices = c("", meta_cols),
+                      selected = "")
+    updatePickerInput(session, "cont_var",
+                      choices = c("", cont_choices),
+                      selected = "")
+    updatePickerInput(session, "unit_var",
+                      choices = meta_cols,
+                      selected = unit_default)
   })
   
   # Launch embedding modules as soon as data is ready (Option 1)
@@ -1183,6 +1191,7 @@ server <- function(input, output, session) {
   run_tests <- eventReactive(input$run_test, {
     test_type <- input$test_type
     
+    # --- Gate-based testing (unchanged) ---
     if (input$test_entity == "Selected gate(s)") {
       req(length(input$test_gate) > 0)
       unit_var  <- req(input$unit_var)
@@ -1218,8 +1227,14 @@ server <- function(input, output, session) {
       out
       
     } else {
+      # --- Cluster or celltype testing using abundance matrix ---
       abund <- rv$clusters$abundance
       req(!is.null(abund), nrow(abund) > 0)
+      
+      # If both group_var and cont_var are blank, return NA row
+      if (!nzchar(input$group_var) && !nzchar(input$cont_var)) {
+        return(data.frame(entity = NA, test = NA, p = NA, n = NA))
+      }
       
       sources <- rownames(abund)
       ids <- unique(rv$meta_cell$patient_ID)
@@ -1267,6 +1282,34 @@ server <- function(input, output, session) {
         res$padj <- p.adjust(res$p, method = "BH")
       
       res
+    }
+  })
+  
+  # --- Plot with message if no variable selected ---
+  output$abund_plot <- renderPlot({
+    res <- req(run_tests())
+    
+    # If both vars are None, show message instead of plot
+    if (!nzchar(input$group_var) && !nzchar(input$cont_var)) {
+      grid::grid.newpage()
+      grid::grid.text("Select a grouping or continuous variable to run tests",
+                      gp = grid::gpar(fontsize = 14))
+      return()
+    }
+    
+    if (!nrow(res)) return(NULL)
+    
+    if ("rho" %in% names(res)) {
+      ggplot(res, aes(x = n, y = rho, color = p)) +
+        geom_point() +
+        scale_color_viridis_c() +
+        theme_minimal() +
+        labs(title = "Spearman results", x = "N", y = "rho")
+    } else {
+      ggplot(res, aes(x = entity %||% "", y = -log10(p))) +
+        geom_col(fill = "#2c7fb8") +
+        theme_minimal() +
+        labs(title = "Abundance test -log10(p)", x = "", y = "-log10(p)")
     }
   })
   
