@@ -128,7 +128,7 @@ EmbeddingUI <- function(id, title = "UMAP") {
 
 # ---- Embedding module server ----
 EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, clusters, cluster_map,
-                            gate_store, active_tab, rv) {
+                            active_tab, rv) {
   moduleServer(id, function(input, output, session) {
     message(sprintf("EmbeddingServer %s started", embedding_name))
     message(sprintf("coords NULL? %s | expr NULL? %s | meta_cell NULL? %s",
@@ -546,37 +546,6 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     outputOptions(output, "embed_plot", suspendWhenHidden = FALSE)
     
     observeEvent(input$clear_selection, current_sel(integer(0)))
-    
-    # Phenotype heatmap
-    output$inout_heatmap <- renderPlot({
-      gname <- req(input$phenotype_gate)
-      glist <- gate_store$list()
-      req(gname %in% names(glist))
-      gate <- glist[[gname]]
-      idx <- gate$cells
-      
-      fun <- switch(input$phenotype_fun,
-                    median = stats::median,
-                    p90 = function(z) quantile(z, 0.9, na.rm = TRUE))
-      
-      in_vals <- apply(expr[idx, , drop = FALSE], 2, fun, na.rm = TRUE)
-      out_vals <- apply(expr[-idx, , drop = FALSE], 2, fun, na.rm = TRUE)
-      
-      M <- rbind(In = in_vals, Out = out_vals)
-      Mz <- t(scale(t(M)))
-      
-      Heatmap(Mz, name = "z",
-              cluster_rows = FALSE, cluster_columns = TRUE,
-              row_names_side = "left",
-              col = colorRamp2(c(-2,0,2), viridis(3)))
-    })
-    
-    # Keep gate pickers synced
-    observe({
-      updatePickerInput(session, "test_gate", choices = names(gate_store$list()))
-      updatePickerInput(session, "overlay_gate", choices = names(gate_store$list()))
-      updatePickerInput(session, "phenotype_gate", choices = names(gate_store$list()))
-    })
   })
 }
 
@@ -659,8 +628,6 @@ ui <- navbarPage(
         fileInput("rdata_upload", "Upload .RData (contains shinyAppInput)", accept = ".RData"),
         numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
         helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time."), 
-        fileInput("json_upload", "Upload gates (.json)", accept = ".json"),
-        hr(),
         width = 3
       ),
       mainPanel(
@@ -671,8 +638,6 @@ ui <- navbarPage(
         h4("App capabilities"),
         tags$ul(
           tags$li(tags$b("Embeddings:"), " UMAP and tSNE with marker overlays and metadata faceting (shown if uploaded)"),
-          tags$li(tags$b("Gating:"), " Lasso and drawn-polygon gating, multiple gates, gate import/export"),
-          tags$li(tags$b("Phenotypes:"), " In-vs-out gate marker heatmaps"),
           tags$li(tags$b("Abundance testing:"), " Wilcoxon, Kruskal–Wallis, Spearman with BH correction"),
           tags$li(tags$b("Clusters:"), " Heatmap of cluster phenotypes when provided")
         )
@@ -703,7 +668,6 @@ ui <- navbarPage(
         3,
         pickerInput("test_entity", "Entity",
                     choices = c("Clusters", "Celltypes")),
-        pickerInput("test_gate", "Gate(s)", choices = NULL, multiple = TRUE),
         pickerInput("group_var", "Grouping factor (metadata)",
                     choices = NULL,
                     options = list(`none-selected-text` = "None")), 
@@ -1001,7 +965,6 @@ server <- function(input, output, session) {
       reactive(rv$meta_cell),
       reactive(rv$clusters),
       reactive(rv$cluster_map),
-      gate_store,
       reactive(input$main_tab),
       rv
     )
@@ -1017,57 +980,9 @@ server <- function(input, output, session) {
       reactive(rv$meta_cell),
       reactive(rv$clusters),
       reactive(rv$cluster_map),
-      gate_store,
       reactive(input$main_tab),
       rv
     )
-  })
-  
-  # Gate JSON upload
-  observeEvent(input$json_upload, {
-    req(input$json_upload)
-    gates <- tryCatch({
-      fromJSON(input$json_upload$datapath, simplifyVector = FALSE)
-    }, error = function(e) {
-      showNotification(paste("Failed to read JSON:", e$message), type = "error"); NULL
-    })
-    req(!is.null(gates))
-    
-    n_before <- length(gate_store$list())
-    # gates can be a named list or unnamed list of gate objects
-    if (is.list(gates) && !is.null(names(gates))) {
-      for (nm in names(gates)) gate_store$add(gates[[nm]])
-    } else if (is.list(gates)) {
-      for (g in gates) gate_store$add(g)
-    }
-    n_after <- length(gate_store$list())
-    showNotification(paste("Loaded", n_after - n_before, "gate(s) from JSON"), type = "message")
-  })
-  
-  # Gate export UI
-  output$gate_export_ui <- renderUI({
-    gl <- gate_store$list()
-    pickerInput("gates_to_export", "Select gates to export",
-                choices = names(gl), multiple = TRUE)
-  })
-  
-  # Gate export download
-  output$export_gates <- downloadHandler(
-    filename = function() paste0("polygon_gates_", format(Sys.Date(), "%Y%m%d"), ".json"),
-    content = function(file) {
-      sel <- input$gates_to_export
-      gl <- gate_store$list()
-      if (!length(sel)) {
-        write_json(list(), path = file, auto_unbox = TRUE, pretty = TRUE)
-      } else {
-        write_json(gl[sel], path = file, auto_unbox = TRUE, pretty = TRUE)
-      }
-    }
-  )
-  
-  observeEvent(input$clear_gates, {
-    gate_store$clear()
-    showNotification("Cleared all gates.", type = "message")
   })
   
   # Home summaries
@@ -1115,6 +1030,7 @@ server <- function(input, output, session) {
   })
   
   run_tests <- eventReactive(input$run_test, {
+    req(rv$meta_cell)
     test_type <- input$test_type
     
     # --- Cluster or celltype testing using abundance matrix ---
