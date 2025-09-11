@@ -14,6 +14,7 @@ suppressPackageStartupMessages({
     library(dplyr)
     library(tidyr)
     library(purrr)
+    library(stringr)
     library(data.table)
     library(ComplexHeatmap)
     library(circlize)
@@ -857,26 +858,29 @@ server <- function(input, output, session) {
   observeEvent(input$rdata_upload, {
     req(input$rdata_upload)
     
+    # Load all objects from the uploaded .RData
     e <- new.env(parent = emptyenv())
     load(input$rdata_upload$datapath, envir = e)
     
-    if ("shinyAppInput" %in% ls(e)) {
-      obj <- e$shinyAppInput
+    # Find all objects with the required structure
+    candidates <- ls(e)
+    matches <- vapply(candidates, function(nm) {
+      cand <- e[[nm]]
+      is.list(cand) && all(c("data", "source", "metadata", "leiden") %in% names(cand))
+    }, logical(1))
+    
+    if (sum(matches) == 1) {
+      obj <- e[[candidates[matches][1]]]
+    } else if (sum(matches) > 1) {
+      showNotification(
+        paste("Multiple valid objects found in .RData:",
+              paste(candidates[matches], collapse = ", ")),
+        type = "error"
+      )
+      return()
     } else {
-      candidates <- ls(e)
-      found <- FALSE
-      for (nm in candidates) {
-        cand <- e[[nm]]
-        if (is.list(cand) && all(c("data","source","metadata","leiden") %in% names(cand))) {
-          obj <- cand
-          found <- TRUE
-          break
-        }
-      }
-      if (!found) {
-        showNotification("No valid input object found in .RData", type = "error")
-        return()
-      }
+      showNotification("No valid input object found in .RData", type = "error")
+      return()
     }
     
     # Ensure embeddings are data.frames
@@ -887,7 +891,7 @@ server <- function(input, output, session) {
       obj$umap$coordinates <- as.data.frame(obj$umap$coordinates)
     }
     
-    # --- Downsample entire object if needed ---
+    # --- Downsample cells if needed (NEVER downsample sample-level metadata) ---
     n_cells <- nrow(obj$data)
     max_cells <- input$max_cells_upload %||% 300000
     
@@ -895,9 +899,8 @@ server <- function(input, output, session) {
       set.seed(123)
       keep_idx <- sort(sample.int(n_cells, max_cells))
       
-      obj$data     <- obj$data[keep_idx, , drop = FALSE]
-      obj$source   <- obj$source[keep_idx]
-      obj$metadata <- obj$metadata[keep_idx, , drop = FALSE]
+      obj$data   <- obj$data[keep_idx, , drop = FALSE]
+      obj$source <- obj$source[keep_idx]
       
       if (!is.null(obj$leiden$clusters) && length(obj$leiden$clusters) == n_cells) {
         obj$leiden$clusters <- obj$leiden$clusters[keep_idx]
@@ -916,42 +919,89 @@ server <- function(input, output, session) {
       showNotification(sprintf("Downsampled from %d to %d cells", n_cells, max_cells), type = "message")
     }
     
-    # Now validate the already-downsampled object
+    # Validate the (possibly downsampled) object
     validateInput(obj, id_col = NULL)
     
-    # Guess ID column and merge metadata immediately
-    guessed <- guess_id_col(obj$metadata, obj$source)
-    id_col <- guessed %||% colnames(obj$metadata)[1]
-    
     expr <- obj$data
-    source_vec <- obj$source
     run_date <- obj$run_date %||% NULL
     
+    # --- Build meta_cell with robust patient_ID mapping ---
     meta_cell <- data.frame(
-      source = source_vec,
+      source  = as.character(obj$source),
       RunDate = if (!is.null(run_date)) run_date else NA
     )
-    colnames(meta_cell)[1] <- "source"
     
-    meta_cell <- meta_cell %>%
-      left_join(obj$metadata %>% mutate(.__id = .data[[id_col]]),
-                by = c("source" = ".__id"))
-    
-    if (!("PatientID" %in% names(meta_cell))) {
-      meta_cell$PatientID <- meta_cell$source
+    # Prepare metadata IDs (character, unique, deduplicated rows)
+    if (!("patient_ID" %in% colnames(obj$metadata))) {
+      showNotification("metadata does not contain 'patient_ID' column.", type = "error")
+      return()
     }
+    obj$metadata$patient_ID <- as.character(obj$metadata$patient_ID)
+    
+    metadata_unique <- obj$metadata %>%
+      dplyr::distinct(patient_ID, .keep_all = TRUE)
+    
+    ids <- unique(metadata_unique$patient_ID)
+    if (length(ids) == 0) {
+      showNotification("No patient_ID values found in metadata.", type = "error")
+      return()
+    }
+    
+    # Escape any regex metacharacters in IDs, then sort by length (longest first)
+    ids_escaped <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
+    ids_escaped <- ids_escaped[order(nchar(ids_escaped), decreasing = TRUE)]
+    pattern <- paste0("(", paste0(ids_escaped, collapse = "|"), ")")
+    
+    # Extract patient_ID from source via regex built from metadata IDs
+    meta_cell$patient_ID <- stringr::str_extract(meta_cell$source, pattern)
+    
+    # Post-extraction sanity check (IDs extracted but not present in metadata)
+    not_in_meta <- setdiff(unique(na.omit(meta_cell$patient_ID)), metadata_unique$patient_ID)
+    if (length(not_in_meta) > 0) {
+      showNotification(
+        paste0("Extracted patient_IDs not found in metadata: ", paste(not_in_meta, collapse = ", ")),
+        type = "warning",
+        duration = NULL
+      )
+    }
+    
+    # Join metadata by patient_ID (safe: metadata_unique has 1 row per ID)
+    meta_cell <- meta_cell %>%
+      dplyr::left_join(metadata_unique, by = "patient_ID")
+    
+    # --- Post-join check for unmatched IDs ---
+    unmatched <- sum(is.na(meta_cell$patient_ID))
+    if (unmatched > 0) {
+      showNotification(
+        paste0("Warning: ", unmatched, " cells could not be matched to metadata (patient_ID missing)."),
+        type = "warning",
+        duration = NULL
+      )
+      message("First few unmatched source entries:")
+      print(utils::head(meta_cell$source[is.na(meta_cell$patient_ID)], 10))
+    }
+    
+    # Ensure PatientID column exists for downstream code
+    if (!("PatientID" %in% names(meta_cell))) {
+      meta_cell$PatientID <- meta_cell$patient_ID
+    }
+    
+    # Factor RunDate if present
     if ("RunDate" %in% names(meta_cell)) {
       meta_cell$RunDate <- as.factor(meta_cell$RunDate)
     }
+    
+    # Add leiden_cluster factor if available
     if (!"leiden_cluster" %in% names(meta_cell) &&
         !is.null(obj$leiden$clusters) &&
         length(obj$leiden$clusters) == nrow(obj$data)) {
-      meta_cell$leiden_cluster <- factor(obj$leiden$clusters, levels = sort(unique(obj$leiden$clusters)))
+      meta_cell$leiden_cluster <- factor(obj$leiden$clusters,
+                                         levels = sort(unique(obj$leiden$clusters)))
     }
     
     clusters <- list(
       assignments = obj$leiden$clusters,
-      settings = obj$leiden$settings %||% list()
+      settings    = obj$leiden$settings %||% list()
     )
     cluster_map <- if (hasClusterMapping(obj)) obj$cluster_mapping else NULL
     
@@ -965,15 +1015,15 @@ server <- function(input, output, session) {
     rep_used     <- if (hasHeatmap(obj)) obj$leiden_heatmap$rep_used else NA
     
     # Store in rv
-    rv$expr <- expr
-    rv$meta_cell <- meta_cell
-    rv$clusters <- clusters
-    rv$cluster_map <- cluster_map
-    rv$UMAP <- UMAP
-    rv$tSNE <- tSNE
+    rv$expr         <- expr
+    rv$meta_cell    <- meta_cell
+    rv$clusters     <- clusters
+    rv$cluster_map  <- cluster_map
+    rv$UMAP         <- UMAP
+    rv$tSNE         <- tSNE
     rv$cluster_heat <- cluster_heat
-    rv$pop_size <- pop_size
-    rv$rep_used <- rep_used
+    rv$pop_size     <- pop_size
+    rv$rep_used     <- rep_used
     
     message("Upload complete: expr rows=", nrow(rv$expr),
             " meta_cell rows=", nrow(rv$meta_cell),
@@ -1122,15 +1172,16 @@ server <- function(input, output, session) {
     )
   })
   
-  # Abundance testing
+  # ---- Abundance testing ----
   run_tests <- eventReactive(input$run_test, {
-    unit_var  <- req(input$unit_var)
-    group_var <- req(input$group_var)
     test_type <- input$test_type
     
     # --- Gate-based testing (optional) ---
     if (input$test_entity == "Selected gate(s)") {
       req(length(input$test_gate) > 0)
+      unit_var  <- req(input$unit_var)
+      group_var <- req(input$group_var)
+      
       tests <- lapply(input$test_gate, function(gn) {
         gate <- gate_store$list()[[gn]]
         dfreq <- freq_by(gate$cells, rv$meta_cell, group_var, unit_var)
@@ -1162,54 +1213,64 @@ server <- function(input, output, session) {
       out
       
     } else {
-      # --- Cluster or celltype testing ---
-      ent_var <- if (input$test_entity == "Clusters") "cluster" else "celltype"
+      # --- Cluster or celltype testing using abundance matrix ---
+      abund <- rv$clusters$abundance
+      req(!is.null(abund), nrow(abund) > 0)
       
-      # Build minimal df equivalent from global reactives
-      dd <- data.frame(
-        cluster  = rv$clusters$assignments,
-        celltype = if (!is.null(rv$cluster_map) &&
-                       all(c("cluster", "celltype") %in% names(rv$cluster_map))) {
-          as.character(rv$cluster_map$celltype[
-            match(rv$clusters$assignments, rv$cluster_map$cluster)
-          ])
-        } else {
-          as.character(rv$clusters$assignments)
-        }
-      )
+      sources <- rownames(abund)
       
-      dd$entity <- if (ent_var == "cluster") dd$cluster else dd$celltype
+      # Map sources to patient_ID using regex from metadata
+      ids <- unique(rv$meta_cell$patient_ID)
+      ids <- ids[order(nchar(ids), decreasing = TRUE)]
+      pattern <- paste0("(", paste0(ids, collapse = "|"), ")")
+      pid <- stringr::str_extract(sources, pattern)
       
-      # Aggregate per-unit frequencies
-      unit_levels <- unique(rv$meta_cell[[unit_var]])
-      res <- lapply(unit_levels, function(u) {
-        idx <- which(rv$meta_cell[[unit_var]] == u)
-        data.frame(
-          unit  = u,
-          group = unique(rv$meta_cell[[group_var]][idx])[1],
-          freq  = sum(!is.na(dd$entity[idx])) / length(idx)
+      # Build abundance data.frame with metadata
+      abund_df <- as.data.frame(abund)
+      abund_df$patient_ID <- pid
+      meta_unique <- rv$meta_cell %>%
+        dplyr::distinct(patient_ID, .keep_all = TRUE)
+      abund_df <- abund_df %>%
+        dplyr::left_join(meta_unique, by = "patient_ID")
+      
+      # Melt to long format: one row per sample × cluster
+      abund_long <- abund_df %>%
+        tidyr::pivot_longer(
+          cols = colnames(abund),
+          names_to = "entity",
+          values_to = "freq"
         )
-      })
-      dfreq <- do.call(rbind, res)
       
-      # Run the chosen test
-      if (test_type == "Wilcoxon (2-group)") {
-        g <- droplevels(factor(dfreq$group))
-        if (length(levels(g)) != 2)
-          return(data.frame(entity = ent_var, test = "wilcox", p = NA, n = nrow(dfreq)))
-        wt <- wilcox.test(freq ~ g, data = dfreq)
-        data.frame(entity = ent_var, test = "wilcox", p = wt$p.value, n = nrow(dfreq))
-        
-      } else if (test_type == "Kruskal–Wallis (multi-group)") {
-        kw <- kruskal.test(freq ~ dfreq$group, data = dfreq)
-        data.frame(entity = ent_var, test = "kruskal", p = kw$p.value, n = nrow(dfreq))
-        
-      } else {
-        cont <- req(input$cont_var)
-        names(dfreq)[names(dfreq) == cont] <- "CONT"
-        ct <- spearman_test(dfreq, cont_var = "CONT")
-        cbind(data.frame(entity = ent_var, test = "spearman"), ct)
-      }
+      # Run the chosen test per entity
+      res <- abund_long %>%
+        dplyr::group_by(entity) %>%
+        dplyr::group_modify(~ {
+          if (test_type == "Wilcoxon (2-group)") {
+            if (!nzchar(input$group_var)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
+            g <- droplevels(factor(.x[[input$group_var]]))
+            if (length(levels(g)) != 2)
+              return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
+            wt <- wilcox.test(freq ~ g, data = .x)
+            data.frame(test = "wilcox", p = wt$p.value, n = nrow(.x))
+            
+          } else if (test_type == "Kruskal–Wallis (multi-group)") {
+            if (!nzchar(input$group_var)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
+            kw <- kruskal.test(freq ~ .x[[input$group_var]], data = .x)
+            data.frame(test = "kruskal", p = kw$p.value, n = nrow(.x))
+            
+          } else {
+            if (!nzchar(input$cont_var)) return(data.frame(test = "spearman", rho = NA, p = NA, n = nrow(.x)))
+            cont <- input$cont_var
+            ct <- spearman_test(.x, cont_var = cont)
+            cbind(data.frame(test = "spearman"), ct)
+          }
+        }) %>%
+        dplyr::ungroup()
+      
+      if (nrow(res) && isTRUE(input$apply_bh) && "p" %in% colnames(res))
+        res$padj <- p.adjust(res$p, method = "BH")
+      
+      res
     }
   })
   
