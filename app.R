@@ -753,42 +753,67 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
 }
 
 
-# --- UI: disable all tabs except Home until data is ready ---
+# --- UI: hard-disable all tabs until data is ready ---
 tags$head(
   tags$style(HTML("
-    /* Grey out and disable pointer events for disabled tabs */
+    /* Grey out disabled tabs */
     #main_tab li.disabled > a,
     #main_tab li.disabled > a:hover {
-      pointer-events: none;
       color: #aaa !important;
       cursor: not-allowed;
+      text-decoration: none;
     }
   ")),
   tags$script(HTML("
-    // Function to disable all but the first tab
-    function disableTabs() {
-      $('#main_tab li:not(:first)').addClass('disabled');
-    }
-    // Function to enable all tabs
-    function enableTabs() {
-      $('#main_tab li').removeClass('disabled');
-    }
-    // Handle enable/disable from server
-    Shiny.addCustomMessageHandler('enableTabs', function(enable) {
-      if (enable) {
-        enableTabs();
-      } else {
-        disableTabs();
+    (function() {
+      // Global-ish lock flag for this page
+      var tabsLocked = true;
+
+      function disableTabs() {
+        tabsLocked = true;
+        // Mark all tabs disabled (including Home, if you want)
+        // To keep Home clickable, change selector to '#main_tab li:not(:first)'
+        $('#main_tab li').addClass('disabled');
       }
-    });
-    // Disable tabs immediately on page load
-    $(document).ready(function() {
-      disableTabs();
-    });
-    // Also disable tabs right after Shiny connects (in case of re-render)
-    $(document).on('shiny:connected', function() {
-      disableTabs();
-    });
+      function enableTabs() {
+        tabsLocked = false;
+        $('#main_tab li').removeClass('disabled');
+      }
+
+      // Intercept all Bootstrap tab show events while locked
+      $(document).on('show.bs.tab', '#main_tab a[data-toggle=\"tab\"]', function(e) {
+        if (tabsLocked) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          return false;
+        }
+      });
+
+      // Also intercept raw clicks as a fallback
+      $(document).on('click', '#main_tab a[data-toggle=\"tab\"]', function(e) {
+        if (tabsLocked) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          return false;
+        }
+      });
+
+      // Handle enable/disable messages from server
+      Shiny.addCustomMessageHandler('enableTabs', function(enable) {
+        if (enable) {
+          enableTabs();
+        } else {
+          disableTabs();
+          // Force UI back to Home immediately on the client
+          var $home = $('#main_tab a[data-toggle=\"tab\"]').first();
+          if ($home.length) $home.tab('show');
+        }
+      });
+
+      // Lock tabs immediately on page ready and on Shiny connect
+      $(document).ready(function() { disableTabs(); });
+      $(document).on('shiny:connected', function() { disableTabs(); });
+    })();
   "))
 )
 
@@ -910,9 +935,9 @@ server <- function(input, output, session) {
   
   # Upload RData and initialize datasets immediately (no mapping button)
   observeEvent(input$rdata_upload, {
-    req(input$rdata_upload)
-    
     session$sendCustomMessage("enableTabs", FALSE)  # lock tabs during load
+    
+    req(input$rdata_upload)
     
     # Load all objects from the uploaded .RData
     e <- new.env(parent = emptyenv())
