@@ -933,15 +933,21 @@ server <- function(input, output, session) {
     }
   })
   
-  # Reactive flag for whether cluster_map is present and valid
-  output$hasClusterMap <- reactive({
+  # Server-side reactive flag
+  hasClusterMap <- reactive({
     !is.null(rv$cluster_map) &&
       all(c("cluster", "celltype") %in% names(rv$cluster_map))
   })
+  
+  # UI-facing flag for conditionalPanel
+  output$hasClusterMap <- reactive({
+    hasClusterMap()
+  })
   outputOptions(output, "hasClusterMap", suspendWhenHidden = FALSE)
   
+  
   observe({
-    if (!output$hasClusterMap()) {
+    if (!hasClusterMap()) {
       updatePickerInput(session, "test_entity", selected = "Clusters")
     }
   })
