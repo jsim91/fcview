@@ -1328,16 +1328,39 @@ server <- function(input, output, session) {
           ok <- !is.na(g)
           g <- g[ok]; freq_ok <- .x$freq[ok]
           if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
+          
+          # Compute per-group summaries
+          summaries <- tapply(freq_ok, g, function(v) {
+            c(med = median(v, na.rm = TRUE),
+              q25 = quantile(v, 0.25, na.rm = TRUE),
+              q75 = quantile(v, 0.75, na.rm = TRUE))
+          })
+          # Flatten into named columns
+          sum_df <- as.data.frame(do.call(cbind, summaries))
+          names(sum_df) <- paste0(rep(names(summaries), each = 3),
+                                  c("_med", "_q25", "_q75"))
+          
           wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
-          data.frame(test = "wilcox", p = wt$p.value, n = sum(ok))
+          cbind(data.frame(test = "wilcox", p = wt$p.value, n = sum(ok)), sum_df)
           
         } else if (test_type == "Kruskal–Wallis (multi-group)") {
           if (!nzchar(input$group_var)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
           g <- .x[[input$group_var]]
           ok <- !is.na(g)
           if (!any(ok)) return(data.frame(test = "kruskal", p = NA, n = 0))
+          
+          # Compute per-group summaries
+          summaries <- tapply(.x$freq[ok], g[ok], function(v) {
+            c(med = median(v, na.rm = TRUE),
+              q25 = quantile(v, 0.25, na.rm = TRUE),
+              q75 = quantile(v, 0.75, na.rm = TRUE))
+          })
+          sum_df <- as.data.frame(do.call(cbind, summaries))
+          names(sum_df) <- paste0(rep(names(summaries), each = 3),
+                                  c("_med", "_q25", "_q75"))
+          
           kw <- kruskal.test(.x$freq[ok] ~ as.factor(g[ok]))
-          data.frame(test = "kruskal", p = kw$p.value, n = sum(ok))
+          cbind(data.frame(test = "kruskal", p = kw$p.value, n = sum(ok)), sum_df)
           
         } else {
           if (!nzchar(input$cont_var)) return(data.frame(test = "spearman", rho = NA, p = NA, n = nrow(.x)))
@@ -1345,7 +1368,8 @@ server <- function(input, output, session) {
           ct <- spearman_test(.x, cont_var = cont)
           cbind(data.frame(test = "spearman"), ct)
         }
-      }) %>% dplyr::ungroup()
+      }) %>%
+      dplyr::ungroup()
     
     if (nrow(res) && isTRUE(input$apply_bh) && "p" %in% colnames(res)) {
       res$padj <- p.adjust(res$p, method = "BH")
@@ -1403,3 +1427,4 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
