@@ -751,7 +751,8 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
 
 # ---- UI ----
 ui <- navbarPage(
-  "CyTOF Explorer",
+  "FCView",
+  windowTitle = "FCView",
   id = "main_tab",
   
   tabPanel(
@@ -760,8 +761,8 @@ ui <- navbarPage(
       sidebarPanel(
         h4("Upload inputs"),
         fileInput("rdata_upload", "Upload .RData (contains shinyAppInput)", accept = ".RData"),
-        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time."), 
         numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
+        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time."), 
         fileInput("json_upload", "Upload gates (.json)", accept = ".json"),
         hr(),
         h4("Gate export"),
@@ -1124,60 +1125,86 @@ server <- function(input, output, session) {
   
   # Abundance testing
   run_tests <- eventReactive(input$run_test, {
-    unit_var <- req(input$unit_var)
+    unit_var  <- req(input$unit_var)
     group_var <- req(input$group_var)
     test_type <- input$test_type
     
+    # --- Gate-based testing (optional) ---
     if (input$test_entity == "Selected gate(s)") {
       req(length(input$test_gate) > 0)
       tests <- lapply(input$test_gate, function(gn) {
         gate <- gate_store$list()[[gn]]
-        dfreq <- freq_by(gate$cells, meta_cell, group_var, unit_var)
+        dfreq <- freq_by(gate$cells, rv$meta_cell, group_var, unit_var)
         
         if (test_type == "Wilcoxon (2-group)") {
           g <- droplevels(factor(dfreq[[group_var]]))
-          if (length(levels(g)) != 2) return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
+          if (length(levels(g)) != 2)
+            return(data.frame(entity = gn, test = "wilcox", p = NA, n = nrow(dfreq)))
           wt <- wilcox.test(freq ~ g, data = dfreq)
           data.frame(entity = gn, test = "wilcox", p = wt$p.value, n = nrow(dfreq))
+          
         } else if (test_type == "Kruskal–Wallis (multi-group)") {
           kw <- kruskal.test(freq ~ dfreq[[group_var]], data = dfreq)
           data.frame(entity = gn, test = "kruskal", p = kw$p.value, n = nrow(dfreq))
+          
         } else {
           cont <- req(input$cont_var)
-          ct <- spearman_test(dfreq %>% dplyr::rename(!!cont := dplyr::all_of(cont)),
-                              cont_var = cont)
+          ct <- spearman_test(
+            dfreq %>% dplyr::rename(!!cont := dplyr::all_of(cont)),
+            cont_var = cont
+          )
           cbind(data.frame(entity = gn, test = "spearman"), ct)
         }
       })
+      
       out <- do.call(rbind, tests)
       if (nrow(out) && isTRUE(input$apply_bh) && "p" %in% colnames(out))
         out$padj <- p.adjust(out$p, method = "BH")
       out
+      
     } else {
-      # Entities: clusters or celltypes (derived from df())
+      # --- Cluster or celltype testing ---
       ent_var <- if (input$test_entity == "Clusters") "cluster" else "celltype"
-      dd <- df()
+      
+      # Build minimal df equivalent from global reactives
+      dd <- data.frame(
+        cluster  = rv$clusters$assignments,
+        celltype = if (!is.null(rv$cluster_map) &&
+                       all(c("cluster", "celltype") %in% names(rv$cluster_map))) {
+          as.character(rv$cluster_map$celltype[
+            match(rv$clusters$assignments, rv$cluster_map$cluster)
+          ])
+        } else {
+          as.character(rv$clusters$assignments)
+        }
+      )
+      
       dd$entity <- if (ent_var == "cluster") dd$cluster else dd$celltype
       
-      # Convert per-cell to per-unit frequencies using gate membership logic (example placeholder)
-      # In practice you'd compute membership per entity; here we aggregate per unit
-      unit_levels <- unique(meta_cell[[unit_var]])
+      # Aggregate per-unit frequencies
+      unit_levels <- unique(rv$meta_cell[[unit_var]])
       res <- lapply(unit_levels, function(u) {
-        idx <- which(meta_cell[[unit_var]] == u)
-        data.frame(unit = u,
-                   group = unique(meta_cell[[group_var]][idx])[1],
-                   freq = sum(!is.na(dd$entity[idx]))/length(idx))
+        idx <- which(rv$meta_cell[[unit_var]] == u)
+        data.frame(
+          unit  = u,
+          group = unique(rv$meta_cell[[group_var]][idx])[1],
+          freq  = sum(!is.na(dd$entity[idx])) / length(idx)
+        )
       })
       dfreq <- do.call(rbind, res)
       
+      # Run the chosen test
       if (test_type == "Wilcoxon (2-group)") {
         g <- droplevels(factor(dfreq$group))
-        if (length(levels(g)) != 2) return(data.frame(entity = ent_var, test = "wilcox", p = NA, n = nrow(dfreq)))
+        if (length(levels(g)) != 2)
+          return(data.frame(entity = ent_var, test = "wilcox", p = NA, n = nrow(dfreq)))
         wt <- wilcox.test(freq ~ g, data = dfreq)
         data.frame(entity = ent_var, test = "wilcox", p = wt$p.value, n = nrow(dfreq))
+        
       } else if (test_type == "Kruskal–Wallis (multi-group)") {
         kw <- kruskal.test(freq ~ dfreq$group, data = dfreq)
         data.frame(entity = ent_var, test = "kruskal", p = kw$p.value, n = nrow(dfreq))
+        
       } else {
         cont <- req(input$cont_var)
         names(dfreq)[names(dfreq) == cont] <- "CONT"
