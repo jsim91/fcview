@@ -765,18 +765,29 @@ tags$head(
     }
   ")),
   tags$script(HTML("
+    // Function to disable all but the first tab
+    function disableTabs() {
+      $('#main_tab li:not(:first)').addClass('disabled');
+    }
+    // Function to enable all tabs
+    function enableTabs() {
+      $('#main_tab li').removeClass('disabled');
+    }
     // Handle enable/disable from server
     Shiny.addCustomMessageHandler('enableTabs', function(enable) {
       if (enable) {
-        $('#main_tab li').removeClass('disabled');
+        enableTabs();
       } else {
-        // keep Home (first) enabled; disable others
-        $('#main_tab li:not(:first)').addClass('disabled');
+        disableTabs();
       }
     });
-    // On initial connection, disable all but Home
+    // Disable tabs immediately on page load
+    $(document).ready(function() {
+      disableTabs();
+    });
+    // Also disable tabs right after Shiny connects (in case of re-render)
     $(document).on('shiny:connected', function() {
-      $('#main_tab li:not(:first)').addClass('disabled');
+      disableTabs();
     });
   "))
 )
@@ -900,6 +911,8 @@ server <- function(input, output, session) {
   # Upload RData and initialize datasets immediately (no mapping button)
   observeEvent(input$rdata_upload, {
     req(input$rdata_upload)
+    
+    session$sendCustomMessage("enableTabs", FALSE)  # lock tabs during load
     
     # Load all objects from the uploaded .RData
     e <- new.env(parent = emptyenv())
@@ -1098,7 +1111,7 @@ server <- function(input, output, session) {
     showNotification("Data loaded and initialized.", type = "message")
     
     rv$data_ready(TRUE)
-    session$sendCustomMessage("enableTabs", TRUE)
+    session$sendCustomMessage("enableTabs", TRUE) # unlock tabs when ready
   })
   
   observeEvent(input$main_tab, {
