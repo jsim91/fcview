@@ -578,6 +578,38 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           )
       }
       
+      # If labels are toggled on, add them immediately
+      if (isTRUE(input$show_labels)) {
+        coords_full <- as.data.frame(coords())
+        names(coords_full)[1:2] <- c("x", "y")
+        coords_full$cluster <- factor(clusters()$assignments)
+        
+        label_df <- coords_full %>%
+          group_by(cluster) %>%
+          summarise(
+            x = mean(x, na.rm = TRUE),
+            y = mean(y, na.rm = TRUE),
+            .groups = "drop"
+          )
+        
+        annots <- lapply(seq_len(nrow(label_df)), function(i) {
+          list(
+            x = label_df$x[i],
+            y = label_df$y[i],
+            xref = "x", yref = "y",
+            text = as.character(label_df$cluster[i]),
+            showarrow = FALSE,
+            xanchor = "center", yanchor = "middle", align = "center",
+            font = list(color = "black", size = 18),
+            bgcolor = "rgba(255,255,255,0.85)",
+            bordercolor = "rgba(0,0,0,0)",
+            borderpad = 2, opacity = 1
+          )
+        })
+        
+        p_base <- p_base %>% layout(annotations = annots)
+      }
+      
       plot_cache_base(p_base)
       plot_cache(p_base)
     })
