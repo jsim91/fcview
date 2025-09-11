@@ -311,7 +311,16 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           return()
         }
         
-        # handle split_by
+        # --- Always add the colour column to dd ---
+        if (color_by %in% numeric_markers) {
+          dd$.color_val <- as.numeric(expr_val[dd$.cell, color_by])
+        } else if (color_by %in% meta_cols) {
+          dd$.color_val <- meta_val[[color_by]][dd$.cell]
+        } else {
+          dd$.color_val <- NA
+        }
+        
+        # Handle faceting
         split_var <- input$split_by
         if (!is.null(split_var) && nzchar(split_var)) {
           dd[[split_var]] <- meta_val[[split_var]][dd$.cell]
@@ -339,14 +348,17 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
             return()
           }
           set.seed(123)
-          dd <- dd %>% group_by(.data[[split_var]]) %>% slice_sample(n = target_per_facet) %>% ungroup()
+          dd <- dd %>%
+            group_by(.data[[split_var]]) %>%
+            slice_sample(n = target_per_facet) %>%
+            ungroup()
           
-          # Build ggplot faceted
-          gg <- ggplot(dd, aes(x = x, y = y, color = .data[[color_by]])) +
+          # Build faceted ggplot
+          gg <- ggplot(dd, aes(x = x, y = y, color = .data[[".color_val"]])) +
             ggrastr::geom_point_rast(size = 0.25, alpha = 0.25) +
             guides(color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
             facet_wrap(as.formula(paste("~", split_var)), ncol = as.numeric(input$max_facets)) +
-            (if (is.numeric(dd[[color_by]])) scale_color_viridis_c() else scale_color_viridis_d()) +
+            (if (is.numeric(dd$.color_val)) scale_color_viridis_c() else scale_color_viridis_d()) +
             theme_minimal() +
             theme(legend.position = "right") +
             labs(
@@ -359,8 +371,8 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           p_base <- ggplotly(gg, tooltip = "text") %>% layout(dragmode = "pan")
           
         } else {
-          # Single-panel plotly scatter
-          gg <- ggplot(dd, aes(x = x, y = y, color = .data[[color_by]])) +
+          # Single-panel ggplot for export
+          gg <- ggplot(dd, aes(x = x, y = y, color = .data[[".color_val"]])) +
             geom_point(size = 0.25, alpha = 0.25) +
             theme_minimal() +
             labs(
@@ -370,20 +382,30 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
             )
           plot_cache_gg(gg)
           
-          # Compute colours for plotly to match ggplot
-          if (is.numeric(dd[[color_by]])) {
-            cols <- scales::col_numeric(viridis::viridis(256),
-                                        domain = range(dd[[color_by]], na.rm = TRUE))(dd[[color_by]])
+          # Compute colours for plotly
+          if (is.numeric(dd$.color_val)) {
+            rng <- range(dd$.color_val, na.rm = TRUE)
+            if (!is.finite(rng[1]) || !is.finite(rng[2])) rng <- c(0, 1)
+            cols <- scales::col_numeric(
+              viridis::viridis(256),
+              domain = rng
+            )(dd$.color_val)
           } else {
-            pal <- viridis::viridis(length(unique(dd[[color_by]])))
-            cols <- setNames(pal, sort(unique(dd[[color_by]])))[as.character(dd[[color_by]])]
+            vals <- as.character(dd$.color_val)
+            levs <- sort(unique(vals))
+            pal <- viridis::viridis(length(levs))
+            cols <- setNames(pal, levs)[vals]
           }
           
           p_base <- plot_ly(
-            data = dd, x = ~x, y = ~y,
-            type = "scatter", mode = "markers",
+            data = dd,
+            x = ~x,
+            y = ~y,
+            type = "scatter",
+            mode = "markers",
             marker = list(color = cols, size = 3),
-            source = ns("embed"), customdata = ~.cell
+            source = ns("embed"),
+            customdata = ~.cell
           ) %>% layout(
             xaxis = list(title = paste0(embedding_name, " 1")),
             yaxis = list(title = paste0(embedding_name, " 2")),
