@@ -112,26 +112,26 @@ EmbeddingUI <- function(id, title = "UMAP") {
         pickerInput(ns("color_by"), "Color by", choices = NULL),
         checkboxInput(ns("show_labels"), "Show cluster labels", value = FALSE),
         pickerInput(ns("split_by"), "Facet by", choices = NULL,
-                    options = list(`none-selected-text`="None")),
+                    options = list(`none-selected-text` = "None")),
         uiOutput(ns("split_levels_ui")),
         selectInput(
-          ns("max_facets"),
-          "Facet columns",
-          choices = c(1, 2, 3, 4),
-          selected = 2
+          ns("max_facets"), "Facet columns",
+          choices = c(1, 2, 3, 4), selected = 2
         ),
         actionButton(ns("plot_facets"), "Plot facets"),
         hr(),
+        # Moved export button here:
+        downloadButton(ns("export_embed_pdf"), "Export embedding as PDF"),
+        hr()
       ),
       column(
         9,
-        plotlyOutput(ns("embed_plot"), height = "650px"), 
-        br(),
-        downloadButton(ns("export_embed_pdf"), "Export embedding as PDF")
+        plotlyOutput(ns("embed_plot"), height = "650px")
       )
-    ),
+    )
   )
 }
+
 
 # ---- Embedding module server ----
 EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, clusters, cluster_map,
@@ -360,6 +360,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
             facet_wrap(as.formula(paste("~", split_var)), ncol = as.numeric(input$max_facets)) +
             (if (is.numeric(dd$.color_val)) scale_color_viridis_c() else scale_color_viridis_d()) +
             theme_minimal() +
+            guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) + 
             theme(legend.position = "right") +
             labs(
               x = paste0(embedding_name, " 1"),
@@ -374,7 +375,9 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           # Single-panel ggplot for export
           gg <- ggplot(dd, aes(x = x, y = y, color = .data[[".color_val"]])) +
             geom_point(size = 0.25, alpha = 0.25) +
-            theme_minimal() +
+            (if (is.numeric(dd$.color_val)) scale_color_viridis_c() else scale_color_viridis_d()) +
+            theme_minimal() + 
+            guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) + 
             labs(
               x = paste0(embedding_name, " 1"),
               y = paste0(embedding_name, " 2"),
@@ -469,7 +472,15 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     
     output$export_embed_pdf <- downloadHandler(
       filename = function() {
-        paste0(tolower(embedding_name), "_embedding_", Sys.Date(), ".pdf")
+        embed_name <- tolower(embedding_name)  # "umap" or "tsne"
+        color_var  <- tolower(input$color_by %||% "color")
+        
+        if (!is.null(input$split_by) && nzchar(input$split_by)) {
+          facet_var <- tolower(input$split_by)
+          paste0(embed_name, "_", facet_var, "_", color_var, ".pdf")
+        } else {
+          paste0(embed_name, "_", color_var, ".pdf")
+        }
       },
       content = function(file) {
         gg <- plot_cache_gg()
