@@ -596,25 +596,21 @@ ui <- navbarPage(
   tabPanel(
     "Clusters",
     fluidRow(
-      column(
-        3,
-        checkboxInput("cluster_rows", "Cluster rows", value = TRUE),
-        checkboxInput("cluster_columns", "Cluster columns", value = TRUE), 
-        selectInput(
-          "heatmap_theme",
-          "Heatmap color theme",
-          choices = c("viridis", "heat", "greyscale"),
-          selected = "viridis"
-        ), 
-        br(), 
-        downloadButton("export_heatmap_pdf", "Export heatmap as PDF")
+      column(3,
+             checkboxInput("cluster_rows", "Cluster rows", value = TRUE),
+             checkboxInput("cluster_columns", "Cluster columns", value = TRUE),
+             selectInput("heatmap_theme", "Heatmap color theme",
+                         choices = c("viridis", "heat", "greyscale"),
+                         selected = "viridis"),
+             br(),
+             downloadButton("export_heatmap_pdf", "Export heatmap as PDF")
       ),
-      column(
-        9,
-        plotOutput("cluster_heatmap", height = "700px")
-      )
-    ),
-    hr(),
+      column(9, plotOutput("cluster_heatmap", height = "700px"))
+    )
+  ),
+  
+  tabPanel(
+    "Testing",
     h4("Abundance testing"),
     fluidRow(
       column(
@@ -633,12 +629,9 @@ ui <- navbarPage(
                      choices = c("Wilcoxon (2-group)",
                                  "Kruskal–Wallis (multi-group)",
                                  "Spearman (continuous)")),
-        selectInput(
-          "p_adj_method",
-          "P‑value adjustment method",
-          choices = c("BH", "bonferroni", "BY", "fdr"),
-          selected = "BH"
-        ),
+        selectInput("p_adj_method", "P‑value adjustment method",
+                    choices = c("BH", "bonferroni", "BY", "fdr"),
+                    selected = "BH"),
         actionButton("run_test", "Run tests"),
         br(), br(),
         conditionalPanel(
@@ -646,10 +639,7 @@ ui <- navbarPage(
           downloadButton("export_results", "Export results as CSV")
         )
       ),
-      column(
-        9,
-        tableOutput("test_table")
-      )
+      column(9, tableOutput("test_table"))
     )
   )
 )
