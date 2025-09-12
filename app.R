@@ -573,7 +573,7 @@ ui <- navbarPage(
         h4("Upload inputs"),
         fileInput("rdata_upload", "Upload .RData (FCSimple analysis object)", accept = ".RData"),
         numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
-        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time. This is done to speed up facet (split) plotting."), 
+        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time. This is done to speed up UMAP or tSNE facet plotting."), 
         width = 3
       ),
       mainPanel(
@@ -681,6 +681,42 @@ ui <- navbarPage(
         plotOutput("categorical_plot", height = "1000px")
       )
     )
+  ), 
+  tabPanel(
+    "Continuous",
+    h4("Continuous metadata scatter plots"),
+    fluidRow(
+      column(
+        3,
+        conditionalPanel(
+          condition = "output.hasClusterMap",
+          pickerInput("cont_entity", "Entity",
+                      choices = c("Clusters", "Celltypes"),
+                      selected = "Clusters")
+        ),
+        conditionalPanel(
+          condition = "!output.hasClusterMap",
+          pickerInput("cont_entity", "Entity",
+                      choices = c("Clusters"),
+                      selected = "Clusters")
+        ),
+        pickerInput("cont_group_var", "Continuous metadata",
+                    choices = NULL,
+                    options = list(`none-selected-text` = "None")),
+        selectInput("cont_p_adj_method", "P‑value adjustment method",
+                    choices = c("BH", "bonferroni", "BY", "fdr"),
+                    selected = "BH"),
+        checkboxInput("cont_use_adj_p", "Plot adjusted pvalues", value = TRUE),
+        selectInput("cont_max_facets", "Facet columns", choices = 2:6, selected = 4),
+        actionButton("generate_cont_plots", "Generate plots"),
+        br(), br(),
+        downloadButton("export_cont_pdf", "Export scatter plots as PDF")
+      ),
+      column(
+        9,
+        plotOutput("continuous_plot", height = "1200px")
+      )
+    )
   )
 )
 
@@ -702,6 +738,7 @@ server <- function(input, output, session) {
   )
   rv$data_ready <- reactiveVal(FALSE)
   cat_plot_cache <- reactiveVal(NULL)
+  cont_plot_cache <- reactiveVal(NULL)
   
   # Disable tabs at startup
   observe({
@@ -968,6 +1005,14 @@ server <- function(input, output, session) {
                       choices = c("", categorical_choices), selected = "")
     updatePickerInput(session, "cont_var",
                       choices = c("", continuous_choices), selected = "")
+  })
+  observe({
+    req(rv$meta_cell)
+    meta_cols <- colnames(rv$meta_cell)
+    continuous_choices <- meta_cols[sapply(rv$meta_cell, is.numeric)]
+    updatePickerInput(session, "cont_group_var",
+                      choices = c("", continuous_choices),
+                      selected = "")
   })
   
   # Launch embedding modules as soon as data is ready (Option 1)
@@ -1492,6 +1537,142 @@ server <- function(input, output, session) {
       pdf_width  <- 4 * ncol_facets
       pdf_height <- 3 * nrow_facets
       
+      ggsave(file, plot = gg, device = cairo_pdf,
+             width = pdf_width, height = pdf_height, units = "in")
+    },
+    contentType = "application/pdf"
+  )
+  
+  cont_plot_data <- eventReactive(input$generate_cont_plots, {
+    req(rv$meta_cell, rv$clusters$abundance)
+    abund0 <- rv$clusters$abundance
+    if (is.null(rownames(abund0)) || any(!nzchar(rownames(abund0)))) {
+      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.",
+                       type = "error")
+      return(NULL)
+    }
+    
+    # Aggregate to celltypes if needed
+    abund <- abund0
+    if (input$cont_entity == "Celltypes" && !is.null(rv$cluster_map)) {
+      cm <- rv$cluster_map
+      keep <- cm$cluster %in% colnames(abund)
+      cm <- cm[keep, , drop = FALSE]
+      if (!nrow(cm)) return(NULL)
+      split_idx <- split(cm$cluster, cm$celltype)
+      abund <- sapply(split_idx, function(cols) rowSums(abund0[, cols, drop = FALSE]))
+      abund <- as.matrix(abund)
+    }
+    
+    # Map abundance rows to patient_ID
+    sources <- rownames(abund)
+    ids <- unique(rv$meta_cell$patient_ID)
+    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
+    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
+    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
+    pid <- stringr::str_extract(sources, pattern)
+    
+    abund_df <- as.data.frame(abund)
+    abund_df$patient_ID <- pid
+    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
+    abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
+    
+    # Long format
+    abund_long <- abund_df %>%
+      tidyr::pivot_longer(cols = colnames(abund),
+                          names_to = "entity", values_to = "freq") %>%
+      mutate(entity = gsub("\\n", " ", entity))
+    
+    # Run Spearman per entity
+    cont_var <- input$cont_group_var
+    res <- abund_long %>%
+      dplyr::group_by(entity) %>%
+      dplyr::group_modify(~ {
+        ok <- complete.cases(.x$freq, .x[[cont_var]])
+        if (!any(ok)) return(data.frame(rho = NA, p = NA))
+        ct <- suppressWarnings(cor.test(.x$freq[ok], .x[[cont_var]][ok], method = "spearman"))
+        data.frame(rho = unname(ct$estimate), p = ct$p.value)
+      }) %>%
+      dplyr::ungroup()
+    
+    # Adjust p-values
+    if (nrow(res) && nzchar(input$cont_p_adj_method)) {
+      res$padj <- p.adjust(res$p, method = input$cont_p_adj_method)
+    }
+    
+    # Save info for export
+    rv$last_cont_info <- list(
+      entity = tolower(input$cont_entity %||% "clusters"),
+      group  = tolower(input$cont_group_var %||% "group"),
+      test_raw = "spearman"
+    )
+    
+    list(data = abund_long, results = res)
+  })
+  
+  output$continuous_plot <- renderPlot({
+    cp <- cont_plot_data()
+    req(cp)
+    abund_long <- cp$data
+    res <- cp$results
+    cont_var <- input$cont_group_var
+    
+    # Build annotation data frame
+    p_df <- res %>%
+      mutate(
+        p_to_show = if (isTRUE(input$cont_use_adj_p) && "padj" %in% names(res)) padj else p,
+        label = paste0(
+          "p = ", signif(p_to_show, 3), "\n",
+          "rho = ", signif(rho, 3)
+        ),
+        # Position: centre horizontally, just above max y for that facet
+        x = tapply(abund_long$freq, abund_long$entity, function(v) mean(range(v, na.rm = TRUE)))[entity],
+        y = tapply(abund_long[[cont_var]], abund_long$entity, max, na.rm = TRUE)[entity] * 1.05
+      )
+    
+    gg <- ggplot(abund_long, aes(x = freq, y = .data[[cont_var]])) +
+      geom_point(alpha = 0.5, pch = 21, color = 'black', fill = 'grey40', stroke = 0.1) +
+      geom_smooth(method = "lm", se = FALSE, color = "red2") +
+      facet_wrap(~entity,
+                 ncol = as.numeric(input$cont_max_facets),
+                 scales = "free") +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+      scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+      theme_bw(base_size = 18) +
+      theme(legend.position = "none") +
+      labs(x = "Abundance", y = cont_var) +
+      geom_text(
+        data = p_df,
+        aes(x = x, y = y, label = label),
+        inherit.aes = FALSE,
+        size = 5,
+        lineheight = 0.85   # tighter spacing between p and rho lines
+      ) +
+      theme(strip.text.x = element_text(margin = margin(t = 1.1, b = 1.1)))
+    
+    cont_plot_cache(gg)  # store for export
+    gg
+  })
+  
+  output$export_cont_pdf <- downloadHandler(
+    filename = function() {
+      info <- rv$last_cont_info
+      if (is.null(info)) return("continuous_plots.pdf")
+      paste0("continuous_", info$entity, "_", info$group, "_", info$test_raw, ".pdf")
+    },
+    content = function(file) {
+      gg <- cont_plot_cache()
+      if (is.null(gg)) {
+        showNotification("No plot available to export. Please generate the plots first.", type = "error")
+        return()
+      }
+      n_facets <- length(unique(gg$data$entity))
+      ncol_facets <- suppressWarnings(as.numeric(input$cont_max_facets))
+      if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+      nrow_facets <- ceiling(n_facets / ncol_facets)
+      if (!is.finite(nrow_facets) || nrow_facets < 1) nrow_facets <- 1
+      pdf_width  <- 4 * ncol_facets
+      pdf_height <- 3 * nrow_facets
       ggsave(file, plot = gg, device = cairo_pdf,
              width = pdf_width, height = pdf_height, units = "in")
     },
