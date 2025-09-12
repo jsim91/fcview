@@ -643,7 +643,7 @@ ui <- navbarPage(
   ), 
   tabPanel(
     "Categorical",
-    h4("Categorical metadata boxplots with p‑values"),
+    h4("Categorical plotting"),
     fluidRow(
       column(
         3,
@@ -669,9 +669,12 @@ ui <- navbarPage(
         selectInput("cat_p_adj_method", "P‑value adjustment method",
                     choices = c("BH", "bonferroni", "BY", "fdr"),
                     selected = "BH"),
+        checkboxInput("cat_use_adj_p", "Plot adjusted pvalues", value = TRUE),
         selectInput("cat_max_facets", "Facet columns",
                     choices = 2:6, selected = 4), 
-        actionButton("generate_cat_plots", "Generate plots")
+        actionButton("generate_cat_plots", "Generate plots"), 
+        br(), br(),
+        downloadButton("export_cat_pdf", "Export boxplots as PDF")
       ),
       column(
         9,
@@ -698,6 +701,7 @@ server <- function(input, output, session) {
     rep_used = NULL
   )
   rv$data_ready <- reactiveVal(FALSE)
+  cat_plot_cache <- reactiveVal(NULL)
   
   # Disable tabs at startup
   observe({
@@ -1414,6 +1418,13 @@ server <- function(input, output, session) {
       res$padj <- p.adjust(res$p, method = input$cat_p_adj_method)
     }
     
+    # Save info for export
+    rv$last_cat_info <- list(
+      entity   = tolower(input$cat_entity %||% "clusters"),
+      group    = tolower(input$cat_group_var %||% "group"),
+      test_raw = input$cat_test_type %||% "test"
+    )
+    
     list(data = abund_long, results = res)
   })
   
@@ -1427,11 +1438,14 @@ server <- function(input, output, session) {
     
     # Merge p-values into data for annotation
     p_df <- res %>%
-      mutate(label = paste0("p = ", signif(p, 3)),
-             x = length(unique(abund_long[[group_var]])) / 2 + 0.5,
-             y = tapply(abund_long$freq, abund_long$entity, max, na.rm = TRUE)[entity] * 1.05)
+      mutate(
+        p_to_show = if (isTRUE(input$cat_use_adj_p) && "padj" %in% names(res)) padj else p,
+        label = paste0("p = ", signif(p_to_show, 3)),
+        x = length(unique(abund_long[[group_var]])) / 2 + 0.5,
+        y = tapply(abund_long$freq, abund_long$entity, max, na.rm = TRUE)[entity] * 1.05
+      )
     
-    ggplot(abund_long, aes(x = .data[[group_var]], y = freq)) +
+    gg <- ggplot(abund_long, aes(x = .data[[group_var]], y = freq)) +
       geom_boxplot(aes(fill = .data[[group_var]]), alpha = 0.7) +
       facet_wrap(~entity,
                  ncol = as.numeric(input$cat_max_facets),
@@ -1443,8 +1457,46 @@ server <- function(input, output, session) {
       geom_text(data = p_df,
                 aes(x = x, y = y, label = label),
                 inherit.aes = FALSE, size = 6) + 
-      theme(strip.text.x = element_text(margin = margin(t = 1, b = 1))) # top/bottom margin in points
+      theme(strip.text.x = element_text(margin = margin(t = 1.1, b = 1.1))) # top/bottom margin in points
+    
+    cat_plot_cache(gg)  # store for export
+    gg
   })
+  
+  output$export_cat_pdf <- downloadHandler(
+    filename = function() {
+      info <- rv$last_cat_info
+      if (is.null(info)) return("categorical_plots.pdf")
+      
+      # Normalise test name
+      test <- tolower(info$test_raw)
+      test <- gsub("\\s+", "_", test)              # spaces to underscores
+      test <- gsub("_\\(.*\\)", "", test)          # remove "(...)" parts
+      test <- gsub("kruskal_wallis", "kruskal-wallis", test)  # special case
+      
+      paste0("categorical_", info$entity, "_", info$group, "_", test, ".pdf")
+    },
+    content = function(file) {
+      gg <- cat_plot_cache()
+      if (is.null(gg)) {
+        showNotification("No plot available to export. Please generate the plots first.", type = "error")
+        return()
+      }
+      # Calculate PDF size based on facets
+      n_facets <- length(unique(gg$data$entity))
+      ncol_facets <- suppressWarnings(as.numeric(input$cat_max_facets))
+      if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+      nrow_facets <- ceiling(n_facets / ncol_facets)
+      if (!is.finite(nrow_facets) || nrow_facets < 1) nrow_facets <- 1
+      
+      pdf_width  <- 4 * ncol_facets
+      pdf_height <- 3 * nrow_facets
+      
+      ggsave(file, plot = gg, device = cairo_pdf,
+             width = pdf_width, height = pdf_height, units = "in")
+    },
+    contentType = "application/pdf"
+  )
 }
 
 shinyApp(ui, server)
