@@ -573,19 +573,14 @@ ui <- navbarPage(
         h4("Upload inputs"),
         fileInput("rdata_upload", "Upload .RData (FCSimple analysis object)", accept = ".RData"),
         numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
-        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time. This is done to speed up UMAP or tSNE facet plotting."), 
+        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time. This is done to speed up UMAP and tSNE facet plotting."), 
         width = 3
       ),
       mainPanel(
         h3("Dataset overview"),
         verbatimTextOutput("ds_summary"),
-        h4("Available metadata"),
-        tableOutput("meta_overview"),
-        h4("App capabilities"),
-        tags$ul(
-          tags$li(tags$b("Embeddings:"), " UMAP and tSNE with marker overlays, metadata overlays, and metadata faceting"),
-          tags$li(tags$b("Clusters:"), " Heatmap of cluster phenotypes and abundance testing of cluster size by metadata features")
-        )
+        h3("Available metadata"),
+        tableOutput("meta_overview")
       )
     )
   ),
@@ -1395,7 +1390,6 @@ server <- function(input, output, session) {
                       selected = "")
   })
   
-  # Event to generate plots
   cat_plot_data <- eventReactive(input$generate_cat_plots, {
     req(rv$meta_cell, rv$clusters$abundance)
     abund0 <- rv$clusters$abundance
@@ -1433,14 +1427,13 @@ server <- function(input, output, session) {
     # Long format
     abund_long <- abund_df %>%
       tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq") %>%
-      mutate(entity = gsub(pattern = "\\\n", replacement = " ", x = entity))
+      mutate(entity = gsub(pattern = "\\n", replacement = " ", x = entity))
     
     # Run test per entity
     test_type <- input$cat_test_type
     group_var <- input$cat_group_var
     res <- abund_long %>%
-      dplyr::group_by(entity) %>% 
-      mutate(entity = gsub(pattern = "\\\n", replacement = " ", x = entity)) %>% 
+      dplyr::group_by(entity) %>%
       dplyr::group_modify(~ {
         g <- droplevels(factor(.x[[group_var]]))
         ok <- !is.na(g)
@@ -1470,19 +1463,28 @@ server <- function(input, output, session) {
       test_raw = input$cat_test_type %||% "test"
     )
     
-    list(data = abund_long, results = res)
+    # Return everything needed for plotting without reading live inputs later
+    list(
+      data       = abund_long,
+      results    = res,
+      group_var  = input$cat_group_var,
+      use_adj_p  = input$cat_use_adj_p,
+      facet_cols = as.numeric(input$cat_max_facets)
+    )
   })
   
   output$categorical_plot <- renderPlot({
     cp <- cat_plot_data()
     req(cp)
     abund_long <- cp$data
-    res <- cp$results
-    group_var <- input$cat_group_var
+    res        <- cp$results
+    group_var  <- cp$group_var
+    use_adj_p  <- cp$use_adj_p
+    facet_cols <- cp$facet_cols
     
     p_df <- res %>%
       mutate(
-        p_to_show = if (isTRUE(input$cat_use_adj_p) && "padj" %in% names(res)) padj else p,
+        p_to_show = if (isTRUE(use_adj_p) && "padj" %in% names(res)) padj else p,
         label = paste0("p = ", signif(p_to_show, 3)),
         x = length(unique(abund_long[[group_var]])) / 2 + 0.5,
         y = tapply(abund_long$freq, abund_long$entity, max, na.rm = TRUE)[entity] * 1.05
@@ -1490,7 +1492,7 @@ server <- function(input, output, session) {
     
     gg <- ggplot(abund_long, aes(x = .data[[group_var]], y = freq)) +
       geom_boxplot(aes(fill = .data[[group_var]]), alpha = 0.7) +
-      facet_wrap(~entity, ncol = as.numeric(input$cat_max_facets), scales = "free_y") +
+      facet_wrap(~entity, ncol = facet_cols, scales = "free_y") +
       scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
       theme_bw(base_size = 18) +
       theme(legend.position = "none") +
@@ -1504,56 +1506,55 @@ server <- function(input, output, session) {
   },
   height = function() {
     gg <- cat_plot_cache()
-    if (is.null(gg)) return(400)
+    cp <- cat_plot_data()
+    if (is.null(gg) || is.null(cp)) return(400)
     n_facets <- length(unique(gg$data$entity))
-    ncol_facets <- suppressWarnings(as.numeric(input$cat_max_facets))
+    ncol_facets <- cp$facet_cols
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
     nrow_facets <- ceiling(n_facets / ncol_facets)
-    200 * nrow_facets   # px per row
+    200 * nrow_facets
   },
   width = function() {
     gg <- cat_plot_cache()
-    if (is.null(gg)) return(400)
-    ncol_facets <- suppressWarnings(as.numeric(input$cat_max_facets))
+    cp <- cat_plot_data()
+    if (is.null(gg) || is.null(cp)) return(400)
+    ncol_facets <- cp$facet_cols
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
-    225 * ncol_facets   # px per column
+    225 * ncol_facets
   })
   
   output$export_cat_pdf <- downloadHandler(
     filename = function() {
       info <- rv$last_cat_info
       if (is.null(info)) return("categorical_plots.pdf")
-      
       # Normalise test name
       test <- tolower(info$test_raw)
-      test <- gsub("\\s+", "_", test)              # spaces to underscores
-      test <- gsub("_\\(.*\\)", "", test)          # remove "(...)" parts
+      test <- gsub("\\s+", "_", test)           # spaces → underscores
+      test <- gsub("_\\(.*\\)", "", test)       # remove "(...)" parts
       test <- gsub("kruskal_wallis", "kruskal-wallis", test)  # special case
-      
       paste0("categorical_", info$entity, "_", info$group, "_", test, ".pdf")
     },
     content = function(file) {
       gg <- cat_plot_cache()
-      if (is.null(gg)) {
+      cp <- cat_plot_data()
+      if (is.null(gg) || is.null(cp)) {
         showNotification("No plot available to export. Please generate the plots first.", type = "error")
         return()
       }
-      # Calculate PDF size based on facets
       n_facets <- length(unique(gg$data$entity))
-      ncol_facets <- suppressWarnings(as.numeric(input$cat_max_facets))
+      ncol_facets <- cp$facet_cols
       if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
       nrow_facets <- ceiling(n_facets / ncol_facets)
       if (!is.finite(nrow_facets) || nrow_facets < 1) nrow_facets <- 1
-      
       pdf_width  <- 4 * ncol_facets
       pdf_height <- 3 * nrow_facets
-      
       ggsave(file, plot = gg, device = cairo_pdf,
              width = pdf_width, height = pdf_height, units = "in")
     },
     contentType = "application/pdf"
   )
   
+  # Event to generate plots
   cont_plot_data <- eventReactive(input$generate_cont_plots, {
     req(rv$meta_cell, rv$clusters$abundance)
     abund0 <- rv$clusters$abundance
@@ -1590,8 +1591,7 @@ server <- function(input, output, session) {
     
     # Long format
     abund_long <- abund_df %>%
-      tidyr::pivot_longer(cols = colnames(abund),
-                          names_to = "entity", values_to = "freq") %>%
+      tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq") %>%
       mutate(entity = gsub("\\n", " ", entity))
     
     # Run Spearman per entity
@@ -1613,40 +1613,58 @@ server <- function(input, output, session) {
     
     # Save info for export
     rv$last_cont_info <- list(
-      entity = tolower(input$cont_entity %||% "clusters"),
-      group  = tolower(input$cont_group_var %||% "group"),
+      entity   = tolower(input$cont_entity %||% "clusters"),
+      group    = tolower(input$cont_group_var %||% "group"),
       test_raw = "spearman"
     )
     
-    list(data = abund_long, results = res)
+    # Return everything needed for plotting without reading live inputs later
+    list(
+      data         = abund_long,
+      results      = res,
+      cont_var     = input$cont_group_var,
+      use_adj_p    = input$cont_use_adj_p,
+      facet_cols   = as.numeric(input$cont_max_facets)  # capture facet cols here
+    )
   })
   
   output$continuous_plot <- renderPlot({
     cp <- cont_plot_data()
     req(cp)
     abund_long <- cp$data
-    res <- cp$results
-    cont_var <- input$cont_group_var
+    res        <- cp$results
+    cont_var   <- cp$cont_var
+    use_adj_p  <- cp$use_adj_p
+    facet_cols <- cp$facet_cols
     
+    # Annotation data
     p_df <- res %>%
       mutate(
-        p_to_show = if (isTRUE(input$cont_use_adj_p) && "padj" %in% names(res)) padj else p,
-        label = paste0("p = ", signif(p_to_show, 3), "\n", "rho = ", signif(rho, 3)),
-        x = tapply(abund_long$freq, abund_long$entity, function(v) mean(range(v, na.rm = TRUE)))[entity],
-        y = tapply(abund_long[[cont_var]], abund_long$entity, max, na.rm = TRUE)[entity] * 1.05
+        p_to_show = if (isTRUE(use_adj_p) && "padj" %in% names(res)) padj else p,
+        label = paste0("p = ", signif(p_to_show, 3),
+                       "\n",
+                       "rho = ", signif(rho, 3)),
+        x = tapply(abund_long$freq, abund_long$entity,
+                   function(v) mean(range(v, na.rm = TRUE)))[entity],
+        y = tapply(abund_long[[cont_var]], abund_long$entity,
+                   max, na.rm = TRUE)[entity] * 1.05
       )
     
     gg <- ggplot(abund_long, aes(x = freq, y = .data[[cont_var]])) +
-      geom_point(alpha = 0.75, pch = 21, color = 'black', fill = 'grey40', stroke = 0.1, size = 3) +
+      geom_point(alpha = 0.75, pch = 21, color = 'black',
+                 fill = 'grey40', stroke = 0.1, size = 3) +
       geom_smooth(method = "lm", se = FALSE, color = "red2") +
-      facet_wrap(~entity, ncol = as.numeric(input$cont_max_facets), scales = "free") +
+      facet_wrap(~entity, ncol = facet_cols, scales = "free") +
       scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
       scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
       theme_bw(base_size = 18) +
       theme(legend.position = "none") +
       labs(x = "Abundance", y = cont_var) +
-      geom_text(data = p_df, aes(x = x, y = y, label = label),
-                inherit.aes = FALSE, size = 5, lineheight = 0.85) +
+      geom_text(data = p_df,
+                aes(x = x, y = y, label = label),
+                inherit.aes = FALSE,
+                size = 5,
+                lineheight = 0.85) +
       theme(strip.text.x = element_text(margin = margin(t = 1.1, b = 1.1)))
     
     cont_plot_cache(gg)
@@ -1654,17 +1672,19 @@ server <- function(input, output, session) {
   },
   height = function() {
     gg <- cont_plot_cache()
-    if (is.null(gg)) return(400)
+    cp <- cont_plot_data()
+    if (is.null(gg) || is.null(cp)) return(400)
     n_facets <- length(unique(gg$data$entity))
-    ncol_facets <- suppressWarnings(as.numeric(input$cont_max_facets))
+    ncol_facets <- cp$facet_cols
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
     nrow_facets <- ceiling(n_facets / ncol_facets)
     200 * nrow_facets
   },
   width = function() {
     gg <- cont_plot_cache()
-    if (is.null(gg)) return(400)
-    ncol_facets <- suppressWarnings(as.numeric(input$cont_max_facets))
+    cp <- cont_plot_data()
+    if (is.null(gg) || is.null(cp)) return(400)
+    ncol_facets <- cp$facet_cols
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
     225 * ncol_facets
   })
@@ -1677,12 +1697,13 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       gg <- cont_plot_cache()
-      if (is.null(gg)) {
+      cp <- cont_plot_data()
+      if (is.null(gg) || is.null(cp)) {
         showNotification("No plot available to export. Please generate the plots first.", type = "error")
         return()
       }
       n_facets <- length(unique(gg$data$entity))
-      ncol_facets <- suppressWarnings(as.numeric(input$cont_max_facets))
+      ncol_facets <- cp$facet_cols
       if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
       nrow_facets <- ceiling(n_facets / ncol_facets)
       if (!is.finite(nrow_facets) || nrow_facets < 1) nrow_facets <- 1
@@ -1693,6 +1714,7 @@ server <- function(input, output, session) {
     },
     contentType = "application/pdf"
   )
+  
 }
 
 shinyApp(ui, server)
