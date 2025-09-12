@@ -678,7 +678,7 @@ ui <- navbarPage(
       ),
       column(
         9,
-        plotOutput("categorical_plot", height = "1000px")
+        column(9, plotOutput("categorical_plot"))
       )
     )
   ), 
@@ -714,7 +714,7 @@ ui <- navbarPage(
       ),
       column(
         9,
-        plotOutput("continuous_plot", height = "1200px")
+        column(9, plotOutput("continuous_plot"))
       )
     )
   )
@@ -1473,7 +1473,6 @@ server <- function(input, output, session) {
     list(data = abund_long, results = res)
   })
   
-  # Render plot
   output$categorical_plot <- renderPlot({
     cp <- cat_plot_data()
     req(cp)
@@ -1481,7 +1480,6 @@ server <- function(input, output, session) {
     res <- cp$results
     group_var <- input$cat_group_var
     
-    # Merge p-values into data for annotation
     p_df <- res %>%
       mutate(
         p_to_show = if (isTRUE(input$cat_use_adj_p) && "padj" %in% names(res)) padj else p,
@@ -1492,20 +1490,33 @@ server <- function(input, output, session) {
     
     gg <- ggplot(abund_long, aes(x = .data[[group_var]], y = freq)) +
       geom_boxplot(aes(fill = .data[[group_var]]), alpha = 0.7) +
-      facet_wrap(~entity,
-                 ncol = as.numeric(input$cat_max_facets),
-                 scales = "free_y") +
+      facet_wrap(~entity, ncol = as.numeric(input$cat_max_facets), scales = "free_y") +
       scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
       theme_bw(base_size = 18) +
       theme(legend.position = "none") +
       labs(x = group_var, y = "Frequency") +
-      geom_text(data = p_df,
-                aes(x = x, y = y, label = label),
-                inherit.aes = FALSE, size = 6) + 
-      theme(strip.text.x = element_text(margin = margin(t = 1.1, b = 1.1))) # top/bottom margin in points
+      geom_text(data = p_df, aes(x = x, y = y, label = label),
+                inherit.aes = FALSE, size = 6) +
+      theme(strip.text.x = element_text(margin = margin(t = 1.1, b = 1.1)))
     
-    cat_plot_cache(gg)  # store for export
+    cat_plot_cache(gg)
     gg
+  },
+  height = function() {
+    gg <- cat_plot_cache()
+    if (is.null(gg)) return(400)
+    n_facets <- length(unique(gg$data$entity))
+    ncol_facets <- suppressWarnings(as.numeric(input$cat_max_facets))
+    if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+    nrow_facets <- ceiling(n_facets / ncol_facets)
+    200 * nrow_facets   # px per row
+  },
+  width = function() {
+    gg <- cat_plot_cache()
+    if (is.null(gg)) return(400)
+    ncol_facets <- suppressWarnings(as.numeric(input$cat_max_facets))
+    if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+    225 * ncol_facets   # px per column
   })
   
   output$export_cat_pdf <- downloadHandler(
@@ -1617,41 +1628,45 @@ server <- function(input, output, session) {
     res <- cp$results
     cont_var <- input$cont_group_var
     
-    # Build annotation data frame
     p_df <- res %>%
       mutate(
         p_to_show = if (isTRUE(input$cont_use_adj_p) && "padj" %in% names(res)) padj else p,
-        label = paste0(
-          "p = ", signif(p_to_show, 3), "\n",
-          "rho = ", signif(rho, 3)
-        ),
-        # Position: centre horizontally, just above max y for that facet
+        label = paste0("p = ", signif(p_to_show, 3), "\n", "rho = ", signif(rho, 3)),
         x = tapply(abund_long$freq, abund_long$entity, function(v) mean(range(v, na.rm = TRUE)))[entity],
         y = tapply(abund_long[[cont_var]], abund_long$entity, max, na.rm = TRUE)[entity] * 1.05
       )
     
     gg <- ggplot(abund_long, aes(x = freq, y = .data[[cont_var]])) +
-      geom_point(alpha = 0.5, pch = 21, color = 'black', fill = 'grey40', stroke = 0.1) +
+      geom_point(alpha = 0.75, pch = 21, color = 'black', fill = 'grey40', stroke = 0.1, size = 3) +
       geom_smooth(method = "lm", se = FALSE, color = "red2") +
-      facet_wrap(~entity,
-                 ncol = as.numeric(input$cont_max_facets),
-                 scales = "free") +
+      facet_wrap(~entity, ncol = as.numeric(input$cont_max_facets), scales = "free") +
       scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
       scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
       theme_bw(base_size = 18) +
       theme(legend.position = "none") +
       labs(x = "Abundance", y = cont_var) +
-      geom_text(
-        data = p_df,
-        aes(x = x, y = y, label = label),
-        inherit.aes = FALSE,
-        size = 5,
-        lineheight = 0.85   # tighter spacing between p and rho lines
-      ) +
+      geom_text(data = p_df, aes(x = x, y = y, label = label),
+                inherit.aes = FALSE, size = 5, lineheight = 0.85) +
       theme(strip.text.x = element_text(margin = margin(t = 1.1, b = 1.1)))
     
-    cont_plot_cache(gg)  # store for export
+    cont_plot_cache(gg)
     gg
+  },
+  height = function() {
+    gg <- cont_plot_cache()
+    if (is.null(gg)) return(400)
+    n_facets <- length(unique(gg$data$entity))
+    ncol_facets <- suppressWarnings(as.numeric(input$cont_max_facets))
+    if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+    nrow_facets <- ceiling(n_facets / ncol_facets)
+    200 * nrow_facets
+  },
+  width = function() {
+    gg <- cont_plot_cache()
+    if (is.null(gg)) return(400)
+    ncol_facets <- suppressWarnings(as.numeric(input$cont_max_facets))
+    if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+    200 * ncol_facets
   })
   
   output$export_cont_pdf <- downloadHandler(
