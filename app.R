@@ -1,4 +1,3 @@
-# app.R
 # App used to explore FCSimple results
 
 # ---- Packages ----
@@ -6,22 +5,16 @@ suppressPackageStartupMessages({
   suppressWarnings({
     library(shiny)
     library(shinyWidgets)
-    library(colourpicker)
     library(plotly)
     library(ggplot2)
     library(ggrastr)
-    library(ggrepel)
     library(dplyr)
     library(tidyr)
-    library(purrr)
     library(stringr)
-    library(data.table)
     library(ComplexHeatmap)
     library(circlize)
     library(viridis)
     library(scales)
-    library(sf)         # point-in-polygon
-    library(shinyjs)
   })
 })
 
