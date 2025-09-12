@@ -1,4 +1,4 @@
-# shiny app for exploring FCSimple results
+# shiny app for exploring [FCSimple](https://github.com/jsim91/FCSimple) results
 The input object, saved in .RData format, should contain the following elements (some are required), as formatted by FCSimple functions:
   - data (FCSimple::fcs_join)
   - source (FCSimple::fcs_join)
