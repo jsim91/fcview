@@ -608,7 +608,6 @@ ui <- navbarPage(
       column(9, plotOutput("cluster_heatmap", height = "700px"))
     )
   ),
-  
   tabPanel(
     "Testing",
     h4("Abundance testing"),
@@ -640,6 +639,44 @@ ui <- navbarPage(
         )
       ),
       column(9, tableOutput("test_table"))
+    )
+  ), 
+  tabPanel(
+    "Categorical",
+    h4("Categorical metadata boxplots with p‑values"),
+    fluidRow(
+      column(
+        3,
+        conditionalPanel(
+          condition = "output.hasClusterMap",
+          pickerInput("cat_entity", "Entity",
+                      choices = c("Clusters", "Celltypes"),
+                      selected = "Clusters")
+        ),
+        # If no cluster map, show a disabled picker fixed to Clusters
+        conditionalPanel(
+          condition = "!output.hasClusterMap",
+          pickerInput("cat_entity", "Entity",
+                      choices = c("Clusters"),
+                      selected = "Clusters")
+        ),
+        pickerInput("cat_group_var", "Categorical metadata",
+                    choices = NULL,
+                    options = list(`none-selected-text` = "None")),
+        radioButtons("cat_test_type", "Test",
+                     choices = c("Wilcoxon (2-group)",
+                                 "Kruskal–Wallis (multi-group)")),
+        selectInput("cat_p_adj_method", "P‑value adjustment method",
+                    choices = c("BH", "bonferroni", "BY", "fdr"),
+                    selected = "BH"),
+        selectInput("cat_max_facets", "Facet columns",
+                    choices = 2:6, selected = 4), 
+        actionButton("generate_cat_plots", "Generate plots")
+      ),
+      column(
+        9,
+        plotOutput("categorical_plot", height = "1000px")
+      )
     )
   )
 )
@@ -903,6 +940,11 @@ server <- function(input, output, session) {
   observe({
     if (!hasClusterMap()) {
       updatePickerInput(session, "test_entity", selected = "Clusters")
+    }
+  })
+  observe({
+    if (!hasClusterMap()) {
+      updatePickerInput(session, "cat_entity", selected = "Clusters")
     }
   })
   
@@ -1293,6 +1335,116 @@ server <- function(input, output, session) {
     },
     contentType = "text/csv"
   )
+  
+  # Update categorical metadata choices when data is ready
+  observe({
+    req(rv$meta_cell)
+    meta_cols <- colnames(rv$meta_cell)
+    categorical_choices <- meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))]
+    updatePickerInput(session, "cat_group_var",
+                      choices = c("", categorical_choices),
+                      selected = "")
+  })
+  
+  # Event to generate plots
+  cat_plot_data <- eventReactive(input$generate_cat_plots, {
+    req(rv$meta_cell, rv$clusters$abundance)
+    abund0 <- rv$clusters$abundance
+    if (is.null(rownames(abund0)) || any(!nzchar(rownames(abund0)))) {
+      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.",
+                       type = "error")
+      return(NULL)
+    }
+    
+    # Aggregate to celltypes if needed
+    abund <- abund0
+    if (input$cat_entity == "Celltypes" && !is.null(rv$cluster_map)) {
+      cm <- rv$cluster_map
+      keep <- cm$cluster %in% colnames(abund)
+      cm <- cm[keep, , drop = FALSE]
+      if (!nrow(cm)) return(NULL)
+      split_idx <- split(cm$cluster, cm$celltype)
+      abund <- sapply(split_idx, function(cols) rowSums(abund0[, cols, drop = FALSE]))
+      abund <- as.matrix(abund)
+    }
+    
+    # Map abundance rows to patient_ID
+    sources <- rownames(abund)
+    ids <- unique(rv$meta_cell$patient_ID)
+    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
+    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
+    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
+    pid <- stringr::str_extract(sources, pattern)
+    
+    abund_df <- as.data.frame(abund)
+    abund_df$patient_ID <- pid
+    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
+    abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
+    
+    # Long format
+    abund_long <- abund_df %>%
+      tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq") %>%
+      mutate(entity = gsub(pattern = "\\\n", replacement = " ", x = entity))
+    
+    # Run test per entity
+    test_type <- input$cat_test_type
+    group_var <- input$cat_group_var
+    res <- abund_long %>%
+      dplyr::group_by(entity) %>% 
+      mutate(entity = gsub(pattern = "\\\n", replacement = " ", x = entity)) %>% 
+      dplyr::group_modify(~ {
+        g <- droplevels(factor(.x[[group_var]]))
+        ok <- !is.na(g)
+        g <- g[ok]; freq_ok <- .x$freq[ok]
+        if (length(unique(g)) < 2) return(data.frame(p = NA))
+        if (test_type == "Wilcoxon (2-group)" && length(unique(g)) == 2) {
+          wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
+          data.frame(p = wt$p.value)
+        } else if (test_type == "Kruskal–Wallis (multi-group)") {
+          kw <- kruskal.test(freq_ok ~ g)
+          data.frame(p = kw$p.value)
+        } else {
+          data.frame(p = NA)
+        }
+      }) %>%
+      dplyr::ungroup()
+    
+    # Adjust p-values
+    if (nrow(res) && nzchar(input$cat_p_adj_method)) {
+      res$padj <- p.adjust(res$p, method = input$cat_p_adj_method)
+    }
+    
+    list(data = abund_long, results = res)
+  })
+  
+  # Render plot
+  output$categorical_plot <- renderPlot({
+    cp <- cat_plot_data()
+    req(cp)
+    abund_long <- cp$data
+    res <- cp$results
+    group_var <- input$cat_group_var
+    
+    # Merge p-values into data for annotation
+    p_df <- res %>%
+      mutate(label = paste0("p = ", signif(p, 3)),
+             x = length(unique(abund_long[[group_var]])) / 2 + 0.5,
+             y = tapply(abund_long$freq, abund_long$entity, max, na.rm = TRUE)[entity] * 1.05)
+    
+    ggplot(abund_long, aes(x = .data[[group_var]], y = freq)) +
+      geom_boxplot(aes(fill = .data[[group_var]]), alpha = 0.7) +
+      facet_wrap(~entity,
+                 ncol = as.numeric(input$cat_max_facets),
+                 scales = "free_y") +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+      theme_bw(base_size = 18) +
+      theme(legend.position = "none") +
+      labs(x = group_var, y = "Frequency") +
+      geom_text(data = p_df,
+                aes(x = x, y = y, label = label),
+                inherit.aes = FALSE, size = 6) + 
+      theme(strip.text.x = element_text(margin = margin(t = 1, b = 1))) # top/bottom margin in points
+  })
 }
 
 shinyApp(ui, server)
