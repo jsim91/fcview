@@ -1666,7 +1666,7 @@ server <- function(input, output, session) {
     if (is.null(gg)) return(400)
     ncol_facets <- suppressWarnings(as.numeric(input$cont_max_facets))
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
-    200 * ncol_facets
+    225 * ncol_facets
   })
   
   output$export_cont_pdf <- downloadHandler(
