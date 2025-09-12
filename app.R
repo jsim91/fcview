@@ -132,7 +132,6 @@ EmbeddingUI <- function(id, title = "UMAP") {
   )
 }
 
-
 # ---- Embedding module server ----
 EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, clusters, cluster_map,
                             active_tab, rv) {
@@ -144,6 +143,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     # One-time picker initialization in a reactive context
     initialized <- FALSE
     plot_cache_gg <- reactiveVal(NULL)
+    facet_cols_saved <- reactiveVal(2)
     
     observeEvent(list(expr(), meta_cell(), clusters()), ignoreInit = FALSE, {
       if (initialized) return()
@@ -284,7 +284,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
     
     # Add split_by to triggers for this observer
     observeEvent(
-      list(df(), expr(), meta_cell(), input$color_by, input$max_facets, input$plot_facets),
+      list(df(), expr(), meta_cell(), input$color_by, input$plot_facets),
       {
         expr_val <- expr()
         meta_val <- meta_cell()
@@ -355,7 +355,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           
           # Build faceted ggplot
           gg <- ggplot(dd, aes(x = x, y = y, color = .data[[".color_val"]])) +
-            ggrastr::geom_point_rast(size = 0.25, alpha = 0.25) +
+            ggrastr::geom_point_rast(size = 0.25, alpha = 0.5) +
             guides(color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
             facet_wrap(as.formula(paste("~", split_var)), ncol = as.numeric(input$max_facets)) +
             (if (is.numeric(dd$.color_val)) scale_color_viridis_c() else scale_color_viridis_d()) +
@@ -717,7 +717,6 @@ ui <- navbarPage(
 
 # ---- Server ----
 server <- function(input, output, session) {
-  
   # App-wide stores
   rv <- reactiveValues(
     obj = NULL,
@@ -928,7 +927,6 @@ server <- function(input, output, session) {
       showNotification("No leiden$abundance matrix found in upload; abundance testing will be disabled.", type = "warning")
       message("No obj$leiden$abundance; rv$clusters$abundance will remain NULL.")
     }
-    
     
     # Store in rv
     rv$expr         <- expr
@@ -1352,16 +1350,6 @@ server <- function(input, output, session) {
     df
   }, sanitize.text.function = function(x) x)
   
-  # observe({
-  #   df <- run_tests()
-  #   has_data <- !is.null(df) && nrow(df) > 0
-  #   if (has_data) {
-  #     shinyjs::enable("export_results")
-  #   } else {
-  #     shinyjs::disable("export_results")
-  #   }
-  # })
-  
   output$export_results <- downloadHandler(
     filename = function() {
       info <- rv$last_test_info
@@ -1718,4 +1706,3 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
-
