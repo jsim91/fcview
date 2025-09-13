@@ -137,7 +137,7 @@ EmbeddingUI <- function(id, title = "UMAP") {
 
 # ---- Embedding module server ----
 EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, clusters, cluster_map,
-                            active_tab, rv) {
+                            active_tab) {
   moduleServer(id, function(input, output, session) {
     message(sprintf("EmbeddingServer %s started", embedding_name))
     message(sprintf("coords NULL? %s | expr NULL? %s | meta_cell NULL? %s",
@@ -802,11 +802,11 @@ server <- function(input, output, session) {
   cont_plot_cache <- reactiveVal(NULL)
   
   # Disable tabs at startup
-  observe({
+  session$onFlushed(function() {
     if (!isTRUE(rv$data_ready)) {
       session$sendCustomMessage("enableTabs", FALSE)
     }
-  })
+  }, once = TRUE)
   
   observeEvent(input$main_tab, {
     message("Tab changed to: ", input$main_tab)
@@ -1094,8 +1094,7 @@ server <- function(input, output, session) {
       reactive(rv$meta_cell),
       reactive(rv$clusters),
       reactive(rv$cluster_map),
-      reactive(input$main_tab),
-      rv
+      reactive(input$main_tab)
     )
   })
   
@@ -1109,8 +1108,7 @@ server <- function(input, output, session) {
       reactive(rv$meta_cell),
       reactive(rv$clusters),
       reactive(rv$cluster_map),
-      reactive(input$main_tab),
-      rv
+      reactive(input$main_tab)
     )
   })
   
