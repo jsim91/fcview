@@ -795,15 +795,15 @@ server <- function(input, output, session) {
     tSNE = NULL,
     cluster_heat = NULL,
     pop_size = NULL,
-    rep_used = NULL
+    rep_used = NULL,
+    data_ready = FALSE
   )
-  rv$data_ready <- reactiveVal(FALSE)
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
   
   # Disable tabs at startup
   observe({
-    if (!rv$data_ready()) {
+    if (!isTRUE(rv$data_ready)) {
       session$sendCustomMessage("enableTabs", FALSE)
     }
   })
@@ -1015,12 +1015,12 @@ server <- function(input, output, session) {
     
     showNotification("Data loaded and initialized.", type = "message")
     
-    rv$data_ready(TRUE)
-    session$sendCustomMessage("enableTabs", TRUE) # unlock tabs when ready
+    rv$data_ready <- TRUE
+    session$sendCustomMessage("enableTabs", TRUE)
   })
   
   observeEvent(input$main_tab, {
-    if (!rv$data_ready() && !identical(input$main_tab, "Home")) {
+    if (!isTRUE(rv$data_ready) && !identical(input$main_tab, "Home")) {
       updateNavbarPage(session, "main_tab", selected = "Home")
     }
   })
