@@ -798,7 +798,6 @@ server <- function(input, output, session) {
     rep_used = NULL,
     data_ready = FALSE
   )
-  #trace(reactiveValues, tracer = function(...) browser(), print = FALSE)
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
   
@@ -1032,24 +1031,26 @@ server <- function(input, output, session) {
   })
   outputOptions(output, "hasClusterMap", suspendWhenHidden = FALSE)
   
-  observe({
-    if (!is.null(rv$cluster_map) && all(c("cluster","celltype") %in% names(rv$cluster_map))) {
+  observeEvent(rv$cluster_map, {
+    cm <- rv$cluster_map
+    if (!is.null(cm) && all(c("cluster","celltype") %in% names(cm))) {
       # nothing to do
     } else {
       updatePickerInput(session, "test_entity", selected = "Clusters")
     }
-  })
-  observe({
-    if (!is.null(rv$cluster_map) && all(c("cluster","celltype") %in% names(rv$cluster_map))) {
+  }, ignoreInit = TRUE)
+  
+  observeEvent(rv$cluster_map, {
+    cm <- rv$cluster_map
+    if (!is.null(cm) && all(c("cluster","celltype") %in% names(cm))) {
       # nothing to do
     } else {
       updatePickerInput(session, "cat_entity", selected = "Clusters")
     }
-  })
+  }, ignoreInit = TRUE)
   
   # Auto-detect categorical vs continuous metadata
-  observe({
-    req(rv$meta_cell)
+  observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
     
     categorical_choices <- meta_cols[sapply(rv$meta_cell, function(x)
@@ -1063,23 +1064,23 @@ server <- function(input, output, session) {
                       choices = c("", categorical_choices), selected = "")
     updatePickerInput(session, "cont_var",
                       choices = c("", continuous_choices), selected = "")
-  })
-  observe({
-    req(rv$meta_cell)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
     continuous_choices <- meta_cols[sapply(rv$meta_cell, is.numeric)]
     updatePickerInput(session, "cont_group_var",
                       choices = c("", continuous_choices),
                       selected = "")
-  })
-  observe({
-    req(rv$meta_cell)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
     updatePickerInput(session, "model_outcome", choices = meta_cols)
     updatePickerInput(session, "model_predictors", choices = meta_cols)
     updatePickerInput(session, "model_covariates", choices = meta_cols)
     updatePickerInput(session, "model_random", choices = meta_cols)
-  })
+  }, ignoreInit = TRUE)
   
   # Launch embedding modules as soon as data is ready
   observeEvent(list(rv$UMAP, rv$data_ready), {
@@ -1221,48 +1222,52 @@ server <- function(input, output, session) {
   })
   outputOptions(output, "hasResults", suspendWhenHidden = FALSE)
   
+  # Store results + adj_col name from the run
   run_tests <- eventReactive(input$run_test, {
     req(rv$meta_cell)
-    test_type <- input$test_type
     
-    # --- Cluster or celltype testing using abundance matrix ---
+    # Capture all relevant inputs at run time
+    test_type_run     <- input$test_type
+    p_adj_method_run  <- input$p_adj_method
+    group_var_run     <- input$group_var
+    cont_var_run      <- input$cont_var
+    test_entity_run   <- input$test_entity
+    
     abund0 <- rv$clusters$abundance
     if (is.null(abund0)) {
-      showNotification("No abundance matrix available. Ensure obj$leiden$abundance is present in the upload.", type = "error", duration = NULL)
-      message("run_tests: rv$clusters$abundance is NULL; aborting.")
-      return(data.frame(entity = NA, test = NA, p = NA, n = NA))
+      showNotification("No abundance matrix available. Ensure obj$leiden$abundance is present in the upload.",
+                       type = "error", duration = NULL)
+      return(list(df = NULL, adj_col = NULL))
     }
     if (is.null(rownames(abund0)) || any(!nzchar(rownames(abund0)))) {
-      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.", type = "error", duration = NULL)
-      message("run_tests: abundance rownames missing/empty; aborting.")
-      return(data.frame(entity = NA, test = NA, p = NA, n = NA))
+      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.",
+                       type = "error", duration = NULL)
+      return(list(df = NULL, adj_col = NULL))
     }
     
     abund <- abund0
-    if (input$test_entity == "Celltypes" &&
-        !is.null(rv$cluster_map) &&
+    if (test_entity_run == "Celltypes" && !is.null(rv$cluster_map) &&
         all(c("cluster", "celltype") %in% names(rv$cluster_map))) {
-      
       cm <- rv$cluster_map
       keep <- cm$cluster %in% colnames(abund)
       cm <- cm[keep, , drop = FALSE]
       if (!nrow(cm)) {
         showNotification("No overlapping clusters to aggregate into celltypes.", type = "error")
-        return(data.frame(entity = NA, test = NA, p = NA, n = NA))
+        return(list(df = NULL, adj_col = NULL))
       }
       split_idx <- split(cm$cluster, cm$celltype)
       abund <- sapply(split_idx, function(cols) rowSums(abund0[, cols, drop = FALSE]))
       abund <- as.matrix(abund)
     }
     
-    if (!nzchar(input$group_var) && !nzchar(input$cont_var)) {
-      return(data.frame(entity = NA, test = NA, p = NA, n = NA))
+    if (!nzchar(group_var_run) && !nzchar(cont_var_run)) {
+      return(list(df = data.frame(entity = NA, test = NA, p = NA, n = NA), adj_col = NULL))
     }
     
-    # Map abundance rows (sources) to patient_ID via escaped regex
+    # Map abundance rows to patient_ID
     sources <- rownames(abund)
     ids <- unique(rv$meta_cell$patient_ID)
-    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\\\1")
+    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
     ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
     pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
     pid <- stringr::str_extract(sources, pattern)
@@ -1272,31 +1277,18 @@ server <- function(input, output, session) {
     meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
     abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
     
-    # Debug: confirm grouping column presence
-    if (nzchar(input$group_var)) {
-      gv <- input$group_var
-      if (!(gv %in% names(abund_df))) {
-        message("run_tests: grouping variable not found after join: ", gv)
-        showNotification(paste0("Grouping variable '", gv, "' not found after join."), type = "error")
-      } else {
-        message("run_tests: grouping var head after join:")
-        print(utils::head(abund_df[, c("patient_ID", gv)], 10))
-      }
-    }
-    
     abund_long <- abund_df %>%
       tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq")
     
     res <- abund_long %>%
       dplyr::group_by(entity) %>%
       dplyr::group_modify(~ {
-        if (test_type == "Wilcoxon (2-group)") {
-          if (!nzchar(input$group_var)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
-          g <- droplevels(factor(.x[[input$group_var]]))
+        if (test_type_run == "Wilcoxon (2-group)") {
+          if (!nzchar(group_var_run)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
+          g <- droplevels(factor(.x[[group_var_run]]))
           ok <- !is.na(g)
           g <- g[ok]; freq_ok <- .x$freq[ok]
           if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
-          
           summaries <- tapply(freq_ok, g, function(v) {
             med <- median(v, na.rm = TRUE)
             q25 <- quantile(v, 0.25, na.rm = TRUE)
@@ -1306,15 +1298,14 @@ server <- function(input, output, session) {
           })
           sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
           names(sum_df) <- paste0(names(sum_df), "_IQR")
-          
           wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
           cbind(data.frame(test = "wilcox", n = sum(ok), p = wt$p.value), sum_df)
-        } else if (test_type == "Kruskal–Wallis (multi-group)") {
-          if (!nzchar(input$group_var)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
-          g <- .x[[input$group_var]]
+          
+        } else if (test_type_run == "Kruskal–Wallis (multi-group)") {
+          if (!nzchar(group_var_run)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
+          g <- .x[[group_var_run]]
           ok <- !is.na(g)
           if (!any(ok)) return(data.frame(test = "kruskal", p = NA, n = 0))
-          
           summaries <- tapply(.x$freq[ok], g[ok], function(v) {
             med <- median(v, na.rm = TRUE)
             q25 <- quantile(v, 0.25, na.rm = TRUE)
@@ -1324,35 +1315,36 @@ server <- function(input, output, session) {
           })
           sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
           names(sum_df) <- paste0(names(sum_df), "_IQR")
-          
           kw <- kruskal.test(.x$freq[ok] ~ as.factor(g[ok]))
           cbind(data.frame(test = "kruskal", n = sum(ok), p = kw$p.value), sum_df)
-        } else {
-          if (!nzchar(input$cont_var)) return(data.frame(test = "spearman", rho = NA, p = NA, n = nrow(.x)))
-          cont <- input$cont_var
+          
+        } else { # Spearman
+          if (!nzchar(cont_var_run)) return(data.frame(test = "spearman", rho = NA, p = NA, n = nrow(.x)))
+          cont <- cont_var_run
           ct <- spearman_test(.x, cont_var = cont)
           cbind(data.frame(test = "spearman"), ct)
         }
       }) %>%
       dplyr::ungroup()
     
-    if (nrow(res) && "p" %in% colnames(res) && nzchar(input$p_adj_method)) {
-      adj_col <- paste0(tolower(input$p_adj_method), "_padj")
-      res[[adj_col]] <- p.adjust(res$p, method = input$p_adj_method)
+    adj_col <- NULL
+    if (nrow(res) && "p" %in% colnames(res) && nzchar(p_adj_method_run)) {
+      adj_col <- paste0(tolower(p_adj_method_run), "_padj")
+      res[[adj_col]] <- p.adjust(res$p, method = p_adj_method_run)
     }
     
-    # Add metadata column name being tested based on test type
-    tested_var <- if (test_type == "Spearman (continuous)") {
-      if (nzchar(input$cont_var)) input$cont_var else NA_character_
-    } else if (test_type %in% c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")) {
-      if (nzchar(input$group_var)) input$group_var else NA_character_
+    # Add metadata column name being tested
+    tested_var <- if (test_type_run == "Spearman (continuous)") {
+      if (nzchar(cont_var_run)) cont_var_run else NA_character_
+    } else if (test_type_run %in% c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")) {
+      if (nzchar(group_var_run)) group_var_run else NA_character_
     } else {
       NA_character_
     }
     
     # Determine entity used in this run
     has_map <- !is.null(rv$cluster_map) && all(c("cluster","celltype") %in% names(rv$cluster_map))
-    entity_used <- if (!has_map) "clusters" else tolower(input$test_entity)
+    entity_used <- if (!has_map) "clusters" else tolower(test_entity_run)
     
     # Determine test short name
     test_map <- c(
@@ -1360,13 +1352,13 @@ server <- function(input, output, session) {
       "Kruskal–Wallis (multi-group)" = "kruskal_wallis",
       "Spearman (continuous)" = "spearman"
     )
-    test_used <- test_map[[input$test_type]]
+    test_used <- test_map[[test_type_run]]
     
-    # Determine metadata used based on test type
-    metadata_used <- if (input$test_type == "Spearman (continuous)") {
-      if (nzchar(input$cont_var)) input$cont_var else "none"
-    } else if (input$test_type %in% c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")) {
-      if (nzchar(input$group_var)) input$group_var else "none"
+    # Determine metadata used
+    metadata_used <- if (test_type_run == "Spearman (continuous)") {
+      if (nzchar(cont_var_run)) cont_var_run else "none"
+    } else if (test_type_run %in% c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")) {
+      if (nzchar(group_var_run)) group_var_run else "none"
     } else {
       "none"
     }
@@ -1382,41 +1374,45 @@ server <- function(input, output, session) {
     
     # Ensure column order: entity, metadata, test, n, p, padj, rho (if present), then all *_IQR
     iqr_cols <- grep("_IQR$", names(res), value = TRUE)
-    adj_col <- paste0(tolower(input$p_adj_method), "_padj")
     base_cols <- c("entity", "metadata", "test", "n", "p")
-    if (adj_col %in% names(res)) {
-      base_cols <- c(base_cols, adj_col)
-    }
-    if ("rho" %in% names(res)) {
-      base_cols <- c(base_cols, "rho")
-    }
+    if (!is.null(adj_col) && adj_col %in% names(res)) base_cols <- c(base_cols, adj_col)
+    if ("rho" %in% names(res)) base_cols <- c(base_cols, "rho")
     res <- res[, c(base_cols, iqr_cols), drop = FALSE]
     
-    res
+    list(df = res, adj_col = adj_col)
   })
   
   output$test_table <- renderTable({
-    df <- req(run_tests())
+    run <- run_tests()
+    df <- req(run$df)
+    adj_col <- run$adj_col
     
-    # Detect adjusted p-value column
-    adj_col <- paste0(tolower(input$p_adj_method), "_padj")
-    
-    # Format p and adjusted p
+    # Format p and adjusted p (only if numeric)
     num_cols <- intersect(c("p", adj_col), names(df))
-    df[num_cols] <- lapply(df[num_cols], function(x) formatC(x, format = "f", digits = 3))
+    for (col in num_cols) {
+      if (is.numeric(df[[col]])) {
+        df[[col]] <- formatC(df[[col]], format = "f", digits = 3)
+      }
+    }
     
-    # Format rho if present
-    if ("rho" %in% names(df)) {
+    # Format rho if present and numeric
+    if ("rho" %in% names(df) && is.numeric(df$rho)) {
       df$rho <- formatC(df$rho, format = "f", digits = 2)
     }
     
     # Order by adjusted p if present
-    if (adj_col %in% names(df)) {
+    if (!is.null(adj_col) && adj_col %in% names(df) && is.numeric(as.numeric(df[[adj_col]]))) {
       df <- df[order(as.numeric(df[[adj_col]]), na.last = TRUE), ]
     }
     
     df
   }, sanitize.text.function = function(x) x)
+  
+  output$hasResults <- reactive({
+    run <- run_tests()
+    !is.null(run$df) && nrow(run$df) > 0
+  })
+  outputOptions(output, "hasResults", suspendWhenHidden = FALSE)
   
   output$export_results <- downloadHandler(
     filename = function() {
@@ -1428,23 +1424,49 @@ server <- function(input, output, session) {
       paste0(fname, ".csv")
     },
     content = function(file) {
-      df <- run_tests()
+      run <- run_tests()
+      df <- run$df
       req(!is.null(df), nrow(df) > 0)
-      # Remove BOM (this was crashing your connection)
       write.csv(df, file, row.names = FALSE)
     },
     contentType = "text/csv"
   )
   
-  # Update categorical metadata choices when data is ready
-  observe({
-    req(rv$meta_cell)
+  # Update cat_group_var choices when metadata arrives
+  observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
     categorical_choices <- meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))]
     updatePickerInput(session, "cat_group_var",
                       choices = c("", categorical_choices),
                       selected = "")
-  })
+  }, ignoreInit = TRUE)
+  
+  # If you also need group_var/cont_var (Testing tab) — keep the same pattern:
+  observeEvent(rv$meta_cell, {
+    meta_cols <- colnames(rv$meta_cell)
+    categorical_choices <- meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))]
+    continuous_choices  <- meta_cols[sapply(rv$meta_cell, function(x) is.numeric(x) || is.integer(x))]
+    updatePickerInput(session, "group_var", choices = c("", categorical_choices), selected = "")
+    updatePickerInput(session, "cont_var",  choices = c("", continuous_choices),  selected = "")
+  }, ignoreInit = TRUE)
+  
+  # Continuous metadata picker for “Continuous” tab
+  observeEvent(rv$meta_cell, {
+    meta_cols <- colnames(rv$meta_cell)
+    continuous_choices <- meta_cols[sapply(rv$meta_cell, is.numeric)]
+    updatePickerInput(session, "cont_group_var",
+                      choices = c("", continuous_choices),
+                      selected = "")
+  }, ignoreInit = TRUE)
+  
+  # Modeling pickers (outcome/predictors/covariates/random)
+  observeEvent(rv$meta_cell, {
+    meta_cols <- colnames(rv$meta_cell)
+    updatePickerInput(session, "model_outcome",    choices = meta_cols)
+    updatePickerInput(session, "model_predictors", choices = meta_cols)
+    updatePickerInput(session, "model_covariates", choices = meta_cols)
+    updatePickerInput(session, "model_random",     choices = meta_cols)
+  }, ignoreInit = TRUE)
   
   cat_plot_data <- eventReactive(input$generate_cat_plots, {
     req(rv$meta_cell, rv$clusters$abundance)
