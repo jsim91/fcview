@@ -798,15 +798,16 @@ server <- function(input, output, session) {
     rep_used = NULL,
     data_ready = FALSE
   )
+  #trace(reactiveValues, tracer = function(...) browser(), print = FALSE)
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
   
   # Disable tabs at startup
-  session$onFlushed(function() {
-    if (!isTRUE(rv$data_ready)) {
-      session$sendCustomMessage("enableTabs", FALSE)
-    }
-  }, once = TRUE)
+  # observe({
+  #   if (!isTRUE(rv$data_ready)) {
+  #     session$sendCustomMessage("enableTabs", FALSE)
+  #   }
+  # })
   
   observeEvent(input$main_tab, {
     message("Tab changed to: ", input$main_tab)
@@ -1025,26 +1026,23 @@ server <- function(input, output, session) {
     }
   })
   
-  # Server-side reactive flag
-  hasClusterMap <- reactive({
-    !is.null(rv$cluster_map) &&
-      all(c("cluster", "celltype") %in% names(rv$cluster_map))
-  })
-  
-  # UI-facing flag for conditionalPanel
+  # UI-facing flag for conditionalPanel (no nested reactive)
   output$hasClusterMap <- reactive({
-    hasClusterMap()
+    !is.null(rv$cluster_map) && all(c("cluster", "celltype") %in% names(rv$cluster_map))
   })
   outputOptions(output, "hasClusterMap", suspendWhenHidden = FALSE)
   
-  
   observe({
-    if (!hasClusterMap()) {
+    if (!is.null(rv$cluster_map) && all(c("cluster","celltype") %in% names(rv$cluster_map))) {
+      # nothing to do
+    } else {
       updatePickerInput(session, "test_entity", selected = "Clusters")
     }
   })
   observe({
-    if (!hasClusterMap()) {
+    if (!is.null(rv$cluster_map) && all(c("cluster","celltype") %in% names(rv$cluster_map))) {
+      # nothing to do
+    } else {
       updatePickerInput(session, "cat_entity", selected = "Clusters")
     }
   })
@@ -1083,9 +1081,9 @@ server <- function(input, output, session) {
     updatePickerInput(session, "model_random", choices = meta_cols)
   })
   
-  # Launch embedding modules as soon as data is ready (Option 1)
-  observeEvent(rv$UMAP, {
-    req(rv$UMAP, rv$expr, rv$meta_cell, rv$clusters)
+  # Launch embedding modules as soon as data is ready
+  observeEvent(list(rv$UMAP, rv$data_ready), {
+    req(rv$data_ready, rv$UMAP, rv$expr, rv$meta_cell, rv$clusters)
     message("Launching UMAP module")
     EmbeddingServer(
       "umap", "UMAP",
@@ -1096,10 +1094,10 @@ server <- function(input, output, session) {
       reactive(rv$cluster_map),
       reactive(input$main_tab)
     )
-  })
+  }, ignoreInit = TRUE)
   
-  observeEvent(rv$tSNE, {
-    req(rv$tSNE, rv$expr, rv$meta_cell, rv$clusters)
+  observeEvent(list(rv$tSNE, rv$data_ready), {
+    req(rv$data_ready, rv$tSNE, rv$expr, rv$meta_cell, rv$clusters)
     message("Launching tSNE module")
     EmbeddingServer(
       "tsne", "tSNE",
@@ -1110,7 +1108,7 @@ server <- function(input, output, session) {
       reactive(rv$cluster_map),
       reactive(input$main_tab)
     )
-  })
+  }, ignoreInit = TRUE)
   
   # Home summaries
   output$ds_summary <- renderPrint({
@@ -1353,11 +1351,8 @@ server <- function(input, output, session) {
     }
     
     # Determine entity used in this run
-    entity_used <- if (!hasClusterMap()) {
-      "clusters"
-    } else {
-      tolower(input$test_entity)
-    }
+    has_map <- !is.null(rv$cluster_map) && all(c("cluster","celltype") %in% names(rv$cluster_map))
+    entity_used <- if (!has_map) "clusters" else tolower(input$test_entity)
     
     # Determine test short name
     test_map <- c(
