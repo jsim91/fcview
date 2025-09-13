@@ -1,4 +1,6 @@
 # App used to explore FCSimple results
+# run by: shiny::runApp(appDir = 'app.R_directory')
+# where 'app.R_directory' is the location of this script, app.R
 
 # ---- Packages ----
 suppressPackageStartupMessages({
