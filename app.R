@@ -17,6 +17,14 @@ suppressPackageStartupMessages({
     library(circlize)
     library(viridis)
     library(scales)
+    library(broom)
+    library(lme4)
+    library(MASS)
+    library(caret)
+    library(rsample)
+    library(tidymodels)
+    library(boot)
+    library(glmnet)
   })
 })
 
@@ -584,7 +592,7 @@ ui <- navbarPage(
   tabPanel("tSNE", EmbeddingUI("tsne", title = "tSNE")),
   
   tabPanel(
-    "Clusters",
+    "Heatmap",
     fluidRow(
       column(3,
              checkboxInput("cluster_rows", "Cluster rows", value = TRUE),
@@ -705,6 +713,70 @@ ui <- navbarPage(
       column(
         9,
         column(9, plotOutput("continuous_plot"))
+      )
+    )
+  ), 
+  tabPanel(
+    "Statistical Modeling",
+    h4("Fit multivariable models to abundance or metadata"),
+    fluidRow(
+      column(
+        3,
+        pickerInput("model_entity", "Entity",
+                    choices = c("Clusters", "Celltypes"),
+                    selected = "Clusters"),
+        pickerInput("model_outcome", "Outcome variable",
+                    choices = NULL,
+                    options = list(`none-selected-text` = "Select outcome")),
+        pickerInput("model_predictors", "Predictor(s)",
+                    choices = NULL, multiple = TRUE,
+                    options = list(`none-selected-text` = "Select predictors")),
+        pickerInput("model_covariates", "Covariates (optional)",
+                    choices = NULL, multiple = TRUE),
+        selectInput("model_type", "Model type",
+                    choices = c("Linear regression" = "lm",
+                                "Logistic regression" = "logistic",
+                                "Poisson GLM" = "poisson",
+                                "Negative binomial GLM" = "negbin",
+                                "Linear mixed-effects" = "lmm")),
+        conditionalPanel(
+          condition = "input.model_type == 'lmm'",
+          pickerInput("model_random", "Random effect (grouping var)",
+                      choices = NULL)
+        ),
+        selectInput("validation_method", "Overfitting protection",
+                    choices = c("None" = "none",
+                                "Train/Test split" = "split",
+                                "K-fold cross-validation" = "kfold",
+                                "Leave-one-out CV" = "loocv"),
+                    selected = "none"),
+        
+        conditionalPanel(
+          condition = "input.validation_method == 'split'",
+          sliderInput("train_prop", "Proportion for training set",
+                      min = 0.5, max = 0.9, value = 0.7, step = 0.05),
+          textOutput("split_counts_preview")
+        ),
+        
+        conditionalPanel(
+          condition = "input.validation_method == 'kfold'",
+          numericInput("k_folds", "Number of folds", value = 5, min = 2, step = 1)
+        ),
+        actionButton("run_model", "Run model"),
+        br(), br(),
+        conditionalPanel(
+          condition = "output.hasModelResults",
+          downloadButton("export_model_results", "Export results as CSV")
+        )
+      ),
+      column(
+        9,
+        h4("Performance metrics"),
+        tableOutput("model_perf"), 
+        h4("Model coefficients"),
+        tableOutput("model_coef_table"),
+        h4("Model summary"),
+        verbatimTextOutput("model_summary")
       )
     )
   )
@@ -1001,6 +1073,14 @@ server <- function(input, output, session) {
     updatePickerInput(session, "cont_group_var",
                       choices = c("", continuous_choices),
                       selected = "")
+  })
+  observe({
+    req(rv$meta_cell)
+    meta_cols <- colnames(rv$meta_cell)
+    updatePickerInput(session, "model_outcome", choices = meta_cols)
+    updatePickerInput(session, "model_predictors", choices = meta_cols)
+    updatePickerInput(session, "model_covariates", choices = meta_cols)
+    updatePickerInput(session, "model_random", choices = meta_cols)
   })
   
   # Launch embedding modules as soon as data is ready (Option 1)
@@ -1610,6 +1690,194 @@ server <- function(input, output, session) {
       facet_cols   = as.numeric(input$cont_max_facets)  # capture facet cols here
     )
   })
+  
+  run_model <- eventReactive(input$run_model, {
+    req(rv$meta_cell, rv$clusters$abundance)
+    
+    abund0 <- rv$clusters$abundance
+    if (is.null(abund0)) {
+      showNotification("No abundance matrix available.", type = "error")
+      return(NULL)
+    }
+    
+    # Aggregate to celltypes if needed
+    abund <- abund0
+    if (input$model_entity == "Celltypes" && !is.null(rv$cluster_map)) {
+      cm <- rv$cluster_map
+      keep <- cm$cluster %in% colnames(abund)
+      cm <- cm[keep, , drop = FALSE]
+      if (!nrow(cm)) return(NULL)
+      split_idx <- split(cm$cluster, cm$celltype)
+      abund <- sapply(split_idx, function(cols) rowSums(abund0[, cols, drop = FALSE]))
+      abund <- as.matrix(abund)
+    }
+    
+    # Map abundance rows to patient_ID
+    sources <- rownames(abund)
+    ids <- unique(rv$meta_cell$patient_ID)
+    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
+    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
+    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
+    pid <- stringr::str_extract(sources, pattern)
+    
+    abund_df <- as.data.frame(abund)
+    abund_df$patient_ID <- pid
+    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
+    abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
+    
+    # Build formula
+    outcome <- input$model_outcome
+    predictors <- c(input$model_predictors, input$model_covariates)
+    if (!length(predictors)) {
+      showNotification("Please select at least one predictor.", type = "error")
+      return(NULL)
+    }
+    form <- as.formula(paste(outcome, "~", paste(predictors, collapse = " + ")))
+    
+    # Helper to fit model based on type
+    fit_model <- function(data) {
+      if (input$model_type == "lm") {
+        lm(form, data = data)
+      } else if (input$model_type == "logistic") {
+        glm(form, data = data, family = binomial)
+      } else if (input$model_type == "poisson") {
+        glm(form, data = data, family = poisson)
+      } else if (input$model_type == "negbin") {
+        if (!requireNamespace("MASS", quietly = TRUE)) stop("MASS package required for negbin")
+        MASS::glm.nb(form, data = data)
+      } else if (input$model_type == "lmm") {
+        if (!requireNamespace("lme4", quietly = TRUE)) stop("lme4 package required for LMM")
+        rand <- input$model_random
+        if (!nzchar(rand)) stop("Random effect variable not selected.")
+        form_lmm <- as.formula(paste(outcome, "~", paste(predictors, collapse = " + "),
+                                     "+ (1|", rand, ")"))
+        lme4::lmer(form_lmm, data = data)
+      } else {
+        stop("Unknown model type.")
+      }
+    }
+    
+    val_method <- input$validation_method
+    perf <- NULL
+    fit <- NULL
+    
+    if (val_method == "split") {
+      set.seed(123)
+      n <- nrow(abund_df)
+      train_n <- floor(input$train_prop * n)
+      train_idx <- sample(seq_len(n), size = train_n)
+      train_data <- abund_df[train_idx, ]
+      test_data  <- abund_df[-train_idx, ]
+      
+      fit <- fit_model(train_data)
+      
+      preds <- tryCatch(
+        predict(fit, newdata = test_data, type = if (input$model_type %in% c("logistic")) "response" else "link"),
+        error = function(e) rep(NA, nrow(test_data))
+      )
+      
+      if (is.numeric(test_data[[outcome]])) {
+        perf <- data.frame(
+          RMSE = sqrt(mean((preds - test_data[[outcome]])^2, na.rm = TRUE)),
+          R2   = 1 - sum((preds - test_data[[outcome]])^2, na.rm = TRUE) /
+            sum((mean(train_data[[outcome]]) - test_data[[outcome]])^2, na.rm = TRUE)
+        )
+      } else {
+        pred_class <- if (is.numeric(preds)) round(preds) else preds
+        perf <- data.frame(
+          Accuracy = mean(pred_class == test_data[[outcome]], na.rm = TRUE)
+        )
+      }
+      
+    } else if (val_method == "kfold") {
+      if (!requireNamespace("caret", quietly = TRUE)) stop("caret package required for k-fold CV")
+      model_method <- switch(input$model_type,
+                             lm = "lm",
+                             logistic = "glm",
+                             poisson = "glm",
+                             negbin = "glm.nb",
+                             lmm = "lmer",
+                             "lm")
+      ctrl <- caret::trainControl(method = "cv", number = input$k_folds)
+      fit <- caret::train(form, data = abund_df, method = model_method, trControl = ctrl)
+      perf <- fit$results
+      
+    } else if (val_method == "loocv") {
+      if (!requireNamespace("caret", quietly = TRUE)) stop("caret package required for LOOCV")
+      model_method <- switch(input$model_type,
+                             lm = "lm",
+                             logistic = "glm",
+                             poisson = "glm",
+                             negbin = "glm.nb",
+                             lmm = "lmer",
+                             "lm")
+      ctrl <- caret::trainControl(method = "LOOCV")
+      fit <- caret::train(form, data = abund_df, method = model_method, trControl = ctrl)
+      perf <- fit$results
+      
+    } else {
+      # No validation
+      fit <- fit_model(abund_df)
+    }
+    
+    list(fit = fit, coef = tryCatch(broom::tidy(fit), error = function(e) NULL), perf = perf)
+  })
+  
+  output$split_counts_preview <- renderText({
+    req(rv$meta_cell)
+    n <- nrow(rv$meta_cell)
+    train_n <- floor(input$train_prop * n)
+    test_n <- n - train_n
+    paste0("Train set: ", train_n, " samples | Test set: ", test_n, " samples")
+  })
+  
+  # Show/hide export button based on whether we have results
+  output$hasModelResults <- reactive({
+    !is.null(run_model()) && !is.null(run_model()$coef)
+  })
+  outputOptions(output, "hasModelResults", suspendWhenHidden = FALSE)
+  
+  # Coefficient table
+  output$model_coef_table <- renderTable({
+    m <- run_model()
+    req(m)
+    if (is.null(m$coef)) return(data.frame(Message = "No coefficients available"))
+    m$coef
+  })
+  
+  # Model summary (verbatim)
+  output$model_summary <- renderPrint({
+    m <- run_model()
+    req(m)
+    if (is.null(m$fit)) {
+      cat("No model fit available.")
+    } else {
+      summary(m$fit)
+    }
+  })
+  
+  # Performance metrics table (only if validation was used)
+  output$model_perf <- renderTable({
+    m <- run_model()
+    req(m)
+    if (is.null(m$perf)) return(NULL)
+    m$perf
+  })
+  
+  # Export coefficients as CSV
+  output$export_model_results <- downloadHandler(
+    filename = function() {
+      paste0("model_results_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      m <- run_model()
+      req(m)
+      if (!is.null(m$coef)) {
+        write.csv(m$coef, file, row.names = FALSE)
+      }
+    },
+    contentType = "text/csv"
+  )
   
   output$continuous_plot <- renderPlot({
     cp <- cont_plot_data()
