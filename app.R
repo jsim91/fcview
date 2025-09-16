@@ -25,6 +25,7 @@ suppressPackageStartupMessages({
     library(tidymodels)
     library(boot)
     library(glmnet)
+    library(Boruta)
   })
 })
 
@@ -573,10 +574,9 @@ ui <- navbarPage(
   tabPanel("Home",
     sidebarLayout(
       sidebarPanel(
-        h4("Upload inputs"),
         fileInput("rdata_upload", "Upload .RData (FCSimple analysis object)", accept = ".RData"),
         numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
-        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled at load time. This is done to speed up UMAP and tSNE facet plotting."), 
+        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled after upload. This is done to speed up UMAP and tSNE facet plotting."), 
         width = 3
       ),
       mainPanel(
@@ -717,66 +717,34 @@ ui <- navbarPage(
     )
   ), 
   tabPanel(
-    "Statistical Modeling",
-    h4("Fit multivariable models to abundance or metadata"),
-    fluidRow(
-      column(
-        3,
-        pickerInput("model_entity", "Entity",
-                    choices = c("Clusters", "Celltypes"),
-                    selected = "Clusters"),
-        pickerInput("model_outcome", "Outcome variable",
-                    choices = NULL,
-                    options = list(`none-selected-text` = "Select outcome")),
-        pickerInput("model_predictors", "Predictor(s)",
-                    choices = NULL, multiple = TRUE,
-                    options = list(`none-selected-text` = "Select predictors")),
-        pickerInput("model_covariates", "Covariates (optional)",
-                    choices = NULL, multiple = TRUE),
-        selectInput("model_type", "Model type",
-                    choices = c("Linear regression" = "lm",
-                                "Logistic regression" = "logistic",
-                                "Poisson GLM" = "poisson",
-                                "Negative binomial GLM" = "negbin",
-                                "Linear mixed-effects" = "lmm")),
+    "Feature Selection",
+    sidebarLayout(
+      sidebarPanel(
+        pickerInput("fs_method", "Method", 
+                    choices = c("Ridge Regression", "Elastic Net", "Random Forest (Boruta)")),
+        pickerInput("fs_outcome", "Outcome variable", choices = NULL),
+        pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
         conditionalPanel(
-          condition = "input.model_type == 'lmm'",
-          pickerInput("model_random", "Random effect (grouping var)",
-                      choices = NULL)
+          condition = "input.fs_method == 'Elastic Net'",
+          sliderInput("fs_alpha", "Alpha (0 = Ridge, 1 = Lasso)", 
+                      min = 0, max = 1, value = 0.5, step = 0.05)
         ),
-        selectInput("validation_method", "Overfitting protection",
-                    choices = c("None" = "none",
-                                "Train/Test split" = "split",
-                                "K-fold cross-validation" = "kfold",
-                                "Leave-one-out CV" = "loocv"),
-                    selected = "none"),
-        
-        conditionalPanel(
-          condition = "input.validation_method == 'split'",
-          sliderInput("train_prop", "Proportion for training set",
-                      min = 0.5, max = 0.9, value = 0.7, step = 0.05),
-          textOutput("split_counts_preview")
-        ),
-        
-        conditionalPanel(
-          condition = "input.validation_method == 'kfold'",
-          numericInput("k_folds", "Number of folds", value = 5, min = 2, step = 1)
-        ),
-        actionButton("run_model", "Run model"),
+        actionButton("run_fs", "Run Feature Selection"),
         br(), br(),
         conditionalPanel(
-          condition = "output.hasModelResults",
-          downloadButton("export_model_results", "Export results as CSV")
+          condition = "output.hasFSResults",
+          downloadButton("export_fs_results", "Export results as CSV")
         )
       ),
-      column(
-        9,
-        h4("Performance metrics"),
-        tableOutput("model_perf"), 
-        h4("Model coefficients"),
-        tableOutput("model_coef_table"),
-        h4("Model summary"),
-        verbatimTextOutput("model_summary")
+      mainPanel(
+        h4("Summary Plot"),
+        plotOutput("fs_plot", height = "500px"),
+        
+        h4("Selected Features"),
+        tableOutput("fs_results"),
+        
+        h4("Details"),
+        verbatimTextOutput("fs_summary")
       )
     )
   )
@@ -928,6 +896,13 @@ server <- function(input, output, session) {
     # Join metadata by patient_ID (safe: metadata_unique has 1 row per ID)
     meta_cell <- meta_cell %>%
       dplyr::left_join(metadata_unique, by = "patient_ID")
+    meta_cell[] <- lapply(meta_cell, function(col) {
+      if (is.character(col) && all(grepl("^\\s*-?\\d*(\\.\\d+)?\\s*$", col[!is.na(col)]))) {
+        as.numeric(col)
+      } else {
+        col
+      }
+    })
     
     # --- Post-join check for unmatched IDs ---
     unmatched <- sum(is.na(meta_cell$patient_ID))
@@ -1706,194 +1681,6 @@ server <- function(input, output, session) {
     )
   })
   
-  run_model <- eventReactive(input$run_model, {
-    req(rv$meta_cell, rv$clusters$abundance)
-    
-    abund0 <- rv$clusters$abundance
-    if (is.null(abund0)) {
-      showNotification("No abundance matrix available.", type = "error")
-      return(NULL)
-    }
-    
-    # Aggregate to celltypes if needed
-    abund <- abund0
-    if (input$model_entity == "Celltypes" && !is.null(rv$cluster_map)) {
-      cm <- rv$cluster_map
-      keep <- cm$cluster %in% colnames(abund)
-      cm <- cm[keep, , drop = FALSE]
-      if (!nrow(cm)) return(NULL)
-      split_idx <- split(cm$cluster, cm$celltype)
-      abund <- sapply(split_idx, function(cols) rowSums(abund0[, cols, drop = FALSE]))
-      abund <- as.matrix(abund)
-    }
-    
-    # Map abundance rows to patient_ID
-    sources <- rownames(abund)
-    ids <- unique(rv$meta_cell$patient_ID)
-    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
-    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
-    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
-    pid <- stringr::str_extract(sources, pattern)
-    
-    abund_df <- as.data.frame(abund)
-    abund_df$patient_ID <- pid
-    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
-    abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
-    
-    # Build formula
-    outcome <- input$model_outcome
-    predictors <- c(input$model_predictors, input$model_covariates)
-    if (!length(predictors)) {
-      showNotification("Please select at least one predictor.", type = "error")
-      return(NULL)
-    }
-    form <- as.formula(paste(outcome, "~", paste(predictors, collapse = " + ")))
-    
-    # Helper to fit model based on type
-    fit_model <- function(data) {
-      if (input$model_type == "lm") {
-        lm(form, data = data)
-      } else if (input$model_type == "logistic") {
-        glm(form, data = data, family = binomial)
-      } else if (input$model_type == "poisson") {
-        glm(form, data = data, family = poisson)
-      } else if (input$model_type == "negbin") {
-        if (!requireNamespace("MASS", quietly = TRUE)) stop("MASS package required for negbin")
-        MASS::glm.nb(form, data = data)
-      } else if (input$model_type == "lmm") {
-        if (!requireNamespace("lme4", quietly = TRUE)) stop("lme4 package required for LMM")
-        rand <- input$model_random
-        if (!nzchar(rand)) stop("Random effect variable not selected.")
-        form_lmm <- as.formula(paste(outcome, "~", paste(predictors, collapse = " + "),
-                                     "+ (1|", rand, ")"))
-        lme4::lmer(form_lmm, data = data)
-      } else {
-        stop("Unknown model type.")
-      }
-    }
-    
-    val_method <- input$validation_method
-    perf <- NULL
-    fit <- NULL
-    
-    if (val_method == "split") {
-      set.seed(123)
-      n <- nrow(abund_df)
-      train_n <- floor(input$train_prop * n)
-      train_idx <- sample(seq_len(n), size = train_n)
-      train_data <- abund_df[train_idx, ]
-      test_data  <- abund_df[-train_idx, ]
-      
-      fit <- fit_model(train_data)
-      
-      preds <- tryCatch(
-        predict(fit, newdata = test_data, type = if (input$model_type %in% c("logistic")) "response" else "link"),
-        error = function(e) rep(NA, nrow(test_data))
-      )
-      
-      if (is.numeric(test_data[[outcome]])) {
-        perf <- data.frame(
-          RMSE = sqrt(mean((preds - test_data[[outcome]])^2, na.rm = TRUE)),
-          R2   = 1 - sum((preds - test_data[[outcome]])^2, na.rm = TRUE) /
-            sum((mean(train_data[[outcome]]) - test_data[[outcome]])^2, na.rm = TRUE)
-        )
-      } else {
-        pred_class <- if (is.numeric(preds)) round(preds) else preds
-        perf <- data.frame(
-          Accuracy = mean(pred_class == test_data[[outcome]], na.rm = TRUE)
-        )
-      }
-      
-    } else if (val_method == "kfold") {
-      if (!requireNamespace("caret", quietly = TRUE)) stop("caret package required for k-fold CV")
-      model_method <- switch(input$model_type,
-                             lm = "lm",
-                             logistic = "glm",
-                             poisson = "glm",
-                             negbin = "glm.nb",
-                             lmm = "lmer",
-                             "lm")
-      ctrl <- caret::trainControl(method = "cv", number = input$k_folds)
-      fit <- caret::train(form, data = abund_df, method = model_method, trControl = ctrl)
-      perf <- fit$results
-      
-    } else if (val_method == "loocv") {
-      if (!requireNamespace("caret", quietly = TRUE)) stop("caret package required for LOOCV")
-      model_method <- switch(input$model_type,
-                             lm = "lm",
-                             logistic = "glm",
-                             poisson = "glm",
-                             negbin = "glm.nb",
-                             lmm = "lmer",
-                             "lm")
-      ctrl <- caret::trainControl(method = "LOOCV")
-      fit <- caret::train(form, data = abund_df, method = model_method, trControl = ctrl)
-      perf <- fit$results
-      
-    } else {
-      # No validation
-      fit <- fit_model(abund_df)
-    }
-    
-    list(fit = fit, coef = tryCatch(broom::tidy(fit), error = function(e) NULL), perf = perf)
-  })
-  
-  output$split_counts_preview <- renderText({
-    req(rv$meta_cell)
-    n <- nrow(rv$meta_cell)
-    train_n <- floor(input$train_prop * n)
-    test_n <- n - train_n
-    paste0("Train set: ", train_n, " samples | Test set: ", test_n, " samples")
-  })
-  
-  # Show/hide export button based on whether we have results
-  output$hasModelResults <- reactive({
-    !is.null(run_model()) && !is.null(run_model()$coef)
-  })
-  outputOptions(output, "hasModelResults", suspendWhenHidden = FALSE)
-  
-  # Coefficient table
-  output$model_coef_table <- renderTable({
-    m <- run_model()
-    req(m)
-    if (is.null(m$coef)) return(data.frame(Message = "No coefficients available"))
-    m$coef
-  })
-  
-  # Model summary (verbatim)
-  output$model_summary <- renderPrint({
-    m <- run_model()
-    req(m)
-    if (is.null(m$fit)) {
-      cat("No model fit available.")
-    } else {
-      summary(m$fit)
-    }
-  })
-  
-  # Performance metrics table (only if validation was used)
-  output$model_perf <- renderTable({
-    m <- run_model()
-    req(m)
-    if (is.null(m$perf)) return(NULL)
-    m$perf
-  })
-  
-  # Export coefficients as CSV
-  output$export_model_results <- downloadHandler(
-    filename = function() {
-      paste0("model_results_", Sys.Date(), ".csv")
-    },
-    content = function(file) {
-      m <- run_model()
-      req(m)
-      if (!is.null(m$coef)) {
-        write.csv(m$coef, file, row.names = FALSE)
-      }
-    },
-    contentType = "text/csv"
-  )
-  
   output$continuous_plot <- renderPlot({
     cp <- cont_plot_data()
     req(cp)
@@ -1981,6 +1768,211 @@ server <- function(input, output, session) {
     contentType = "application/pdf"
   )
   
+  # Populate Feature Selection dropdowns from same metadata source as other tabs
+  observeEvent(rv$meta_cell, {
+    meta_cols <- colnames(rv$meta_cell)
+    updatePickerInput(session, "fs_outcome", choices = meta_cols)
+    updatePickerInput(session, "fs_predictors", choices = meta_cols)
+  }, ignoreInit = TRUE)
+  
+  run_fs <- eventReactive(input$run_fs, {
+    req(rv$clusters$abundance, rv$meta_cell)
+    
+    # --- Merge abundance with sample-level metadata ---
+    abund0 <- rv$clusters$abundance
+    sources <- rownames(abund0)
+    ids <- unique(rv$meta_cell$patient_ID)
+    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
+    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
+    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
+    pid <- stringr::str_extract(sources, pattern)
+    
+    abund_df <- as.data.frame(abund0)
+    abund_df$patient_ID <- pid
+    
+    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
+    df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
+    
+    # --- Capture inputs ---
+    outcome <- input$fs_outcome
+    predictors <- input$fs_predictors
+    req(outcome, predictors)
+    
+    # --- Drop samples with missing outcome or predictors ---
+    n_before <- nrow(df)
+    df <- df[!is.na(df[[outcome]]), , drop = FALSE]
+    df <- df[stats::complete.cases(df[, predictors, drop = FALSE]), , drop = FALSE]
+    n_after <- nrow(df)
+    n_dropped <- n_before - n_after
+    
+    # --- Notify user if samples were dropped ---
+    if (n_dropped > 0) {
+      showNotification(
+        sprintf("%d sample(s) dropped due to missing outcome/predictor data. %d sample(s) used.",
+                n_dropped, n_after),
+        type = "warning"
+      )
+    }
+    
+    method <- input$fs_method
+    
+    if (method %in% c("Ridge Regression", "Elastic Net")) {
+      alpha_val <- if (method == "Ridge Regression") 0 else input$fs_alpha
+      x <- model.matrix(reformulate(predictors), df)[, -1]
+      y <- df[[outcome]]
+      
+      cvfit <- glmnet::cv.glmnet(x, y, alpha = alpha_val, standardize = TRUE)
+      coefs <- coef(cvfit, s = "lambda.min")
+      coefs_df <- data.frame(
+        Feature = rownames(coefs),
+        Coefficient = as.numeric(coefs)
+      )
+      coefs_df <- coefs_df[coefs_df$Feature != "(Intercept)", ]
+      coefs_df <- coefs_df[order(abs(coefs_df$Coefficient), decreasing = TRUE), ]
+      
+      return(list(results = coefs_df,
+                  summary = list(model = cvfit,
+                                 n_before = n_before,
+                                 n_after = n_after,
+                                 n_dropped = n_dropped)))
+      
+    } else if (method == "Random Forest (Boruta)") {
+      form <- as.formula(paste(outcome, "~", paste(predictors, collapse = "+")))
+      bor <- Boruta::Boruta(form, data = df, doTrace = 0)
+      bor_final <- Boruta::TentativeRoughFix(bor)
+      
+      imp <- attStats(bor_final)
+      
+      # Convert rownames to a proper column
+      imp <- data.frame(Feature = rownames(imp), imp, row.names = NULL)
+      
+      # Order by importance
+      imp <- imp[order(-imp$meanImp), ]
+      
+      return(list(results = imp,
+                  summary = list(model = bor_final,
+                                 n_before = n_before,
+                                 n_after = n_after,
+                                 n_dropped = n_dropped)))
+    }
+  })
+  
+  output$fs_results <- renderTable({
+    res <- run_fs()
+    req(res)
+    res$results
+  })
+  
+  output$fs_plot <- renderPlot({
+    res <- run_fs()
+    req(res)
+    
+    title_hjust <- 0.5
+    
+    if (inherits(res$summary$model, "Boruta")) {
+      # --- Boruta ggplot2 boxplot from attStats() ---
+      imp_df <- Boruta::attStats(res$summary$model)
+      imp_df <- data.frame(Feature = rownames(imp_df), imp_df, row.names = NULL)
+      
+      # Order features by mean importance
+      imp_df$Feature <- factor(imp_df$Feature, levels = imp_df$Feature[order(imp_df$meanImp)])
+      
+      ggplot(imp_df, aes(x = Feature, y = meanImp, fill = decision)) +
+        geom_col() +
+        geom_errorbar(aes(ymin = minImp, ymax = maxImp), width = 0.2) +
+        scale_fill_manual(values = c("Confirmed" = "forestgreen",
+                                     "Tentative" = "gold",
+                                     "Rejected" = "firebrick")) +
+        labs(
+          title = "Boruta Feature Importance",
+          x = NULL,  # remove x-axis title
+          y = "Mean Importance"
+        ) +
+        theme_bw(base_size = 24) +
+        theme(
+          plot.title = element_text(hjust = title_hjust),
+          axis.text.x = element_text(angle = 45, hjust = 1)
+        )
+      
+    } else if (inherits(res$summary$model, "cv.glmnet")) {
+      # --- Ridge / Elastic Net coefficient bar plot with feature:category labels ---
+      coefs_df <- res$results
+      coefs_df <- coefs_df[coefs_df$Feature != "(Intercept)", , drop = FALSE]
+      
+      # Map expanded dummy names back to "feature:category"
+      predictors <- input$fs_predictors
+      coefs_df$Feature <- vapply(coefs_df$Feature, function(f) {
+        hits <- predictors[startsWith(f, predictors)]
+        if (length(hits)) {
+          base <- hits[which.max(nchar(hits))]
+          category <- sub(paste0("^", base), "", f)
+          if (category == "") base else paste0(base, ":", category)
+        } else {
+          f
+        }
+      }, character(1))
+      
+      # Aggregate to one row per base predictor: keep coefficient with largest abs value
+      agg <- coefs_df |>
+        dplyr::group_by(Feature) |>
+        dplyr::summarise(
+          idx = which.max(abs(Coefficient)),
+          Coefficient = Coefficient[idx],
+          .groups = "drop"
+        )
+      
+      # Filter out zero coefficients
+      agg <- agg[agg$Coefficient != 0, , drop = FALSE]
+      
+      # Order by absolute magnitude and take top N
+      agg <- agg[order(abs(agg$Coefficient), decreasing = TRUE), , drop = FALSE]
+      top_n <- min(20, nrow(agg))
+      agg_top <- utils::head(agg, top_n)
+      
+      ggplot(agg_top, aes(x = reorder(Feature, Coefficient), y = Coefficient, fill = Coefficient > 0)) +
+        geom_col(show.legend = FALSE) +
+        coord_flip() +
+        labs(
+          title = "Top Coefficients (Ridge/Elastic Net)",
+          x = "Feature",
+          y = "Coefficient"
+        ) +
+        theme_bw(base_size = 24) +
+        theme(
+          plot.title = element_text(hjust = title_hjust)
+        )
+    }
+  })
+  
+  output$fs_summary <- renderPrint({
+    res <- run_fs()
+    req(res)
+    
+    cat("Samples before filtering:", res$summary$n_before, "\n")
+    cat("Samples after filtering:", res$summary$n_after, "\n")
+    cat("Samples dropped:", res$summary$n_dropped, "\n\n")
+    
+    if (inherits(res$summary$model, "cv.glmnet")) {
+      print(res$summary$model)
+    } else if (inherits(res$summary$model, "Boruta")) {
+      print(res$summary$model)
+    } else {
+      print(res$summary$model)
+    }
+  })
+  
+  output$hasFSResults <- reactive({
+    !is.null(run_fs())
+  })
+  outputOptions(output, "hasFSResults", suspendWhenHidden = FALSE)
+  
+  output$export_fs_results <- downloadHandler(
+    filename = function() paste0("feature_selection_", Sys.Date(), ".csv"),
+    content = function(file) {
+      res <- run_fs()
+      write.csv(res$results, file, row.names = FALSE)
+    }
+  )
 }
 
 shinyApp(ui, server)
