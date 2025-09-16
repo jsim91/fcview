@@ -157,34 +157,41 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       
       req(!is.null(expr_val), !is.null(meta_val))
       
-      # Add leiden_cluster column as factor
+      # Add leiden_cluster column as factor if missing
       if (!"leiden_cluster" %in% colnames(meta_val) && !is.null(clusters_val$assignments)) {
         meta_val$leiden_cluster <- factor(clusters_val$assignments)
       }
       
       numeric_markers <- colnames(expr_val)
       meta_cols <- setdiff(colnames(meta_val), c(".cell"))
-      cont_choices <- meta_cols[sapply(meta_val[meta_cols], is.numeric)]
-      unit_candidates <- intersect(
-        c("PatientID", "patient_ID", "patient", "source", "RunDate", "run_date"),
-        colnames(meta_val)
-      )
-      unit_default <- if (length(unit_candidates)) unit_candidates[1] else meta_cols[1]
+      
+      # Ensure leiden_cluster is present and comes right after markers
+      if (!"leiden_cluster" %in% meta_cols && "leiden_cluster" %in% colnames(meta_val)) {
+        meta_cols <- c("leiden_cluster", setdiff(meta_cols, "leiden_cluster"))
+      }
+      
+      # Sort metadata portion alphabetically (excluding leiden_cluster)
+      meta_cols_sorted <- sort(setdiff(meta_cols, "leiden_cluster"))
+      
+      # Final order: markers → leiden_cluster → sorted metadata
+      ordered_choices <- c(numeric_markers, "leiden_cluster", meta_cols_sorted)
+      
+      # Continuous and categorical choices from metadata
+      cont_choices <- sort(meta_cols[sapply(meta_val[meta_cols], is.numeric)])
+      factor_cols  <- meta_cols[sapply(meta_val[meta_cols], is.factor)]
+      char_cols    <- meta_cols[sapply(meta_val[meta_cols], is.character)]
+      categorical_choices <- sort(c(factor_cols, char_cols))
+      
+      # Default unit_var
+      unit_default <- if ("PatientID" %in% meta_cols) "PatientID" else meta_cols[1]
       
       updatePickerInput(session, "color_by",
-                        choices = c(numeric_markers, meta_cols),
-                        selected = if (length(numeric_markers)) numeric_markers[1] else meta_cols[1])
-      factor_cols <- meta_cols[sapply(meta_val[meta_cols], is.factor)]
-      char_cols   <- meta_cols[sapply(meta_val[meta_cols], is.character)]
-      categorical_choices <- c(factor_cols, char_cols)
+                        choices = ordered_choices,
+                        selected = if (length(numeric_markers)) numeric_markers[1] else ordered_choices[1])
       updatePickerInput(session, "split_by", choices = c("", categorical_choices), selected = "")
-      updatePickerInput(session, "group_var",
-                        choices = c("", meta_cols),
-                        selected = "")
-      updatePickerInput(session, "cont_var",
-                        choices = c("", cont_choices),
-                        selected = "")
-      updatePickerInput(session, "unit_var", choices = meta_cols, selected = unit_default)
+      updatePickerInput(session, "group_var", choices = c("", sort(meta_cols)), selected = "")
+      updatePickerInput(session, "cont_var", choices = c("", cont_choices), selected = "")
+      updatePickerInput(session, "unit_var", choices = sort(meta_cols), selected = unit_default)
       
       message(sprintf("Picker inputs initialized for %s (reactive observer)", embedding_name))
       initialized <<- TRUE
@@ -725,6 +732,11 @@ ui <- navbarPage(
         pickerInput("fs_outcome", "Outcome variable", choices = NULL),
         pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
         conditionalPanel(
+          condition = "input.fs_predictors.includes('leiden_cluster')",
+          pickerInput("fs_leiden_subset", "Select clusters to include",
+                      choices = NULL, multiple = TRUE)
+        ), 
+        conditionalPanel(
           condition = "input.fs_method == 'Elastic Net'",
           sliderInput("fs_alpha", "Alpha (0 = Ridge, 1 = Lasso)", 
                       min = 0, max = 1, value = 0.5, step = 0.05)
@@ -738,7 +750,7 @@ ui <- navbarPage(
       ),
       mainPanel(
         h4("Summary Plot"),
-        plotOutput("fs_plot", height = "500px"),
+        plotOutput("fs_plot", height = "550px"),
         
         h4("Selected Features"),
         tableOutput("fs_results"),
@@ -1028,12 +1040,12 @@ server <- function(input, output, session) {
   observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
     
-    categorical_choices <- meta_cols[sapply(rv$meta_cell, function(x)
+    categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x)
       is.character(x) || is.factor(x)
-    )]
-    continuous_choices <- meta_cols[sapply(rv$meta_cell, function(x)
+    )])
+    continuous_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x)
       is.numeric(x) || is.integer(x)
-    )]
+    )])
     
     updatePickerInput(session, "group_var",
                       choices = c("", categorical_choices), selected = "")
@@ -1043,14 +1055,14 @@ server <- function(input, output, session) {
   
   observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
-    continuous_choices <- meta_cols[sapply(rv$meta_cell, is.numeric)]
+    continuous_choices <- sort(meta_cols[sapply(rv$meta_cell, is.numeric)])
     updatePickerInput(session, "cont_group_var",
                       choices = c("", continuous_choices),
                       selected = "")
   }, ignoreInit = TRUE)
   
   observeEvent(rv$meta_cell, {
-    meta_cols <- colnames(rv$meta_cell)
+    meta_cols <- sort(colnames(rv$meta_cell))
     updatePickerInput(session, "model_outcome", choices = meta_cols)
     updatePickerInput(session, "model_predictors", choices = meta_cols)
     updatePickerInput(session, "model_covariates", choices = meta_cols)
@@ -1410,7 +1422,7 @@ server <- function(input, output, session) {
   # Update cat_group_var choices when metadata arrives
   observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
-    categorical_choices <- meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))]
+    categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))])
     updatePickerInput(session, "cat_group_var",
                       choices = c("", categorical_choices),
                       selected = "")
@@ -1419,8 +1431,8 @@ server <- function(input, output, session) {
   # If you also need group_var/cont_var (Testing tab) — keep the same pattern:
   observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
-    categorical_choices <- meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))]
-    continuous_choices  <- meta_cols[sapply(rv$meta_cell, function(x) is.numeric(x) || is.integer(x))]
+    categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))])
+    continuous_choices  <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.numeric(x) || is.integer(x))])
     updatePickerInput(session, "group_var", choices = c("", categorical_choices), selected = "")
     updatePickerInput(session, "cont_var",  choices = c("", continuous_choices),  selected = "")
   }, ignoreInit = TRUE)
@@ -1428,19 +1440,10 @@ server <- function(input, output, session) {
   # Continuous metadata picker for “Continuous” tab
   observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
-    continuous_choices <- meta_cols[sapply(rv$meta_cell, is.numeric)]
+    continuous_choices <- sort(meta_cols[sapply(rv$meta_cell, is.numeric)])
     updatePickerInput(session, "cont_group_var",
                       choices = c("", continuous_choices),
                       selected = "")
-  }, ignoreInit = TRUE)
-  
-  # Modeling pickers (outcome/predictors/covariates/random)
-  observeEvent(rv$meta_cell, {
-    meta_cols <- colnames(rv$meta_cell)
-    updatePickerInput(session, "model_outcome",    choices = meta_cols)
-    updatePickerInput(session, "model_predictors", choices = meta_cols)
-    updatePickerInput(session, "model_covariates", choices = meta_cols)
-    updatePickerInput(session, "model_random",     choices = meta_cols)
   }, ignoreInit = TRUE)
   
   cat_plot_data <- eventReactive(input$generate_cat_plots, {
@@ -1770,10 +1773,15 @@ server <- function(input, output, session) {
   
   # Populate Feature Selection dropdowns from same metadata source as other tabs
   observeEvent(rv$meta_cell, {
-    meta_cols <- colnames(rv$meta_cell)
+    meta_cols <- sort(colnames(rv$meta_cell))
     updatePickerInput(session, "fs_outcome", choices = meta_cols)
     updatePickerInput(session, "fs_predictors", choices = meta_cols)
   }, ignoreInit = TRUE)
+  
+  observeEvent(rv$clusters$abundance, {
+    cluster_names <- colnames(rv$clusters$abundance)
+    updatePickerInput(session, "fs_leiden_subset", choices = cluster_names)
+  })
   
   run_fs <- eventReactive(input$run_fs, {
     req(rv$clusters$abundance, rv$meta_cell)
@@ -1789,23 +1797,75 @@ server <- function(input, output, session) {
     
     abund_df <- as.data.frame(abund0)
     abund_df$patient_ID <- pid
-    
     meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
     df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
     
+    abund_cols <- colnames(abund0)
+    
     # --- Capture inputs ---
     outcome <- input$fs_outcome
-    predictors <- input$fs_predictors
-    req(outcome, predictors)
+    predictors_in <- input$fs_predictors
+    req(outcome, predictors_in)
     
-    # --- Drop samples with missing outcome or predictors ---
+    # Map method to short name
+    method <- input$fs_method
+    method_short <- switch(method,
+                           "Ridge Regression" = "ridge",
+                           "Elastic Net" = "elastic_net",
+                           "Random Forest (Boruta)" = "random_forest"
+    )
+    
+    # Snapshot run-time info for later use in table and export
+    rv$last_fs_info <- list(
+      method = method_short,
+      alpha  = if (method_short == "elastic_net") input$fs_alpha else NA,
+      outcome = outcome
+    )
+    
+    # --- Expand leiden_cluster into abundance predictors if selected ---
+    predictors <- predictors_in
+    if ("leiden_cluster" %in% predictors) {
+      chosen <- abund_cols
+      if (!is.null(input$fs_leiden_subset) && length(input$fs_leiden_subset) > 0) {
+        chosen <- intersect(chosen, input$fs_leiden_subset)
+        if (!length(chosen)) {
+          showNotification("No selected clusters found in abundance matrix.", type = "error")
+          return(NULL)
+        }
+      }
+      predictors <- c(setdiff(predictors, "leiden_cluster"), chosen)
+    }
+    
+    # --- Drop samples with missing outcome ---
     n_before <- nrow(df)
     df <- df[!is.na(df[[outcome]]), , drop = FALSE]
+    
+    # Remove predictors not present in df
+    predictors <- predictors[predictors %in% colnames(df)]
+    if (!length(predictors)) {
+      showNotification("No valid predictors available after filtering.", type = "error")
+      return(NULL)
+    }
+    
+    # Drop single-level factors to avoid contrasts errors
+    single_level <- vapply(predictors, function(p) {
+      is.factor(df[[p]]) && length(levels(droplevels(df[[p]]))) < 2
+    }, logical(1))
+    if (any(single_level)) {
+      dropped <- predictors[single_level]
+      predictors <- predictors[!single_level]
+      showNotification(sprintf("Dropped single-level factor(s): %s", paste(dropped, collapse = ", ")),
+                       type = "warning")
+    }
+    if (!length(predictors)) {
+      showNotification("All predictors dropped due to single-level factors.", type = "error")
+      return(NULL)
+    }
+    
+    # Drop rows with missing predictor values
     df <- df[stats::complete.cases(df[, predictors, drop = FALSE]), , drop = FALSE]
     n_after <- nrow(df)
     n_dropped <- n_before - n_after
-    
-    # --- Notify user if samples were dropped ---
     if (n_dropped > 0) {
       showNotification(
         sprintf("%d sample(s) dropped due to missing outcome/predictor data. %d sample(s) used.",
@@ -1813,66 +1873,110 @@ server <- function(input, output, session) {
         type = "warning"
       )
     }
+    if (n_after < 3) {
+      showNotification("Fewer than 3 samples remain; results may be unstable.", type = "warning")
+    }
     
-    method <- input$fs_method
+    # Helper to map abundance colnames to display names
+    as_display_name <- function(var) {
+      if (var %in% abund_cols) paste0("leiden_cluster:", var) else var
+    }
     
     if (method %in% c("Ridge Regression", "Elastic Net")) {
       alpha_val <- if (method == "Ridge Regression") 0 else input$fs_alpha
-      x <- model.matrix(reformulate(predictors), df)[, -1]
+      
+      # Use ~ . to avoid formula parsing issues with special chars
+      x <- model.matrix(~ ., data = df[, predictors, drop = FALSE])[ , -1, drop = FALSE]
       y <- df[[outcome]]
       
       cvfit <- glmnet::cv.glmnet(x, y, alpha = alpha_val, standardize = TRUE)
       coefs <- coef(cvfit, s = "lambda.min")
-      coefs_df <- data.frame(
-        Feature = rownames(coefs),
-        Coefficient = as.numeric(coefs)
-      )
-      coefs_df <- coefs_df[coefs_df$Feature != "(Intercept)", ]
-      coefs_df <- coefs_df[order(abs(coefs_df$Coefficient), decreasing = TRUE), ]
+      coefs_df <- data.frame(Feature = rownames(coefs),
+                             Coefficient = as.numeric(coefs),
+                             stringsAsFactors = FALSE)
+      coefs_df <- coefs_df[coefs_df$Feature != "(Intercept)", , drop = FALSE]
+      coefs_df$Feature <- vapply(coefs_df$Feature, as_display_name, character(1))
+      coefs_df <- coefs_df[order(abs(coefs_df$Coefficient), decreasing = TRUE), , drop = FALSE]
       
-      return(list(results = coefs_df,
-                  summary = list(model = cvfit,
-                                 n_before = n_before,
-                                 n_after = n_after,
-                                 n_dropped = n_dropped)))
+      # Append method/outcome/alpha as last columns
+      coefs_df$Method <- method_short
+      coefs_df$Outcome <- outcome
+      coefs_df$Alpha <- if (!is.na(rv$last_fs_info$alpha)) rv$last_fs_info$alpha else NA
+      
+      return(list(
+        results = coefs_df,
+        summary = list(model = cvfit,
+                       n_before = n_before,
+                       n_after = n_after,
+                       n_dropped = n_dropped,
+                       sd_y = sd(y, na.rm = TRUE))
+      ))
       
     } else if (method == "Random Forest (Boruta)") {
-      form <- as.formula(paste(outcome, "~", paste(predictors, collapse = "+")))
-      bor <- Boruta::Boruta(form, data = df, doTrace = 0)
+      # Use x/y interface to avoid formula parsing issues
+      x_bor <- df[, predictors, drop = FALSE]
+      y_bor <- df[[outcome]]
+      
+      bor <- Boruta::Boruta(x = x_bor, y = y_bor, doTrace = 0)
       bor_final <- Boruta::TentativeRoughFix(bor)
       
-      imp <- attStats(bor_final)
+      imp <- Boruta::attStats(bor_final)
+      imp <- data.frame(Feature = rownames(imp), imp, row.names = NULL, check.names = FALSE)
+      imp$Feature <- vapply(imp$Feature, as_display_name, character(1))
+      imp <- imp[order(-imp$meanImp), , drop = FALSE]
       
-      # Convert rownames to a proper column
-      imp <- data.frame(Feature = rownames(imp), imp, row.names = NULL)
+      # Append method/outcome/alpha as last columns
+      imp$Method <- method_short
+      imp$Outcome <- outcome
+      imp$Alpha <- if (!is.na(rv$last_fs_info$alpha)) rv$last_fs_info$alpha else NA
       
-      # Order by importance
-      imp <- imp[order(-imp$meanImp), ]
-      
-      return(list(results = imp,
-                  summary = list(model = bor_final,
-                                 n_before = n_before,
-                                 n_after = n_after,
-                                 n_dropped = n_dropped)))
+      return(list(
+        results = imp,
+        summary = list(model = bor_final,
+                       n_before = n_before,
+                       n_after = n_after,
+                       n_dropped = n_dropped)
+      ))
     }
   })
   
   output$fs_results <- renderTable({
     res <- run_fs()
     req(res)
-    res$results
-  })
+    
+    # Columns to hide in the UI but keep in CSV
+    hide_cols <- c("Method", "Outcome", "Alpha")
+    
+    # Only show the other columns in the UI table
+    display_df <- res$results[, setdiff(names(res$results), hide_cols), drop = FALSE]
+    
+    display_df
+  }, sanitize.text.function = function(x) x)
   
   output$fs_plot <- renderPlot({
     res <- run_fs()
     req(res)
-    
     title_hjust <- 0.5
     
+    # Get method/alpha/outcome snapshot from last run
+    info <- rv$last_fs_info
+    method_label <- if (!is.null(info)) {
+      lbl <- paste0("Method: ", info$method)
+      if (!is.na(info$alpha)) {
+        lbl <- paste0(lbl, " | Alpha: ", info$alpha)
+      }
+      lbl
+    } else {
+      ""
+    }
+    
     if (inherits(res$summary$model, "Boruta")) {
-      # --- Boruta ggplot2 boxplot from attStats() ---
+      # --- Boruta ggplot2 boxplot ---
       imp_df <- Boruta::attStats(res$summary$model)
       imp_df <- data.frame(Feature = rownames(imp_df), imp_df, row.names = NULL)
+      
+      # Replace newlines with spaces in feature names
+      imp_df$Feature <- gsub("\\s*\\n\\s*", " ", imp_df$Feature)
       
       # Order features by mean importance
       imp_df$Feature <- factor(imp_df$Feature, levels = imp_df$Feature[order(imp_df$meanImp)])
@@ -1883,34 +1987,20 @@ server <- function(input, output, session) {
         scale_fill_manual(values = c("Confirmed" = "forestgreen",
                                      "Tentative" = "gold",
                                      "Rejected" = "firebrick")) +
-        labs(
-          title = "Boruta Feature Importance",
-          x = NULL,  # remove x-axis title
-          y = "Mean Importance"
-        ) +
+        labs(title = paste("Boruta Feature Importance", method_label, sep = " | "),
+             x = NULL,
+             y = "Mean Importance") +
         theme_bw(base_size = 24) +
-        theme(
-          plot.title = element_text(hjust = title_hjust),
-          axis.text.x = element_text(angle = 45, hjust = 1)
-        )
+        theme(plot.title = element_text(hjust = title_hjust),
+              axis.text.x = element_text(angle = 45, hjust = 1))
       
     } else if (inherits(res$summary$model, "cv.glmnet")) {
-      # --- Ridge / Elastic Net coefficient bar plot with feature:category labels ---
+      # --- Ridge / Elastic Net coefficient bar plot ---
       coefs_df <- res$results
       coefs_df <- coefs_df[coefs_df$Feature != "(Intercept)", , drop = FALSE]
       
-      # Map expanded dummy names back to "feature:category"
-      predictors <- input$fs_predictors
-      coefs_df$Feature <- vapply(coefs_df$Feature, function(f) {
-        hits <- predictors[startsWith(f, predictors)]
-        if (length(hits)) {
-          base <- hits[which.max(nchar(hits))]
-          category <- sub(paste0("^", base), "", f)
-          if (category == "") base else paste0(base, ":", category)
-        } else {
-          f
-        }
-      }, character(1))
+      # Replace newlines with spaces in feature names
+      coefs_df$Feature <- gsub("\\s*\\n\\s*", " ", coefs_df$Feature)
       
       # Aggregate to one row per base predictor: keep coefficient with largest abs value
       agg <- coefs_df |>
@@ -1921,26 +2011,25 @@ server <- function(input, output, session) {
           .groups = "drop"
         )
       
-      # Filter out zero coefficients
-      agg <- agg[agg$Coefficient != 0, , drop = FALSE]
+      # Apply tolerance filter based on outcome scale
+      tol <- 1e-6 * res$summary$sd_y
+      agg <- agg[abs(agg$Coefficient) > tol, , drop = FALSE]
       
       # Order by absolute magnitude and take top N
       agg <- agg[order(abs(agg$Coefficient), decreasing = TRUE), , drop = FALSE]
       top_n <- min(20, nrow(agg))
       agg_top <- utils::head(agg, top_n)
       
-      ggplot(agg_top, aes(x = reorder(Feature, Coefficient), y = Coefficient, fill = Coefficient > 0)) +
+      ggplot(agg_top, aes(x = reorder(Feature, Coefficient),
+                          y = Coefficient,
+                          fill = Coefficient > 0)) +
         geom_col(show.legend = FALSE) +
         coord_flip() +
-        labs(
-          title = "Top Coefficients (Ridge/Elastic Net)",
-          x = "Feature",
-          y = "Coefficient"
-        ) +
+        labs(title = paste("Top Coefficients (Ridge/Elastic Net)", method_label, sep = " | "),
+             x = "Feature",
+             y = "Coefficient") +
         theme_bw(base_size = 24) +
-        theme(
-          plot.title = element_text(hjust = title_hjust)
-        )
+        theme(plot.title = element_text(hjust = title_hjust))
     }
   })
   
@@ -1967,11 +2056,20 @@ server <- function(input, output, session) {
   outputOptions(output, "hasFSResults", suspendWhenHidden = FALSE)
   
   output$export_fs_results <- downloadHandler(
-    filename = function() paste0("feature_selection_", Sys.Date(), ".csv"),
+    filename = function() {
+      info <- rv$last_fs_info
+      if (is.null(info)) {
+        return(paste0("feature_selection_", Sys.Date(), ".csv"))
+      }
+      paste0(info$method, "_feature_selection_with_outcome_", info$outcome, ".csv")
+    },
     content = function(file) {
       res <- run_fs()
-      write.csv(res$results, file, row.names = FALSE)
-    }
+      req(res)
+      # res$results already has Method, Outcome, Alpha as last columns
+      utils::write.csv(res$results, file, row.names = FALSE)
+    },
+    contentType = "text/csv"
   )
 }
 
