@@ -713,6 +713,7 @@ ui <- navbarPage(
                     choices = c("BH", "bonferroni", "BY", "fdr"),
                     selected = "BH"),
         checkboxInput("cont_use_adj_p", "Plot adjusted pvalues", value = TRUE),
+        checkboxInput("cont_transpose", "Transpose axes", value = FALSE), 
         selectInput("cont_max_facets", "Facet columns", choices = 2:6, selected = 4),
         actionButton("generate_cont_plots", "Generate plots"),
         br(), br(),
@@ -1837,13 +1838,12 @@ server <- function(input, output, session) {
     contentType = "application/pdf"
   )
   
-  # Event to generate plots
   cont_plot_data <- eventReactive(input$generate_cont_plots, {
     req(rv$meta_cell, rv$clusters$abundance)
+    
     abund0 <- rv$clusters$abundance
     if (is.null(rownames(abund0)) || any(!nzchar(rownames(abund0)))) {
-      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.",
-                       type = "error")
+      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.", type = "error")
       return(NULL)
     }
     
@@ -1862,95 +1862,160 @@ server <- function(input, output, session) {
     # Map abundance rows to patient_ID
     sources <- rownames(abund)
     ids <- unique(rv$meta_cell$patient_ID)
-    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
+    ids_esc <- stringr::str_replace_all(ids, "([\\\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
     ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
     pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
     pid <- stringr::str_extract(sources, pattern)
     
-    abund_df <- as.data.frame(abund)
+    abund_df <- as.data.frame(abund, check.names = FALSE, stringsAsFactors = FALSE)
     abund_df$patient_ID <- pid
     meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
     abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
     
-    # Long format
+    # Long format; remove NA freq immediately so tests and plotting ignore NA abundances
     abund_long <- abund_df %>%
       tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq") %>%
-      mutate(entity = gsub("\\n", " ", entity))
+      dplyr::mutate(entity = gsub("\\n", " ", entity)) %>%
+      dplyr::filter(!is.na(freq))
     
-    # Run Spearman per entity
+    # Capture transpose and cont_var at Generate time
     cont_var <- input$cont_group_var
+    transpose_flag <- isTRUE(input$cont_transpose)
+    test_padj_method <- input$cont_p_adj_method
+    
+    # Run Spearman per entity: drop rows where freq or cont_var is NA
     res <- abund_long %>%
       dplyr::group_by(entity) %>%
       dplyr::group_modify(~ {
+        if (is.null(cont_var) || !nzchar(cont_var) || !(cont_var %in% colnames(.x))) {
+          return(data.frame(rho = NA_real_, p = NA_real_, n = 0))
+        }
         ok <- complete.cases(.x$freq, .x[[cont_var]])
-        if (!any(ok)) return(data.frame(rho = NA, p = NA))
+        if (!any(ok)) return(data.frame(rho = NA_real_, p = NA_real_, n = 0))
+        # Spearman is symmetric; orientation does not affect rho/p
         ct <- suppressWarnings(cor.test(.x$freq[ok], .x[[cont_var]][ok], method = "spearman"))
-        data.frame(rho = unname(ct$estimate), p = ct$p.value)
+        data.frame(rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
       }) %>%
       dplyr::ungroup()
     
-    # Adjust p-values
-    if (nrow(res) && nzchar(input$cont_p_adj_method)) {
-      res$padj <- p.adjust(res$p, method = input$cont_p_adj_method)
+    # Adjust p-values if requested
+    if (nrow(res) && nzchar(test_padj_method) && "p" %in% names(res)) {
+      res$padj <- p.adjust(res$p, method = test_padj_method)
     }
     
     # Save info for export
     rv$last_cont_info <- list(
-      entity   = tolower(input$cont_entity %||% "clusters"),
-      group    = tolower(input$cont_group_var %||% "group"),
-      test_raw = "spearman"
+      entity = tolower(input$cont_entity %||% "clusters"),
+      group = tolower(cont_var %||% "group"),
+      test_raw = "spearman",
+      transpose = transpose_flag
     )
     
-    # Return everything needed for plotting without reading live inputs later
+    # Return everything needed for plotting; include the transpose flag and captured cont_var
     list(
-      data         = abund_long,
-      results      = res,
-      cont_var     = input$cont_group_var,
-      use_adj_p    = input$cont_use_adj_p,
-      facet_cols   = as.numeric(input$cont_max_facets)  # capture facet cols here
+      data = abund_long,
+      results = res,
+      cont_var = cont_var,
+      use_adj_p = input$cont_use_adj_p,
+      facet_cols = as.numeric(input$cont_max_facets),
+      transpose = transpose_flag
     )
   })
   
   output$continuous_plot <- renderPlot({
     cp <- cont_plot_data()
     req(cp)
-    abund_long <- cp$data
-    res        <- cp$results
-    cont_var   <- cp$cont_var
-    use_adj_p  <- cp$use_adj_p
-    facet_cols <- cp$facet_cols
     
-    # Annotation data
+    abund_long <- cp$data
+    res <- cp$results
+    cont_var <- cp$cont_var
+    use_adj_p <- cp$use_adj_p
+    facet_cols <- cp$facet_cols
+    transpose_flag <- cp$transpose %||% FALSE
+    
+    # Validate cont_var
+    if (is.null(cont_var) || !nzchar(cont_var) || !(cont_var %in% colnames(abund_long))) {
+      showNotification("No valid continuous metadata variable selected for continuous plotting.", type = "error")
+      return(invisible(NULL))
+    }
+    
+    # Remove rows with NA in either plotted axis (safe: cont_plot_data already removed NA freq but cont_var could have NA)
+    if (!transpose_flag) {
+      # Default: Abundance = x, continuous metadata = y
+      plot_df <- abund_long %>% dplyr::filter(!is.na(freq) & !is.na(.data[[cont_var]]))
+    } else {
+      # Transposed: continuous metadata = x, Abundance = y
+      plot_df <- abund_long %>% dplyr::filter(!is.na(freq) & !is.na(.data[[cont_var]]))
+    }
+    
+    if (nrow(plot_df) == 0) {
+      showNotification("No datapoints available for plotting after removing missing values.", type = "warning")
+      return(invisible(NULL))
+    }
+    
+    # Prepare p-value annotation dataframe (use same results computed at generate time)
     p_df <- res %>%
-      mutate(
+      dplyr::mutate(
         p_to_show = if (isTRUE(use_adj_p) && "padj" %in% names(res)) padj else p,
-        label = paste0("p = ", signif(p_to_show, 3),
-                       "\n",
-                       "rho = ", signif(rho, 3)),
-        x = tapply(abund_long$freq, abund_long$entity,
-                   function(v) mean(range(v, na.rm = TRUE)))[entity],
-        y = tapply(abund_long[[cont_var]], abund_long$entity,
-                   max, na.rm = TRUE)[entity] * 1.05
+        label = paste0("p = ", signif(p_to_show, 3), "\n", "rho = ", signif(rho, 3))
       )
     
-    gg <- ggplot(abund_long, aes(x = freq, y = .data[[cont_var]])) +
-      geom_point(alpha = 0.75, pch = 21, color = 'black',
-                 fill = 'grey40', stroke = 0.1, size = 3) +
-      geom_smooth(method = "lm", se = FALSE, color = "red2") +
-      facet_wrap(~entity, ncol = facet_cols, scales = "free") +
-      scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
-      scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
-      theme_bw(base_size = 18) +
-      theme(legend.position = "none") +
-      labs(x = "Abundance", y = cont_var) +
-      geom_text(data = p_df,
-                aes(x = x, y = y, label = label),
-                inherit.aes = FALSE,
-                size = 5,
-                lineheight = 0.85) +
-      theme(strip.text.x = element_text(margin = margin(t = 1.1, b = 1.1)))
+    # Choose aesthetics and trendline according to transpose_flag
+    if (!transpose_flag) {
+      # Abundance on x, continuous on y
+      aes_pt <- ggplot2::aes(x = freq, y = .data[[cont_var]])
+      smooth_aes <- ggplot2::aes(x = freq, y = .data[[cont_var]])
+      x_lab <- "Abundance"
+      y_lab <- cont_var
+      # p-value label positions: put near top-right by entity
+      p_df <- p_df %>%
+        dplyr::mutate(
+          x = tapply(plot_df$freq, plot_df$entity, function(v) mean(range(v, na.rm = TRUE)))[entity],
+          y = tapply(plot_df[[cont_var]], plot_df$entity, max, na.rm = TRUE)[entity] * 1.05
+        )
+    } else {
+      # Transposed: continuous on x, Abundance on y
+      aes_pt <- ggplot2::aes(x = .data[[cont_var]], y = freq)
+      smooth_aes <- ggplot2::aes(x = .data[[cont_var]], y = freq)
+      x_lab <- cont_var
+      y_lab <- "Abundance"
+      # p-value label positions: put near top-right by entity
+      p_df <- p_df %>%
+        dplyr::mutate(
+          x = tapply(plot_df[[cont_var]], plot_df$entity, function(v) mean(range(v, na.rm = TRUE)))[entity],
+          y = tapply(plot_df$freq, plot_df$entity, max, na.rm = TRUE)[entity] * 1.05
+        )
+    }
     
+    # Build the ggplot
+    gg <- ggplot2::ggplot(plot_df, mapping = aes_pt) +
+      ggplot2::geom_point(alpha = 0.75, pch = 21, color = 'black', fill = 'grey40', stroke = 0.1, size = 3) +
+      ggplot2::geom_smooth(mapping = smooth_aes, method = "lm", se = FALSE, color = "red2") +
+      ggplot2::facet_wrap(~entity, ncol = facet_cols, scales = "free") +
+      ggplot2::scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+      ggplot2::scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+      ggplot2::theme_bw(base_size = 18) +
+      ggplot2::theme(legend.position = "none") +
+      ggplot2::labs(x = x_lab, y = y_lab) +
+      ggplot2::theme(strip.text.x = ggplot2::element_text(margin = ggplot2::margin(t = 1.1, b = 1.1)))
+    
+    # Add p-value / rho annotations (filter to entities actually plotted)
+    if (!is.null(p_df) && nrow(p_df) > 0) {
+      p_df_plot <- p_df %>% dplyr::filter(entity %in% unique(plot_df$entity))
+      if (nrow(p_df_plot) > 0) {
+        gg <- gg + ggplot2::geom_text(
+          data = p_df_plot,
+          ggplot2::aes(x = x, y = y, label = label),
+          inherit.aes = FALSE,
+          size = 5,
+          lineheight = 0.85
+        )
+      }
+    }
+    
+    # Cache for export
     cont_plot_cache(gg)
+    
     gg
   },
   height = function() {
