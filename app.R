@@ -1455,53 +1455,67 @@ server <- function(input, output, session) {
   }
   
   # Populate color pickers for the currently-selected categorical grouping
+  # This version will use the currently-selected metadata column (input$cat_group_var)
+  # even if the user has not yet clicked Generate plots. NA is excluded from the choices.
   observeEvent(input$cat_populate_colors, {
-    req(rv$meta_cell)
-    # Determine the levels present in the current plotting data if available,
-    # otherwise fall back to values in the metadata column.
+    req(rv$meta_cell)   # require metadata to be present
+    
+    # Preferred source: use the last generated cat_plot_data if available (ensures exact plotting groups)
     levels_vec <- NULL
-    if (!is.null(cat_plot_data()) && !is.null(cat_plot_data()$data) && nrow(cat_plot_data()$data) > 0) {
-      abund_long <- cat_plot_data()$data
-      group_var <- cat_plot_data()$group_var
-      if (!is.null(group_var) && nzchar(group_var) && group_var %in% colnames(abund_long)) {
-        levels_vec <- unique(as.character(abund_long[[group_var]]))
+    cp <- NULL
+    # try to use the precomputed eventReactive if it exists and has data
+    if (exists("cat_plot_data", mode = "function")) {
+      # guard around possible NULL result if not run yet
+      try({
+        cp <- cat_plot_data()
+      }, silent = TRUE)
+    }
+    if (!is.null(cp) && is.list(cp) && !is.null(cp$data) && nrow(cp$data) > 0) {
+      # use group values from the prepared plotting data (guarantees match)
+      group_col <- cp$group_var
+      if (!is.null(group_col) && nzchar(group_col) && group_col %in% colnames(cp$data)) {
+        levels_vec <- unique(as.character(cp$data[[group_col]]))
       }
     }
+    
+    # If not available, fall back to the metadata column selected by the user (cat_group_var)
     if (is.null(levels_vec) || length(levels_vec) == 0) {
-      # fallback to metadata values
       gv <- input$cat_group_var
       if (!is.null(gv) && nzchar(gv) && gv %in% colnames(rv$meta_cell)) {
         levels_vec <- sort(unique(as.character(rv$meta_cell[[gv]])))
       } else {
+        # nothing to show
         levels_vec <- character(0)
       }
     }
     
+    # Exclude NA from choices so no color is created for NA
+    levels_vec <- levels_vec[!is.na(levels_vec)]
+    
     if (length(levels_vec) == 0) {
-      showNotification("No group levels found to populate colors for.", type = "warning")
+      showNotification("No non-missing group levels found to populate colors for.", type = "warning")
       output$cat_color_pickers_ui <- renderUI(NULL)
       rv$cat_colors <- NULL
       return()
     }
     
-    # Ensure reproducible default palette with enough colors
+    # Default palette sized to number of levels
     n_levels <- length(levels_vec)
     default_pal <- viridis::viridis(n_levels)
     names(default_pal) <- levels_vec
     
-    # Determine whether we will use colourpicker::colourInput or fallback to textInput
+    # Prefer GUI picker from colourpicker package if available; fallback to textInput
     use_colourpicker <- requireNamespace("colourpicker", quietly = TRUE)
     if (!use_colourpicker) {
       showNotification("Package 'colourpicker' not installed; using text inputs for hex colors. Install with install.packages('colourpicker') for a GUI picker.", type = "message", duration = 8)
     }
     
-    # Create UI list of colour inputs or text inputs
+    # Build UI inputs (one per non-missing group)
     ui_list <- lapply(seq_along(levels_vec), function(i) {
       lv <- levels_vec[i]
       input_id <- paste0("cat_color_", sanitize_id(lv))
       label_text <- paste0("Color for ", lv)
       if (use_colourpicker) {
-        # explicit namespace call to avoid depending on library() being present
         colourpicker::colourInput(
           inputId = input_id,
           label = label_text,
@@ -1509,7 +1523,6 @@ server <- function(input, output, session) {
           showColour = "both"
         )
       } else {
-        # simple text input expecting a hex string like #1f77b4
         textInput(
           inputId = input_id,
           label = label_text,
@@ -1548,10 +1561,10 @@ server <- function(input, output, session) {
   
   cat_plot_data <- eventReactive(input$generate_cat_plots, {
     req(rv$meta_cell, rv$clusters$abundance)
+    
     abund0 <- rv$clusters$abundance
     if (is.null(rownames(abund0)) || any(!nzchar(rownames(abund0)))) {
-      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.",
-                       type = "error")
+      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.", type = "error")
       return(NULL)
     }
     
@@ -1567,78 +1580,102 @@ server <- function(input, output, session) {
       abund <- as.matrix(abund)
     }
     
-    # Map abundance rows to patient_ID
+    # Map abundance rows to patient_ID via robust escaped regex
     sources <- rownames(abund)
     ids <- unique(rv$meta_cell$patient_ID)
-    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
+    ids_esc <- stringr::str_replace_all(ids, "([\\\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
     ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
     pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
     pid <- stringr::str_extract(sources, pattern)
     
-    abund_df <- as.data.frame(abund)
+    abund_df <- as.data.frame(abund, check.names = FALSE, stringsAsFactors = FALSE)
     abund_df$patient_ID <- pid
     meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
     abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
     
-    # Long format
+    # Long format and remove NA abundance rows immediately (so testing/plotting ignore NA freqs)
     abund_long <- abund_df %>%
       tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq") %>%
-      mutate(entity = gsub(pattern = "\\n", replacement = " ", x = entity))
+      dplyr::mutate(entity = gsub(pattern = "\\n", replacement = " ", x = entity))
     
-    # Run test per entity
+    # Remove rows with NA freq up-front and also rows with NA grouping variable later
+    abund_long <- abund_long %>% dplyr::filter(!is.na(freq))
+    
+    # Capture plot-type and point-mode at Generate time so later UI changes do not re-trigger calculations
+    plot_type_selected <- input$cat_plot_type %||% "box"    # "box" or "violin"
+    point_mode_selected <- input$cat_points %||% "draw"    # "draw", "jitter", "none"
+    
+    # Run test per entity; ensure we drop NA grouping values for the tested grouping variable
     test_type <- input$cat_test_type
     group_var <- input$cat_group_var
-    res <- abund_long %>%
-      dplyr::group_by(entity) %>%
-      dplyr::group_modify(~ {
-        g <- droplevels(factor(.x[[group_var]]))
-        ok <- !is.na(g)
-        g <- g[ok]; freq_ok <- .x$freq[ok]
-        if (length(unique(g)) < 2) return(data.frame(p = NA))
-        if (test_type == "Wilcoxon (2-group)" && length(unique(g)) == 2) {
-          wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
-          data.frame(p = wt$p.value)
-        } else if (test_type == "Kruskal–Wallis (multi-group)") {
-          kw <- kruskal.test(freq_ok ~ g)
-          data.frame(p = kw$p.value)
-        } else {
-          data.frame(p = NA)
-        }
-      }) %>%
-      dplyr::ungroup()
     
-    # Adjust p-values
-    if (nrow(res) && nzchar(input$cat_p_adj_method)) {
+    # If group_var is blank, return NA p-values for each entity
+    if (is.null(group_var) || !nzchar(group_var)) {
+      res <- abund_long %>%
+        dplyr::group_by(entity) %>%
+        dplyr::summarise(p = NA_real_, .groups = "drop")
+    } else {
+      res <- abund_long %>%
+        dplyr::group_by(entity) %>%
+        dplyr::group_modify(~ {
+          # drop rows where group_var is NA
+          if (!(group_var %in% colnames(.x))) return(data.frame(p = NA_real_))
+          g_raw <- .x[[group_var]]
+          ok_rows <- !is.na(g_raw)
+          if (!any(ok_rows)) return(data.frame(p = NA_real_))
+          g <- droplevels(factor(g_raw[ok_rows]))
+          freq_ok <- .x$freq[ok_rows]
+          
+          # guard against too few groups
+          if (length(unique(g)) < 2) return(data.frame(p = NA_real_))
+          
+          if (test_type == "Wilcoxon (2-group)" && length(unique(g)) == 2) {
+            wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
+            data.frame(p = wt$p.value)
+          } else if (test_type == "Kruskal\u2013Wallis (multi-group)") {
+            kw <- kruskal.test(freq_ok ~ as.factor(g))
+            data.frame(p = kw$p.value)
+          } else {
+            data.frame(p = NA_real_)
+          }
+        }) %>%
+        dplyr::ungroup()
+    }
+    
+    # Adjust p-values if appropriate
+    if (nrow(res) && nzchar(input$cat_p_adj_method) && "p" %in% names(res)) {
       res$padj <- p.adjust(res$p, method = input$cat_p_adj_method)
     }
     
     # Save info for export
     rv$last_cat_info <- list(
-      entity   = tolower(input$cat_entity %||% "clusters"),
-      group    = tolower(input$cat_group_var %||% "group"),
+      entity = tolower(input$cat_entity %||% "clusters"),
+      group = tolower(input$cat_group_var %||% "group"),
       test_raw = input$cat_test_type %||% "test"
     )
     
-    # Return everything needed for plotting without reading live inputs later
+    # Return everything needed for plotting; include captured plot-type and point-mode
     list(
-      data       = abund_long,
-      results    = res,
-      group_var  = input$cat_group_var,
-      use_adj_p  = input$cat_use_adj_p,
-      facet_cols = as.numeric(input$cat_max_facets)
+      data = abund_long,
+      results = res,
+      group_var = input$cat_group_var,
+      use_adj_p = input$cat_use_adj_p,
+      facet_cols = as.numeric(input$cat_max_facets),
+      plot_type = plot_type_selected,
+      point_mode = point_mode_selected
     )
   })
   
   output$categorical_plot <- renderPlot({
-    # Only depend on the generate button via cat_plot_data()
     cp <- cat_plot_data()
     req(cp)
-    
     abund_long <- cp$data
     res <- cp$results
     group_var <- cp$group_var
     use_adj_p <- cp$use_adj_p
     facet_cols <- cp$facet_cols
+    plot_type <- cp$plot_type %||% input$cat_plot_type %||% "box"
+    point_mode <- cp$point_mode %||% input$cat_points %||% "draw"
     
     # Validate grouping variable
     if (is.null(group_var) || !nzchar(group_var) || !(group_var %in% colnames(abund_long))) {
@@ -1646,27 +1683,33 @@ server <- function(input, output, session) {
       return(invisible(NULL))
     }
     
-    # Compute p-value annotation frame from the test results
+    # Remove rows with NA grouping values for plotting
+    abund_long_plot <- abund_long %>% dplyr::filter(!is.na(.data[[group_var]]))
+    
+    if (nrow(abund_long_plot) == 0) {
+      showNotification("No datapoints after removing NA frequencies or NA group values; nothing to plot.", type = "warning")
+      return(invisible(NULL))
+    }
+    
+    # Prepare p-value annotation dataframe
     p_df <- res %>%
       dplyr::mutate(
         p_to_show = if (isTRUE(use_adj_p) && "padj" %in% names(res)) padj else p,
         label = paste0("p = ", signif(p_to_show, 3)),
-        x = length(unique(abund_long[[group_var]])) / 2 + 0.5,
-        y = tapply(abund_long$freq, abund_long$entity, max, na.rm = TRUE)[entity] * 1.05
+        x = length(unique(abund_long_plot[[group_var]])) / 2 + 0.5,
+        y = tapply(abund_long_plot$freq, abund_long_plot$entity, max, na.rm = TRUE)[entity] * 1.05
       )
     
-    # Determine group levels actually present in the plotted data (preserve order of appearance)
-    grp_levels <- unique(as.character(abund_long[[group_var]]))
+    # Determine group levels present in plotting data
+    grp_levels <- unique(as.character(abund_long_plot[[group_var]]))
     if (length(grp_levels) == 0) {
-      showNotification("No group values found in the plotted data.", type = "error")
+      showNotification("No valid group levels found for plotting.", type = "error")
       return(invisible(NULL))
     }
     
-    # Resolve color mapping but DO NOT make this reactive to color inputs.
-    # Use isolate() so changes to rv$cat_colors or dynamic colourInput values do not retrigger this render.
+    # Resolve manual colors non-reactively (isolate => changing pickers won't auto-trigger replot)
     colors_named <- isolate({
       if (!is.null(rv$cat_colors) && length(rv$cat_colors) > 0) {
-        # Keep only keys present in grp_levels; fill missing with viridis
         matched <- rv$cat_colors[names(rv$cat_colors) %in% grp_levels]
         missing_lvls <- setdiff(grp_levels, names(matched))
         if (length(missing_lvls) > 0) {
@@ -1674,7 +1717,6 @@ server <- function(input, output, session) {
           names(filler) <- missing_lvls
           matched <- c(matched, as.character(filler))
         }
-        # Reorder to match grp_levels
         cols_ord <- as.character(matched[grp_levels])
         names(cols_ord) <- grp_levels
         cols_ord
@@ -1684,21 +1726,58 @@ server <- function(input, output, session) {
       }
     })
     
-    # Build the ggplot (boxplots by default)
-    gg <- ggplot2::ggplot(abund_long, ggplot2::aes(x = .data[[group_var]], y = freq)) +
-      ggplot2::geom_boxplot(ggplot2::aes(fill = .data[[group_var]]), alpha = 0.7) +
+    # Build ggplot
+    gg <- ggplot2::ggplot(abund_long_plot, ggplot2::aes(x = .data[[group_var]], y = freq))
+    
+    if (identical(plot_type, "violin")) {
+      gg <- gg + ggplot2::geom_violin(ggplot2::aes(fill = .data[[group_var]]), alpha = 0.7, scale = "width", trim = TRUE)
+    } else {
+      gg <- gg + ggplot2::geom_boxplot(ggplot2::aes(fill = .data[[group_var]]), alpha = 0.7, outlier.shape = NA)
+    }
+    
+    # Add points per captured point_mode (points use pch=21 with black border and fill mapped to group)
+    if (identical(point_mode, "draw")) {
+      gg <- gg + ggplot2::geom_point(
+        ggplot2::aes(fill = .data[[group_var]]),
+        position = ggplot2::position_jitter(width = 0.04, height = 0),
+        pch = 21, size = 2.6, stroke = 0.3, color = "black", alpha = 0.9, inherit.aes = TRUE
+      )
+    } else if (identical(point_mode, "jitter")) {
+      gg <- gg + ggplot2::geom_jitter(
+        ggplot2::aes(fill = .data[[group_var]]),
+        width = 0.15, height = 0, pch = 21, size = 2.6, stroke = 0.3, color = "black", alpha = 0.9
+      )
+    } else {
+      # none -> no point layer
+    }
+    
+    gg <- gg +
       ggplot2::facet_wrap(~entity, ncol = facet_cols, scales = "free_y") +
       ggplot2::scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
       ggplot2::theme_bw(base_size = 18) +
-      ggplot2::theme(legend.position = "none") +
       ggplot2::labs(x = group_var, y = "Frequency") +
-      ggplot2::geom_text(data = p_df, ggplot2::aes(x = x, y = y, label = label), inherit.aes = FALSE, size = 6) +
-      ggplot2::theme(strip.text.x = ggplot2::element_text(margin = ggplot2::margin(t = 1.1, b = 1.1)))
+      ggplot2::theme(
+        strip.text.x = ggplot2::element_text(margin = ggplot2::margin(t = 1.1, b = 1.1)),
+        axis.text.x = ggplot2::element_text(angle = 45, hjust = 1) # rotate facet x-axis labels 45 degrees
+      )
     
-    # Apply manual fill scale using colors_named; this is computed inside isolate above
+    # Apply manual fill scale; points use black border so no color scale required for border
     gg <- gg + ggplot2::scale_fill_manual(values = colors_named)
     
-    # Cache the ggplot for export (export will use the last generated plot)
+    # Add p-value text annotations (filter to plotted entities)
+    if (!is.null(p_df) && nrow(p_df) > 0) {
+      p_df_plot <- p_df %>% dplyr::filter(entity %in% unique(abund_long_plot$entity))
+      if (nrow(p_df_plot) > 0) {
+        gg <- gg + ggplot2::geom_text(
+          data = p_df_plot,
+          ggplot2::aes(x = x, y = y, label = label),
+          inherit.aes = FALSE,
+          size = 5
+        )
+      }
+    }
+    
+    # Cache for export
     cat_plot_cache(gg)
     
     gg
@@ -1721,7 +1800,6 @@ server <- function(input, output, session) {
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
     225 * ncol_facets
   })
-  
   
   observeEvent(input$cat_group_var, {
     output$cat_color_pickers_ui <- renderUI(NULL)
