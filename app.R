@@ -17,15 +17,9 @@ suppressPackageStartupMessages({
     library(circlize)
     library(viridis)
     library(scales)
-    library(broom)
-    library(lme4)
-    library(MASS)
-    library(caret)
-    library(rsample)
-    library(tidymodels)
-    library(boot)
     library(glmnet)
     library(Boruta)
+    library(colourpicker)
   })
 })
 
@@ -677,6 +671,12 @@ ui <- navbarPage(
         checkboxInput("cat_use_adj_p", "Plot adjusted pvalues", value = TRUE),
         selectInput("cat_max_facets", "Facet columns",
                     choices = 2:6, selected = 4), 
+        selectInput("cat_plot_type", "Plot type",
+                    choices = c("Boxplot" = "box", "Violin" = "violin"), selected = "box"),
+        radioButtons("cat_points", "Show data points", 
+                     choices = c("Draw" = "draw", "Draw with jitter" = "jitter", "Do not draw" = "none"), selected = "draw"), 
+        actionButton("cat_populate_colors", "Populate colors for selected group variable"), 
+        uiOutput("cat_color_pickers_ui"),  # dynamic UI container for per-group color pickers
         actionButton("generate_cat_plots", "Generate plots"), 
         br(), br(),
         downloadButton("export_cat_pdf", "Export boxplots as PDF")
@@ -1446,6 +1446,105 @@ server <- function(input, output, session) {
                       selected = "")
   }, ignoreInit = TRUE)
   
+  # Helper to make safe input IDs from arbitrary group values
+  sanitize_id <- function(x) {
+    x <- as.character(x)
+    x <- gsub("[^A-Za-z0-9_\\-]", "_", x)
+    x
+  }
+  
+  # Populate color pickers for the currently-selected categorical grouping
+  observeEvent(input$cat_populate_colors, {
+    req(rv$meta_cell)
+    # Determine the levels present in the current plotting data if available,
+    # otherwise fall back to values in the metadata column.
+    levels_vec <- NULL
+    if (!is.null(cat_plot_data()) && !is.null(cat_plot_data()$data) && nrow(cat_plot_data()$data) > 0) {
+      abund_long <- cat_plot_data()$data
+      group_var <- cat_plot_data()$group_var
+      if (!is.null(group_var) && nzchar(group_var) && group_var %in% colnames(abund_long)) {
+        levels_vec <- unique(as.character(abund_long[[group_var]]))
+      }
+    }
+    if (is.null(levels_vec) || length(levels_vec) == 0) {
+      # fallback to metadata values
+      gv <- input$cat_group_var
+      if (!is.null(gv) && nzchar(gv) && gv %in% colnames(rv$meta_cell)) {
+        levels_vec <- sort(unique(as.character(rv$meta_cell[[gv]])))
+      } else {
+        levels_vec <- character(0)
+      }
+    }
+    
+    if (length(levels_vec) == 0) {
+      showNotification("No group levels found to populate colors for.", type = "warning")
+      output$cat_color_pickers_ui <- renderUI(NULL)
+      rv$cat_colors <- NULL
+      return()
+    }
+    
+    # Ensure reproducible default palette with enough colors
+    n_levels <- length(levels_vec)
+    default_pal <- viridis::viridis(n_levels)
+    names(default_pal) <- levels_vec
+    
+    # Determine whether we will use colourpicker::colourInput or fallback to textInput
+    use_colourpicker <- requireNamespace("colourpicker", quietly = TRUE)
+    if (!use_colourpicker) {
+      showNotification("Package 'colourpicker' not installed; using text inputs for hex colors. Install with install.packages('colourpicker') for a GUI picker.", type = "message", duration = 8)
+    }
+    
+    # Create UI list of colour inputs or text inputs
+    ui_list <- lapply(seq_along(levels_vec), function(i) {
+      lv <- levels_vec[i]
+      input_id <- paste0("cat_color_", sanitize_id(lv))
+      label_text <- paste0("Color for ", lv)
+      if (use_colourpicker) {
+        # explicit namespace call to avoid depending on library() being present
+        colourpicker::colourInput(
+          inputId = input_id,
+          label = label_text,
+          value = default_pal[i],
+          showColour = "both"
+        )
+      } else {
+        # simple text input expecting a hex string like #1f77b4
+        textInput(
+          inputId = input_id,
+          label = label_text,
+          value = default_pal[i],
+          placeholder = "#RRGGBB"
+        )
+      }
+    })
+    
+    output$cat_color_pickers_ui <- renderUI({
+      tagList(
+        tags$div(
+          style = "max-height: 300px; overflow-y: auto; padding-right: 6px;",
+          ui_list
+        )
+      )
+    })
+    
+    # Initialize rv$cat_colors with the defaults (named vector keyed by group label)
+    rv$cat_colors <- setNames(as.character(default_pal), levels_vec)
+  })
+  
+  # Observe any manual color changes and persist into rv$cat_colors
+  observe({
+    # If rv$cat_colors exists, watch its keys and update from inputs
+    req(!is.null(rv$cat_colors))
+    new_colors <- rv$cat_colors
+    for (grp in names(rv$cat_colors)) {
+      input_name <- paste0("cat_color_", sanitize_id(grp))
+      if (!is.null(input[[input_name]])) {
+        new_colors[[grp]] <- input[[input_name]]
+      }
+    }
+    rv$cat_colors <- new_colors
+  })
+  
   cat_plot_data <- eventReactive(input$generate_cat_plots, {
     req(rv$meta_cell, rv$clusters$abundance)
     abund0 <- rv$clusters$abundance
@@ -1533,34 +1632,71 @@ server <- function(input, output, session) {
     cp <- cat_plot_data()
     req(cp)
     abund_long <- cp$data
-    res        <- cp$results
-    group_var  <- cp$group_var
-    use_adj_p  <- cp$use_adj_p
+    res <- cp$results
+    group_var <- cp$group_var
+    use_adj_p <- cp$use_adj_p
     facet_cols <- cp$facet_cols
     
+    # Basic safety
+    if (is.null(group_var) || !nzchar(group_var) || !(group_var %in% colnames(abund_long))) {
+      showNotification("No valid grouping variable selected for categorical plotting.", type = "error")
+      return(invisible(NULL))
+    }
+    
+    # Prepare p-value annotation dataframe
     p_df <- res %>%
-      mutate(
-        p_to_show = if (isTRUE(use_adj_p) && "padj" %in% names(res)) padj else p,
+      dplyr::mutate(
+        p_to_show = if (isTRUE(use_adj_p) & "padj" %in% names(res)) padj else p,
         label = paste0("p = ", signif(p_to_show, 3)),
         x = length(unique(abund_long[[group_var]])) / 2 + 0.5,
         y = tapply(abund_long$freq, abund_long$entity, max, na.rm = TRUE)[entity] * 1.05
       )
     
-    gg <- ggplot(abund_long, aes(x = .data[[group_var]], y = freq)) +
-      geom_boxplot(aes(fill = .data[[group_var]]), alpha = 0.7) +
-      facet_wrap(~entity, ncol = facet_cols, scales = "free_y") +
-      scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
-      theme_bw(base_size = 18) +
-      theme(legend.position = "none") +
-      labs(x = group_var, y = "Frequency") +
-      geom_text(data = p_df, aes(x = x, y = y, label = label),
-                inherit.aes = FALSE, size = 6) +
-      theme(strip.text.x = element_text(margin = margin(t = 1.1, b = 1.1)))
+    # Determine the exact group levels that appear in the plotting data (ordered by appearance)
+    grp_levels <- unique(as.character(abund_long[[group_var]]))
+    if (length(grp_levels) == 0) {
+      showNotification("No group values found in the plotted data.", type = "error")
+      return(invisible(NULL))
+    }
     
+    # Resolve manual colors: prefer rv$cat_colors entries that match grp_levels, fill missing with palette
+    colors_named <- NULL
+    if (!is.null(rv$cat_colors) && length(rv$cat_colors) > 0) {
+      # keep only keys present in grp_levels
+      matched <- rv$cat_colors[names(rv$cat_colors) %in% grp_levels]
+      missing_lvls <- setdiff(grp_levels, names(matched))
+      if (length(missing_lvls) > 0) {
+        filler <- viridis::viridis(length(missing_lvls))
+        names(filler) <- missing_lvls
+        matched <- c(matched, as.character(filler))
+      }
+      # reorder to match grp_levels order
+      colors_named <- as.character(matched[grp_levels])
+      names(colors_named) <- grp_levels
+    } else {
+      pal <- viridis::viridis(length(grp_levels))
+      colors_named <- setNames(as.character(pal), grp_levels)
+    }
+    
+    # Build ggplot: existing behavior uses boxplots; keep geom_boxplot and label p-values.
+    # Fill aesthetic maps to the group variable and manual scale uses colors_named
+    gg <- ggplot2::ggplot(abund_long, ggplot2::aes(x = .data[[group_var]], y = freq)) +
+      ggplot2::geom_boxplot(ggplot2::aes(fill = .data[[group_var]]), alpha = 0.7) +
+      ggplot2::facet_wrap(~entity, ncol = facet_cols, scales = "free_y") +
+      ggplot2::scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+      ggplot2::theme_bw(base_size = 18) +
+      ggplot2::theme(legend.position = "none") +
+      ggplot2::labs(x = group_var, y = "Frequency") +
+      ggplot2::geom_text(data = p_df, ggplot2::aes(x = x, y = y, label = label), inherit.aes = FALSE, size = 6) +
+      ggplot2::theme(strip.text.x = ggplot2::element_text(margin = ggplot2::margin(t = 1.1, b = 1.1)))
+    
+    # Attach manual scales for fill and, if needed, color (used for jitter/points if you map color)
+    gg <- gg + ggplot2::scale_fill_manual(values = colors_named)
+    
+    # Cache the ggplot for export
     cat_plot_cache(gg)
     gg
-  },
-  height = function() {
+  }, height = function() {
     gg <- cat_plot_cache()
     cp <- cat_plot_data()
     if (is.null(gg) || is.null(cp)) return(400)
@@ -1569,14 +1705,18 @@ server <- function(input, output, session) {
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
     nrow_facets <- ceiling(n_facets / ncol_facets)
     200 * nrow_facets
-  },
-  width = function() {
+  }, width = function() {
     gg <- cat_plot_cache()
     cp <- cat_plot_data()
     if (is.null(gg) || is.null(cp)) return(400)
     ncol_facets <- cp$facet_cols
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
     225 * ncol_facets
+  })
+  
+  observeEvent(input$cat_group_var, {
+    output$cat_color_pickers_ui <- renderUI(NULL)
+    rv$cat_colors <- NULL
   })
   
   output$export_cat_pdf <- downloadHandler(
