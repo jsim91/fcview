@@ -22,7 +22,7 @@ suppressPackageStartupMessages({
     library(colourpicker)
     library(caret) # train(), trainControl, resampling
     library(nnet) # multinom() for multi-class logistic regression
-    # library(yardstick) # roc_curve(), roc_auc(), autoplot()
+    library(pROC)
     library(multiROC)
     library(rsample) # vfold_cv(), initial_split (if you want tidy resampling)
     library(boot) # bootstrapping CIs for AUC
@@ -48,47 +48,33 @@ spearman_test <- function(df, freq_col = "freq", cont_var) {
 }
 
 compute_multiROC <- function(preds) {
-  # Ensure obs is a factor with at least 2 levels
-  if (!is.factor(preds$obs)) {
-    preds$obs <- factor(preds$obs)
-  }
-  if (length(levels(preds$obs)) < 2 || length(unique(preds$obs)) < 2) {
-    stop("ROC requires at least 2 outcome classes in `preds$obs`.")
-  }
+  if (!is.factor(preds$obs)) preds$obs <- factor(preds$obs)
+  class_levels <- levels(preds$obs)
+  if (length(class_levels) < 2) stop("Need ≥2 classes for ROC")
   
-  # Identify probability columns
-  pred_cols <- grep("^\\.pred_", names(preds), value = TRUE)
-  classes <- gsub("^\\.pred_", "", pred_cols)
+  # Build truth and prob data.frames
+  truth_df <- as.data.frame(
+    sapply(class_levels, function(cls) as.integer(preds$obs == cls), simplify = "matrix")
+  )
+  names(truth_df) <- paste0(class_levels, "_true")
   
-  # If binary and only one prob column, reconstruct the missing one
-  if (length(classes) == 1 && length(levels(preds$obs)) == 2) {
-    all_classes <- levels(preds$obs)
-    existing_cls <- classes[1]
-    missing_cls <- setdiff(all_classes, existing_cls)
-    if (length(missing_cls) == 1) {
-      preds[[paste0(".pred_", missing_cls)]] <- 1 - preds[[pred_cols[1]]]
-      pred_cols <- grep("^\\.pred_", names(preds), value = TRUE)
-      classes <- gsub("^\\.pred_", "", pred_cols)
-    }
-  }
+  prob_df <- preds[, paste0(".pred_", class_levels), drop = FALSE]
+  names(prob_df) <- paste0(class_levels, "_pred")
   
-  # Validate we have at least two probability columns
-  if (length(pred_cols) < 2) {
-    stop("ROC requires ≥2 probability columns (.pred_<class>).")
-  }
+  # Combine
+  multi_df <- cbind(truth_df, prob_df)
   
-  # Build one-hot truth matrix (force matrix)
-  truth_mat <- sapply(classes, function(cls) as.integer(preds$obs == cls), simplify = "matrix")
-  colnames(truth_mat) <- paste0(classes, "_true")
+  # Force to plain numeric matrix
+  multi_mat <- as.matrix(multi_df)
+  storage.mode(multi_mat) <- "numeric"
   
-  # Build probability matrix (drop = FALSE to preserve dims)
-  pred_mat <- preds[, pred_cols, drop = FALSE]
-  if (is.vector(pred_mat)) pred_mat <- matrix(pred_mat, ncol = 1)
-  colnames(pred_mat) <- paste0(classes, "_pred")
+  message("compute_multiROC: multi_mat head")
+  print(utils::head(multi_mat))
   
-  # Combine and compute ROC
-  multi_df <- cbind(truth_mat, pred_mat)
-  multi_roc(multi_df, force_diag = TRUE)
+  # Run multiROC on the matrix
+  roc_res <- multiROC::multi_roc(multi_mat, force_diag = TRUE)
+  attr(roc_res, "multi_df") <- multi_df
+  roc_res
 }
 
 # Validate minimal structure
@@ -2581,6 +2567,16 @@ server <- function(input, output, session) {
       trainY <- outcome[idx]
       testY  <- outcome[-idx]
       
+      train_counts <- table(trainY)
+      test_counts  <- table(testY)
+      
+      split_info <- list(
+        n_train = length(trainY),
+        n_test  = length(testY),
+        train_counts = train_counts,
+        test_counts  = test_counts
+      )
+      
       if (method == "glmnet") {
         trainMat <- model.matrix(~ . - 1, data = trainX)
         testMat  <- model.matrix(~ . - 1, data = testX)
@@ -2606,28 +2602,35 @@ server <- function(input, output, session) {
         pred_class <- predict(model, newdata = testX, type = "raw")
       }
       
+      if (is.vector(probs)) {
+        pos <- levels(trainY)[2]
+        probs <- data.frame(setNames(list(as.numeric(probs)), pos), check.names = FALSE)
+      }
+      
       preds_tbl <- dplyr::bind_cols(
         truth = testY,
         dplyr::rename(probs, !!!setNames(names(probs), paste0(".pred_", names(probs)))),
         pred = pred_class
       )
       names(preds_tbl)[1] <- "obs"
-      # Ensure obs has the model's outcome levels
       preds_tbl$obs <- factor(preds_tbl$obs, levels = levels(outcome))
       
-      # --- Binary probability fix ---
+      # Binary probability completion
       classes <- levels(outcome)
-      if (length(classes) == 2) {
-        for (cls in classes) {
-          colname <- paste0(".pred_", cls)
-          if (!(colname %in% names(preds_tbl))) {
-            other_col <- grep("^\\.pred_", names(preds_tbl), value = TRUE)[1]
-            preds_tbl[[colname]] <- 1 - preds_tbl[[other_col]]
-          }
-        }
+      have_cols <- grep("^\\.pred_", names(preds_tbl), value = TRUE)
+      if (length(classes) == 2 && length(have_cols) == 1) {
+        missing_cls <- setdiff(classes, gsub("^\\.pred_", "", have_cols))
+        preds_tbl[[paste0(".pred_", missing_cls)]] <- 1 - preds_tbl[[have_cols[1]]]
       }
       
-      return(list(model = model, preds = preds_tbl, null_acc = null_acc))
+      # --- Console logging ---
+      message("=== Logistic Model (Train/Test) complete ===")
+      message("Outcome levels: ", paste(levels(outcome), collapse = ", "))
+      message("Prediction columns: ", paste(grep("^\\.pred_", names(preds_tbl), value = TRUE), collapse = ", "))
+      utils::str(utils::head(preds_tbl, 5))
+      
+      return(list(model = model, preds = preds_tbl, null_acc = null_acc,
+                  split_info = split_info))
     }
     
     # --- CV or LOO ---
@@ -2665,24 +2668,24 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    # Rename probability columns
     level_names <- levels(outcome)
     prob_cols <- intersect(level_names, names(preds))
     rename_map <- setNames(prob_cols, paste0(".pred_", prob_cols))
     preds <- dplyr::rename(preds, !!!rename_map)
-    # Ensure obs has the model's outcome levels
     preds$obs <- factor(preds$obs, levels = levels(outcome))
     
-    # --- Binary probability fix ---
-    if (length(level_names) == 2) {
-      for (cls in level_names) {
-        colname <- paste0(".pred_", cls)
-        if (!(colname %in% names(preds))) {
-          other_col <- grep("^\\.pred_", names(preds), value = TRUE)[1]
-          preds[[colname]] <- 1 - preds[[other_col]]
-        }
-      }
+    classes <- levels(outcome)
+    have_cols <- grep("^\\.pred_", names(preds), value = TRUE)
+    if (length(classes) == 2 && length(have_cols) == 1) {
+      missing_cls <- setdiff(classes, gsub("^\\.pred_", "", have_cols))
+      preds[[paste0(".pred_", missing_cls)]] <- 1 - preds[[have_cols[1]]]
     }
+    
+    # --- Console logging ---
+    message("=== Logistic Model (CV/LOO) complete ===")
+    message("Outcome levels: ", paste(levels(outcome), collapse = ", "))
+    message("Prediction columns: ", paste(grep("^\\.pred_", names(preds), value = TRUE), collapse = ", "))
+    utils::str(utils::head(preds, 5))
     
     return(list(model = model, preds = preds, null_acc = null_acc))
   })
@@ -2691,46 +2694,48 @@ server <- function(input, output, session) {
     res <- lm_results(); req(res)
     preds <- res$preds; req(preds)
     
-    # Compute ROC results using the helper
-    roc_res <- tryCatch({
-      compute_multiROC(preds)
-    }, error = function(e) {
-      showNotification(paste("ROC computation failed:", e$message), type = "error")
-      return(NULL)
-    })
-    req(roc_res)
+    n_classes <- nlevels(preds$obs)
     
-    plot_roc_data(roc_res) +
-      ggplot2::labs(title = "ROC Curves",
-                    subtitle = "Includes macro and micro averages") +
-      ggplot2::theme_minimal(base_size = 14)
+    if (n_classes == 2) {
+      # --- Binary ROC with pROC ---
+      classes <- levels(preds$obs)
+      positive <- classes[2]  # treat second level as "positive"
+      roc_obj <- pROC::roc(response = preds$obs,
+                           predictor = preds[[paste0(".pred_", positive)]],
+                           levels = rev(classes))
+      plot(roc_obj, main = "Binary ROC Curve", col = "blue", lwd = 2, print.auc = TRUE)
+      abline(a = 0, b = 1, lty = 2, col = "red")
+    } else {
+      # --- Multiclass ROC with multiROC ---
+      roc_res <- tryCatch({
+        compute_multiROC(preds)
+      }, error = function(e) {
+        showNotification(paste("ROC computation failed:", e$message), type = "error")
+        return(NULL)
+      })
+      req(roc_res)
+      
+      plot_roc_data(roc_res) +
+        ggplot2::labs(title = "Multiclass ROC Curves",
+                      subtitle = "Includes macro and micro averages") +
+        ggplot2::theme_minimal(base_size = 14)
+    }
   })
   
   output$lm_perf_table <- renderTable({
     res <- lm_results(); req(res)
     preds <- res$preds; req(preds)
     
-    # Compute ROC results
-    roc_res <- tryCatch({
-      compute_multiROC(preds)
-    }, error = function(e) {
-      showNotification(paste("ROC computation failed:", e$message), type = "error")
-      return(NULL)
-    })
-    req(roc_res)
+    n_classes <- nlevels(preds$obs)
     
-    aucs <- roc_res$AUC
-    macro_auc <- if ("macro" %in% aucs$Group) aucs[aucs$Group == "macro", "AUC"] else NA
-    micro_auc <- if ("micro" %in% aucs$Group) aucs[aucs$Group == "micro", "AUC"] else NA
-    
+    # Start with core metrics
     obs <- preds$obs
     pred <- preds$pred
     
-    # If pred is missing, reconstruct from max probability
     if (is.null(pred)) {
       pred_cols <- grep("^\\.pred_", names(preds), value = TRUE)
       classes <- gsub("^\\.pred_", "", pred_cols)
-      max_idx <- apply(preds[, pred_cols, drop = FALSE], 1, which.max)
+      max_idx <- apply(as.matrix(preds[, pred_cols, drop = FALSE]), 1, which.max)
       pred <- factor(classes[max_idx], levels = classes)
     }
     
@@ -2745,15 +2750,65 @@ server <- function(input, output, session) {
     majority_safe <- names(which.max(table(obs)))
     majority_orig <- rv$lm_label_map[[majority_safe]]
     
-    data.frame(
+    # Build base performance table
+    perf_table <- data.frame(
       Metric = c("Null Accuracy (most frequent class)", "Model Accuracy",
-                 "Binomial p-value vs Null", "Macro AUC (multiROC)", "Micro AUC (multiROC)"),
+                 "Binomial p-value vs Null"),
       Value  = c(paste0(round(res$null_acc, 3), " (", majority_orig, ")"),
                  round(model_acc, 3),
-                 signif(binom_p, 3),
-                 round(macro_auc, 3),
-                 round(micro_auc, 3))
+                 signif(binom_p, 3))
     )
+    
+    if (n_classes == 2) {
+      # --- Binary ROC with pROC ---
+      classes <- levels(preds$obs)
+      positive <- classes[2]
+      roc_obj <- pROC::roc(response = preds$obs,
+                           predictor = preds[[paste0(".pred_", positive)]],
+                           levels = rev(classes))
+      auc_val <- as.numeric(pROC::auc(roc_obj))
+      
+      perf_table <- rbind(perf_table,
+                          data.frame(Metric = "AUC (pROC)",
+                                     Value = round(auc_val, 3)))
+    } else {
+      # --- Multiclass ROC with multiROC ---
+      roc_res <- tryCatch({
+        compute_multiROC(preds)
+      }, error = function(e) {
+        showNotification(paste("ROC computation failed:", e$message), type = "error")
+        return(NULL)
+      })
+      req(roc_res)
+      
+      aucs <- roc_res$AUC
+      macro_auc <- if ("macro" %in% aucs$Group) aucs[aucs$Group == "macro", "AUC"] else NA
+      micro_auc <- if ("micro" %in% aucs$Group) aucs[aucs$Group == "micro", "AUC"] else NA
+      
+      perf_table <- rbind(perf_table,
+                          data.frame(Metric = c("Macro AUC (multiROC)", "Micro AUC (multiROC)"),
+                                     Value  = c(round(macro_auc, 3), round(micro_auc, 3))))
+    }
+    
+    # --- Add Train/Test split info if available ---
+    if (!is.null(res$split_info)) {
+      train_summary <- paste(names(res$split_info$train_counts),
+                             res$split_info$train_counts, collapse = "; ")
+      test_summary  <- paste(names(res$split_info$test_counts),
+                             res$split_info$test_counts, collapse = "; ")
+      
+      extra_rows <- data.frame(
+        Metric = c("Train size", "Test size", "Train breakdown", "Test breakdown"),
+        Value  = c(res$split_info$n_train,
+                   res$split_info$n_test,
+                   train_summary,
+                   test_summary)
+      )
+      
+      perf_table <- rbind(perf_table, extra_rows)
+    }
+    
+    perf_table
   })
   
 }
