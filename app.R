@@ -48,15 +48,45 @@ spearman_test <- function(df, freq_col = "freq", cont_var) {
 }
 
 compute_multiROC <- function(preds) {
+  # Ensure obs is a factor with at least 2 levels
+  if (!is.factor(preds$obs)) {
+    preds$obs <- factor(preds$obs)
+  }
+  if (length(levels(preds$obs)) < 2 || length(unique(preds$obs)) < 2) {
+    stop("ROC requires at least 2 outcome classes in `preds$obs`.")
+  }
+  
+  # Identify probability columns
   pred_cols <- grep("^\\.pred_", names(preds), value = TRUE)
   classes <- gsub("^\\.pred_", "", pred_cols)
   
-  truth_mat <- sapply(classes, function(cls) as.integer(preds$obs == cls))
+  # If binary and only one prob column, reconstruct the missing one
+  if (length(classes) == 1 && length(levels(preds$obs)) == 2) {
+    all_classes <- levels(preds$obs)
+    existing_cls <- classes[1]
+    missing_cls <- setdiff(all_classes, existing_cls)
+    if (length(missing_cls) == 1) {
+      preds[[paste0(".pred_", missing_cls)]] <- 1 - preds[[pred_cols[1]]]
+      pred_cols <- grep("^\\.pred_", names(preds), value = TRUE)
+      classes <- gsub("^\\.pred_", "", pred_cols)
+    }
+  }
+  
+  # Validate we have at least two probability columns
+  if (length(pred_cols) < 2) {
+    stop("ROC requires ≥2 probability columns (.pred_<class>).")
+  }
+  
+  # Build one-hot truth matrix (force matrix)
+  truth_mat <- sapply(classes, function(cls) as.integer(preds$obs == cls), simplify = "matrix")
   colnames(truth_mat) <- paste0(classes, "_true")
   
-  pred_mat <- preds[, pred_cols]
+  # Build probability matrix (drop = FALSE to preserve dims)
+  pred_mat <- preds[, pred_cols, drop = FALSE]
+  if (is.vector(pred_mat)) pred_mat <- matrix(pred_mat, ncol = 1)
   colnames(pred_mat) <- paste0(classes, "_pred")
   
+  # Combine and compute ROC
   multi_df <- cbind(truth_mat, pred_mat)
   multi_roc(multi_df, force_diag = TRUE)
 }
@@ -2461,11 +2491,24 @@ server <- function(input, output, session) {
   lm_results <- eventReactive(input$run_lm, {
     req(rv$meta_cell, input$lm_outcome, input$lm_predictors)
     
-    # Outcome: categorical metadata only
-    outcome_raw <- rv$meta_cell[[input$lm_outcome]]
+    # --- Patient-level metadata ---
+    meta_patient <- rv$meta_cell %>%
+      dplyr::distinct(patient_ID, .keep_all = TRUE)
+    
+    if (!("patient_ID" %in% colnames(meta_patient))) {
+      showNotification("No patient_ID column available in metadata.", type = "error")
+      return(NULL)
+    }
+    
+    # Outcome
+    if (!(input$lm_outcome %in% colnames(meta_patient))) {
+      showNotification(paste0("Outcome '", input$lm_outcome, "' not found in metadata."), type = "error")
+      return(NULL)
+    }
+    outcome_raw <- meta_patient[[input$lm_outcome]]
     outcome <- factor(outcome_raw)
     
-    # Sanitize levels for caret compatibility
+    # Sanitize levels
     orig_levels <- levels(outcome)
     safe_levels <- make.names(orig_levels)
     levels(outcome) <- safe_levels
@@ -2476,44 +2519,39 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    # Predictors from metadata only
-    meta_cols <- colnames(rv$meta_cell)
+    # Predictors
+    meta_cols <- colnames(meta_patient)
     pred_meta <- intersect(input$lm_predictors, meta_cols)
-    
     if (length(pred_meta) == 0) {
-      showNotification("Select at least one predictor from metadata.", type = "error")
+      showNotification("Select at least one predictor.", type = "error")
       return(NULL)
     }
-    
-    X <- rv$meta_cell[, pred_meta, drop = FALSE]
+    X <- meta_patient[, pred_meta, drop = FALSE]
     
     # Optional cluster filter
-    if ("leiden_cluster" %in% input$lm_predictors && !is.null(input$lm_leiden_subset)) {
-      keep <- rv$meta_cell$leiden_cluster %in% input$lm_leiden_subset
+    if ("leiden_cluster" %in% input$lm_predictors &&
+        "leiden_cluster" %in% colnames(meta_patient) &&
+        !is.null(input$lm_leiden_subset) && length(input$lm_leiden_subset) > 0) {
+      keep <- as.character(meta_patient$leiden_cluster) %in% input$lm_leiden_subset
       X <- X[keep, , drop = FALSE]
       outcome <- outcome[keep]
+      meta_patient <- meta_patient[keep, , drop = FALSE]
     }
     
-    # Construct model_df for NA filtering
-    model_df <- cbind(X, .outcome = outcome)
-    
-    # Ensure patient_ID is present
-    if (!"patient_ID" %in% colnames(model_df)) {
-      model_df$patient_ID <- rv$meta_cell$patient_ID[rownames(model_df)]
-    }
-    
-    na_rows <- which(!complete.cases(model_df))
-    
+    # NA filtering
+    model_df <- cbind(X, .outcome = outcome, patient_ID = meta_patient$patient_ID)
+    na_rows <- which(!complete.cases(model_df[, setdiff(names(model_df), "patient_ID")]))
     if (length(na_rows) > 0) {
       dropped_ids <- model_df$patient_ID[na_rows]
-      showNotification(paste("Dropped", length(na_rows), "rows due to missing values. Affected patient_IDs:",
-                             paste(unique(dropped_ids), collapse = ", ")),
-                       type = "warning", duration = 10)
+      showNotification(
+        paste("Dropped", length(na_rows), "patients due to missing values. Affected patient_IDs:",
+              paste(unique(dropped_ids), collapse = ", ")),
+        type = "warning", duration = 10
+      )
       model_df <- model_df[-na_rows, , drop = FALSE]
     }
     
-    # Re-split predictors and outcome
-    X <- model_df[, setdiff(names(model_df), c(".outcome")), drop = FALSE]
+    X <- model_df[, setdiff(names(model_df), c(".outcome", "patient_ID")), drop = FALSE]
     outcome <- model_df$.outcome
     
     if (length(outcome) < 10) {
@@ -2531,10 +2569,9 @@ server <- function(input, output, session) {
                      "Elastic Net"         = "glmnet",
                      "Random Forest"       = "rf")
     
-    # Validation strategy
     validation <- input$lm_validation
     
-    # Train/Test split
+    # --- Train/Test split ---
     if (validation == "Train/Test split") {
       set.seed(123)
       train_frac <- input$lm_train_frac %||% 0.7
@@ -2548,15 +2585,17 @@ server <- function(input, output, session) {
         trainMat <- model.matrix(~ . - 1, data = trainX)
         testMat  <- model.matrix(~ . - 1, data = testX)
         storage.mode(trainMat) <- "double"
-        storage.mode(testMat) <- "double"
+        storage.mode(testMat)  <- "double"
         
         model <- caret::train(
           x = trainMat, y = trainY,
           method = "glmnet",
           trControl = caret::trainControl(classProbs = TRUE),
-          tuneGrid = expand.grid(alpha = input$lm_alpha, lambda = 10^seq(-3, 1, length = 20))
+          tuneGrid = expand.grid(alpha = input$lm_alpha,
+                                 lambda = 10^seq(-3, 1, length = 20))
         )
         probs <- predict(model, newdata = testMat, type = "prob")
+        pred_class <- predict(model, newdata = testMat, type = "raw")
       } else {
         model <- caret::train(
           x = trainX, y = trainY,
@@ -2564,9 +2603,8 @@ server <- function(input, output, session) {
           trControl = caret::trainControl(classProbs = TRUE)
         )
         probs <- predict(model, newdata = testX, type = "prob")
+        pred_class <- predict(model, newdata = testX, type = "raw")
       }
-      
-      pred_class <- predict(model, newdata = if (method == "glmnet") testMat else testX, type = "raw")
       
       preds_tbl <- dplyr::bind_cols(
         truth = testY,
@@ -2574,11 +2612,25 @@ server <- function(input, output, session) {
         pred = pred_class
       )
       names(preds_tbl)[1] <- "obs"
+      # Ensure obs has the model's outcome levels
+      preds_tbl$obs <- factor(preds_tbl$obs, levels = levels(outcome))
+      
+      # --- Binary probability fix ---
+      classes <- levels(outcome)
+      if (length(classes) == 2) {
+        for (cls in classes) {
+          colname <- paste0(".pred_", cls)
+          if (!(colname %in% names(preds_tbl))) {
+            other_col <- grep("^\\.pred_", names(preds_tbl), value = TRUE)[1]
+            preds_tbl[[colname]] <- 1 - preds_tbl[[other_col]]
+          }
+        }
+      }
       
       return(list(model = model, preds = preds_tbl, null_acc = null_acc))
     }
     
-    # CV or LOO
+    # --- CV or LOO ---
     ctrl <- caret::trainControl(
       method = switch(validation,
                       "k-fold CV"     = "cv",
@@ -2596,7 +2648,8 @@ server <- function(input, output, session) {
         x = Xmat, y = outcome,
         method = "glmnet",
         trControl = ctrl,
-        tuneGrid = expand.grid(alpha = input$lm_alpha, lambda = 10^seq(-3, 1, length = 20))
+        tuneGrid = expand.grid(alpha = input$lm_alpha,
+                               lambda = 10^seq(-3, 1, length = 20))
       )
     } else {
       model <- caret::train(
@@ -2612,10 +2665,24 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
+    # Rename probability columns
     level_names <- levels(outcome)
     prob_cols <- intersect(level_names, names(preds))
     rename_map <- setNames(prob_cols, paste0(".pred_", prob_cols))
     preds <- dplyr::rename(preds, !!!rename_map)
+    # Ensure obs has the model's outcome levels
+    preds$obs <- factor(preds$obs, levels = levels(outcome))
+    
+    # --- Binary probability fix ---
+    if (length(level_names) == 2) {
+      for (cls in level_names) {
+        colname <- paste0(".pred_", cls)
+        if (!(colname %in% names(preds))) {
+          other_col <- grep("^\\.pred_", names(preds), value = TRUE)[1]
+          preds[[colname]] <- 1 - preds[[other_col]]
+        }
+      }
+    }
     
     return(list(model = model, preds = preds, null_acc = null_acc))
   })
@@ -2624,35 +2691,17 @@ server <- function(input, output, session) {
     res <- lm_results(); req(res)
     preds <- res$preds; req(preds)
     
-    # Validate prediction structure
-    pred_cols <- grep("^\\.pred_", names(preds), value = TRUE)
-    classes <- gsub("^\\.pred_", "", pred_cols)
-    
-    if (length(classes) < 2 || length(unique(preds$obs)) < 2) {
-      showNotification("ROC plotting requires ≥2 outcome classes with valid predictions.", type = "error")
-      return(invisible(NULL))
-    }
-    
-    # One-hot truth matrix
-    truth_mat <- sapply(classes, function(cls) as.integer(preds$obs == cls))
-    colnames(truth_mat) <- paste0(classes, "_true")
-    
-    # Rename predicted columns
-    pred_mat <- preds[, pred_cols]
-    colnames(pred_mat) <- paste0(classes, "_pred")
-    
-    multi_df <- cbind(truth_mat, pred_mat)
-    
+    # Compute ROC results using the helper
     roc_res <- tryCatch({
-      multi_roc(multi_df, force_diag = TRUE)
+      compute_multiROC(preds)
     }, error = function(e) {
-      showNotification("multiROC failed: " %+% e$message, type = "error")
+      showNotification(paste("ROC computation failed:", e$message), type = "error")
       return(NULL)
     })
-    
     req(roc_res)
+    
     plot_roc_data(roc_res) +
-      ggplot2::labs(title = "Multi-class ROC Curves",
+      ggplot2::labs(title = "ROC Curves",
                     subtitle = "Includes macro and micro averages") +
       ggplot2::theme_minimal(base_size = 14)
   })
@@ -2661,41 +2710,27 @@ server <- function(input, output, session) {
     res <- lm_results(); req(res)
     preds <- res$preds; req(preds)
     
-    pred_cols <- grep("^\\.pred_", names(preds), value = TRUE)
-    classes <- gsub("^\\.pred_", "", pred_cols)
-    
-    if (length(classes) < 2 || length(unique(preds$obs)) < 2) {
-      showNotification("Performance summary requires ≥2 outcome classes.", type = "error")
-      return(NULL)
-    }
-    
-    # One-hot truth matrix
-    truth_mat <- sapply(classes, function(cls) as.integer(preds$obs == cls))
-    colnames(truth_mat) <- paste0(classes, "_true")
-    
-    # Rename predicted columns
-    pred_mat <- preds[, pred_cols]
-    colnames(pred_mat) <- paste0(classes, "_pred")
-    
-    multi_df <- cbind(truth_mat, pred_mat)
-    
+    # Compute ROC results
     roc_res <- tryCatch({
-      multi_roc(multi_df, force_diag = TRUE)
+      compute_multiROC(preds)
     }, error = function(e) {
-      showNotification("multiROC failed: " %+% e$message, type = "error")
+      showNotification(paste("ROC computation failed:", e$message), type = "error")
       return(NULL)
     })
-    
     req(roc_res)
+    
     aucs <- roc_res$AUC
-    macro_auc <- aucs[aucs$Group == "macro", "AUC"]
-    micro_auc <- aucs[aucs$Group == "micro", "AUC"]
+    macro_auc <- if ("macro" %in% aucs$Group) aucs[aucs$Group == "macro", "AUC"] else NA
+    micro_auc <- if ("micro" %in% aucs$Group) aucs[aucs$Group == "micro", "AUC"] else NA
     
     obs <- preds$obs
     pred <- preds$pred
     
+    # If pred is missing, reconstruct from max probability
     if (is.null(pred)) {
-      max_idx <- apply(pred_mat, 1, which.max)
+      pred_cols <- grep("^\\.pred_", names(preds), value = TRUE)
+      classes <- gsub("^\\.pred_", "", pred_cols)
+      max_idx <- apply(preds[, pred_cols, drop = FALSE], 1, which.max)
       pred <- factor(classes[max_idx], levels = classes)
     }
     
@@ -2711,8 +2746,8 @@ server <- function(input, output, session) {
     majority_orig <- rv$lm_label_map[[majority_safe]]
     
     data.frame(
-      Metric = c("Null Accuracy (most frequent class)", "Model Accuracy", "Binomial p-value vs Null",
-                 "Macro AUC (multiROC)", "Micro AUC (multiROC)"),
+      Metric = c("Null Accuracy (most frequent class)", "Model Accuracy",
+                 "Binomial p-value vs Null", "Macro AUC (multiROC)", "Micro AUC (multiROC)"),
       Value  = c(paste0(round(res$null_acc, 3), " (", majority_orig, ")"),
                  round(model_acc, 3),
                  signif(binom_p, 3),
