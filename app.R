@@ -40,13 +40,6 @@ pct_clip <- function(x, p = c(0.01, 0.99)) {
   pmin(pmax(x, q[1]), q[2])
 }
 
-appendLog <- function(msg) {
-  old <- rv$log()
-  new <- c(old, paste0(format(Sys.time(), "%H:%M:%S"), " | ", msg))
-  if (length(new) > 10) new <- tail(new, 10)  # keep last 10 lines
-  rv$log(new)
-}
-
 align_metadata_abundance <- function(metadata, abundance) {
   # Extract patient_ID from abundance rownames ("patientID_runDate.fcs" is the expected format; the pattern "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$" will always match the _runDate.fcs part)
   patient_ids <- gsub(pattern = "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$", replacement = "", x = rownames(abundance))
@@ -802,16 +795,41 @@ ui <- navbarPage(
                                choices = c("Ridge Regression", "Elastic Net", "Random Forest (Boruta)")),
                    pickerInput("fs_outcome", "Outcome variable", choices = NULL),
                    pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
+                   
                    conditionalPanel(
                      condition = "input.fs_predictors.includes('leiden_cluster')",
                      pickerInput("fs_leiden_subset", "Select clusters to include",
                                  choices = NULL, multiple = TRUE)
                    ), 
+                   
                    conditionalPanel(
                      condition = "input.fs_method == 'Elastic Net'",
                      sliderInput("fs_alpha", "Alpha (0 = Ridge, 1 = Lasso)", 
                                  min = 0, max = 1, value = 0.5, step = 0.05)
                    ),
+                   
+                   # --- Quick Run toggle (always visible for FS methods) ---
+                   checkboxInput("fs_quickrun", "Quick Run (exploratory)", value = FALSE),
+                   conditionalPanel(
+                     condition = "input.fs_method == 'Random Forest (Boruta)'",
+                     helpText("Quick Run = 1 repetition, 200 maxRuns (much faster, less stable).")
+                   ),
+                   conditionalPanel(
+                     condition = "input.fs_method == 'Ridge Regression' || input.fs_method == 'Elastic Net'",
+                     helpText("Quick Run = 1 repetition, 3-fold CV (faster, less stable).")
+                   ),
+                   
+                   # Boruta-specific numeric controls (only shown if not Quick Run)
+                   conditionalPanel(
+                     condition = "input.fs_method == 'Random Forest (Boruta)' && !input.fs_quickrun",
+                     numericInput("fs_reps", "Number of Boruta repetitions", 
+                                  value = 3, min = 1, max = 10, step = 1),
+                     helpText("More repetitions = more stable consensus, but runtime increases linearly."),
+                     numericInput("fs_maxruns", "Boruta maxRuns per repetition", 
+                                  value = 300, min = 50, max = 1000, step = 50),
+                     helpText("Higher maxRuns = more thorough feature testing, but each run takes longer.")
+                   ),
+                   
                    actionButton("run_fs", "Run Feature Selection"),
                    br(), br(),
                    conditionalPanel(
@@ -894,6 +912,13 @@ server <- function(input, output, session) {
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
   rv$log <- reactiveVal(character())
+  
+  appendLog <- function(msg) {
+    old <- rv$log()
+    new <- c(old, paste0(format(Sys.time(), "%H:%M:%S"), " | ", msg))
+    if (length(new) > 200) new <- tail(new, 200)  # keep last 200 lines
+    rv$log(new)
+  }
   
   output$console_log <- renderText({
     paste(rv$log(), collapse = "\n")
@@ -2234,7 +2259,19 @@ server <- function(input, output, session) {
     reps <- input$fs_reps %||% 1
     boruta_maxruns <- input$fs_maxruns %||% 500
     
-    set.seed(seed_val)
+    quick_flag <- FALSE
+    
+    # Override with Quick Run defaults if enabled
+    if (isTRUE(input$fs_quickrun)) {
+      quick_flag <- TRUE
+      if (method == "Random Forest (Boruta)") {
+        reps <- 1
+        boruta_maxruns <- 200
+      } else if (method %in% c("Ridge Regression", "Elastic Net")) {
+        reps <- 1
+        nfolds_val <- 3   # fewer folds for speed
+      }
+    }
     
     # Helper: clean dummy names
     clean_dummy_names <- function(nms) {
@@ -2260,20 +2297,32 @@ server <- function(input, output, session) {
         all_imp[[r]] <- imp
         bor_models[[r]] <- bor
       }
+      
+      # Average importance across runs
       merged_imp <- Reduce(function(a, b) {
         common <- intersect(rownames(a), rownames(b))
         a[common, "meanImp"] <- (a[common, "meanImp"] + b[common, "meanImp"]) / 2
         a
       }, all_imp)
+      
+      # Consensus vote for decision
+      decisions <- lapply(all_imp, function(df) df$decision)
+      decisions_mat <- do.call(cbind, decisions)
+      consensus_decision <- apply(decisions_mat, 1, function(x) {
+        tab <- table(x)
+        names(tab)[which.max(tab)]
+      })
+      
       merged_imp <- merged_imp[abs(merged_imp$meanImp) >= tolerance, , drop = FALSE]
       
-      sel <- rownames(merged_imp)[merged_imp$decision %in% c("Confirmed", "Tentative")]
       res_df <- data.frame(
         Feature = rownames(merged_imp),
         ImportanceMean = merged_imp$meanImp,
-        Decision = merged_imp$decision,
+        Decision = consensus_decision[rownames(merged_imp)],
         stringsAsFactors = FALSE
       )
+      
+      sel <- res_df$Feature[res_df$Decision %in% c("Confirmed", "Tentative")]
       
       return(list(
         method = "Boruta",
@@ -2286,7 +2335,8 @@ server <- function(input, output, session) {
           n_before = n_before,
           n_after = n_after,
           n_dropped = n_dropped,
-          model = bor_models[[1]]  # return first Boruta model for inspection
+          model = bor_models[[1]],
+          quick_run = quick_flag
         )
       ))
     }
@@ -2309,7 +2359,7 @@ server <- function(input, output, session) {
     coef_list <- list()
     cv_models <- list()
     for (r in seq_len(reps)) {
-      set.seed(seed_val + r - 1)
+      set.seed(seed_val + r + 1)
       cvfit <- glmnet::cv.glmnet(
         x = Xmat, y = y, family = family,
         alpha = alpha_val, nfolds = nfolds_val
@@ -2361,7 +2411,8 @@ server <- function(input, output, session) {
         n_before = n_before,
         n_after = n_after,
         n_dropped = n_dropped,
-        model = cv_models[[1]]  # return first cv.glmnet model for inspection
+        model = cv_models[[1]],
+        quick_run = quick_flag
       )
     ))
   })
@@ -2372,7 +2423,39 @@ server <- function(input, output, session) {
     
     withCallingHandlers(
       {
+        # --- Capture user inputs ---
+        method <- input$fs_method %||% "Elastic Net"
+        reps <- input$fs_reps %||% 1
+        boruta_maxruns <- input$fs_maxruns %||% 500
+        nfolds_val <- input$fs_nfolds %||% 5
+        quick_flag <- FALSE
+        
+        # --- Quick Run overrides ---
+        if (isTRUE(input$fs_quickrun)) {
+          quick_flag <- TRUE
+          if (method == "Random Forest (Boruta)") {
+            reps <- 1
+            boruta_maxruns <- 200
+            appendLog("Running Boruta in QUICK RUN mode (1 repetition, 200 maxRuns).")
+          } else if (method %in% c("Ridge Regression", "Elastic Net")) {
+            reps <- 1
+            nfolds_val <- 3
+            appendLog("Running Elastic Net/Ridge in QUICK RUN mode (1 repetition, 3-fold CV).")
+          }
+        } else {
+          if (method == "Random Forest (Boruta)") {
+            appendLog(paste("Running Boruta with", reps, "repetitions and", boruta_maxruns, "maxRuns each."))
+          } else {
+            appendLog(paste("Running", method, "with", reps, "repetitions and", nfolds_val, "fold CV."))
+          }
+        }
+        
+        # --- Run feature selection ---
         res <- run_fs()
+        # Ensure the quick_run flag is stored in the summary
+        if (!is.null(res$summary)) {
+          res$summary$quick_run <- quick_flag
+        }
         rv$fs_result <- res
       },
       message = function(m) {
@@ -2389,7 +2472,12 @@ server <- function(input, output, session) {
       }
     )
     
-    appendLog("Finished feature selection.")
+    # --- Final log message with run type ---
+    if (isTRUE(rv$fs_result$summary$quick_run)) {
+      appendLog("Finished feature selection (Quick Run).")
+    } else {
+      appendLog("Finished feature selection (Full Run).")
+    }
   })
   
   output$fs_plot <- renderPlot({
@@ -2398,7 +2486,7 @@ server <- function(input, output, session) {
     tol <- res$tolerance
     
     if (identical(res$method, "Boruta")) {
-      # --- Boruta importance plot ---
+      # --- Boruta importance plot with consensus decision ---
       df <- res$results
       df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
       df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
@@ -2408,13 +2496,21 @@ server <- function(input, output, session) {
                       ggplot2::aes(x = reorder(Feature, ImportanceMean),
                                    y = ImportanceMean,
                                    fill = Decision)) +
-        ggplot2::geom_col(color = 'black', lwd = 0.4) +
+        ggplot2::geom_col(colour = "black", linewidth = 0.3) +
         ggplot2::coord_flip() +
-        ggplot2::labs(title = "Boruta feature importance",
-                      x = "Feature", y = "Mean importance") +
-        scale_fill_manual(values = c('Confirmed' = 'green4', 'Rejected' = 'red4', 'Tentative' = 'grey40')) + 
+        ggplot2::labs(
+          title = "Boruta Feature Importance (Consensus Decision)",
+          subtitle = if (isTRUE(res$summary$quick_run)) "Quick Run (exploratory)" else NULL,
+          x = "Feature",
+          y = "Mean importance",
+          fill = "Consensus Decision"
+        ) +
+        ggplot2::scale_fill_manual(values = c(
+          "Confirmed" = "green4",
+          "Rejected"  = "red4",
+          "Tentative" = "grey40"
+        )) +
         ggplot2::theme_bw(base_size = 14)
-      
     } else {
       # --- Elastic Net / Ridge ---
       df <- res$results
@@ -2506,6 +2602,11 @@ server <- function(input, output, session) {
     sumry <- res$summary
     tol <- res$tolerance
     
+    # --- Quick Run indicator ---
+    if (isTRUE(sumry$quick_run)) {
+      cat("*** NOTE: Results obtained in QUICK RUN (exploratory) mode ***\n\n")
+    }
+    
     cat("Samples before filtering:", sumry$n_before, "\n")
     cat("Samples after filtering:", sumry$n_after, "\n")
     cat("Samples dropped:", sumry$n_dropped, "\n\n")
@@ -2538,15 +2639,18 @@ server <- function(input, output, session) {
   output$export_fs_results <- downloadHandler(
     filename = function() {
       info <- rv$last_fs_info
-      if (is.null(info)) {
+      res <- rv$fs_result
+      if (is.null(info) || is.null(res)) {
         return(paste0("feature_selection_", Sys.Date(), ".csv"))
       }
-      paste0(info$method, "_feature_selection_with_outcome_", info$outcome, ".csv")
+      base <- paste0(info$method, "_feature_selection_with_outcome_", info$outcome)
+      if (isTRUE(res$summary$quick_run)) {
+        base <- paste0(base, "_quickrun")
+      }
+      paste0(base, ".csv")
     },
     content = function(file) {
-      # res <- run_fs(); req(res)
       res <- rv$fs_result; req(res)
-      # res$results already has Method, Outcome, Alpha as last columns
       utils::write.csv(res$results, file, row.names = FALSE)
     },
     contentType = "text/csv"
