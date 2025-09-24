@@ -2243,6 +2243,7 @@ server <- function(input, output, session) {
     
     if (method == "Random Forest (Boruta)") {
       all_imp <- list()
+      bor_models <- list()
       for (r in seq_len(reps)) {
         set.seed(seed_val + r - 1)
         X_boruta <- model.matrix(~ . - 1, data = X_raw)
@@ -2257,6 +2258,7 @@ server <- function(input, output, session) {
         imp <- Boruta::attStats(bor)
         imp$meanImp[!is.finite(imp$meanImp)] <- 0
         all_imp[[r]] <- imp
+        bor_models[[r]] <- bor
       }
       merged_imp <- Reduce(function(a, b) {
         common <- intersect(rownames(a), rownames(b))
@@ -2280,7 +2282,12 @@ server <- function(input, output, session) {
         outcome = y,
         predictors = colnames(X_raw),
         tolerance = tolerance,
-        details = list(samples_before = n_before, samples_after = n_after, samples_dropped = n_dropped)
+        summary = list(
+          n_before = n_before,
+          n_after = n_after,
+          n_dropped = n_dropped,
+          model = bor_models[[1]]  # return first Boruta model for inspection
+        )
       ))
     }
     
@@ -2300,6 +2307,7 @@ server <- function(input, output, session) {
     if (nfolds_val > n_after) nfolds_val <- max(3, floor(n_after / 2))
     
     coef_list <- list()
+    cv_models <- list()
     for (r in seq_len(reps)) {
       set.seed(seed_val + r - 1)
       cvfit <- glmnet::cv.glmnet(
@@ -2320,6 +2328,7 @@ server <- function(input, output, session) {
         coef_df <- coef_df[coef_df$Feature != "(Intercept)", , drop = FALSE]
         coef_list[[r]] <- coef_df
       }
+      cv_models[[r]] <- cvfit
     }
     
     if (family == "multinomial") {
@@ -2348,7 +2357,12 @@ server <- function(input, output, session) {
       outcome = y,
       predictors = colnames(Xmat),
       tolerance = tolerance,
-      details = list(samples_before = n_before, samples_after = n_after, samples_dropped = n_dropped)
+      summary = list(
+        n_before = n_before,
+        n_after = n_after,
+        n_dropped = n_dropped,
+        model = cv_models[[1]]  # return first cv.glmnet model for inspection
+      )
     ))
   })
   
@@ -2356,15 +2370,14 @@ server <- function(input, output, session) {
     rv$log(character())  # clear log
     appendLog("Starting feature selection...")
     
-    # Run FS with live message capture
     withCallingHandlers(
       {
-        res <- run_fs()   # this triggers your eventReactive code
+        res <- run_fs()
         rv$fs_result <- res
       },
       message = function(m) {
         appendLog(conditionMessage(m))
-        invokeRestart("muffleMessage")  # prevent double printing
+        invokeRestart("muffleMessage")
       },
       warning = function(w) {
         appendLog(paste("Warning:", conditionMessage(w)))
@@ -2372,28 +2385,16 @@ server <- function(input, output, session) {
       },
       error = function(e) {
         appendLog(paste("Error:", conditionMessage(e)))
-        stop(e)  # still stop the app on error
+        stop(e)
       }
     )
     
     appendLog("Finished feature selection.")
   })
   
-  output$fs_results <- renderTable({
-    res <- run_fs()
-    req(res)
-    
-    # Columns to hide in the UI but keep in CSV
-    hide_cols <- c("Method", "Outcome", "Alpha")
-    
-    # Only show the other columns in the UI table
-    display_df <- res$results[, setdiff(names(res$results), hide_cols), drop = FALSE]
-    
-    display_df
-  }, sanitize.text.function = function(x) x)
-  
   output$fs_plot <- renderPlot({
-    res <- run_fs(); req(res)
+    # res <- run_fs(); req(res)
+    res <- rv$fs_result; req(res)
     tol <- res$tolerance
     
     if (identical(res$method, "Boruta")) {
@@ -2458,7 +2459,8 @@ server <- function(input, output, session) {
   })
   
   output$fs_results <- renderTable({
-    res <- run_fs(); req(res)
+    # res <- run_fs(); req(res)
+    res <- rv$fs_result; req(res)
     df <- res$results
     tol <- res$tolerance
     
@@ -2474,14 +2476,39 @@ server <- function(input, output, session) {
     df
   }, sanitize.text.function = function(x) x)
   
+  # output$fs_summary <- renderPrint({
+  #   res <- run_fs(); req(res)
+  #   det <- res$details %||% list(samples_before = NA, samples_after = NA, samples_dropped = NA)
+  #   tol <- res$tolerance
+  #   
+  #   cat("Samples before filtering:", det$samples_before, "\n")
+  #   cat("Samples after filtering:", det$samples_after, "\n")
+  #   cat("Samples dropped:", det$samples_dropped, "\n\n")
+  #   
+  #   cat("Selected features (top):\n")
+  #   if (identical(res$method, "Boruta")) {
+  #     df <- res$results
+  #     df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+  #     df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
+  #     print(utils::head(df$Feature, 20))
+  #   } else {
+  #     df <- res$results
+  #     if ("Coef" %in% names(df)) {
+  #       df <- df[abs(df$Coef) >= tol, , drop = FALSE]
+  #       df <- df[order(df$Coef, decreasing = TRUE), ]
+  #       print(utils::head(df$Feature, 20))
+  #     }
+  #   }
+  # })
+  
   output$fs_summary <- renderPrint({
-    res <- run_fs(); req(res)
-    det <- res$details %||% list(samples_before = NA, samples_after = NA, samples_dropped = NA)
+    res <- rv$fs_result; req(res)
+    sumry <- res$summary
     tol <- res$tolerance
     
-    cat("Samples before filtering:", det$samples_before, "\n")
-    cat("Samples after filtering:", det$samples_after, "\n")
-    cat("Samples dropped:", det$samples_dropped, "\n\n")
+    cat("Samples before filtering:", sumry$n_before, "\n")
+    cat("Samples after filtering:", sumry$n_after, "\n")
+    cat("Samples dropped:", sumry$n_dropped, "\n\n")
     
     cat("Selected features (top):\n")
     if (identical(res$method, "Boruta")) {
@@ -2497,33 +2524,14 @@ server <- function(input, output, session) {
         print(utils::head(df$Feature, 20))
       }
     }
+    
+    cat("\nModel object:\n")
+    print(sumry$model)
   })
   
   output$hasFSResults <- reactive({
-    res <- run_fs()
-    !is.null(res) && !is.null(res$results) && nrow(res$results) > 0
-  })
-  outputOptions(output, "hasFSResults", suspendWhenHidden = FALSE)
-  
-  output$fs_summary <- renderPrint({
-    res <- run_fs()
-    req(res)
-    
-    cat("Samples before filtering:", res$summary$n_before, "\n")
-    cat("Samples after filtering:", res$summary$n_after, "\n")
-    cat("Samples dropped:", res$summary$n_dropped, "\n\n")
-    
-    if (inherits(res$summary$model, "cv.glmnet")) {
-      print(res$summary$model)
-    } else if (inherits(res$summary$model, "Boruta")) {
-      print(res$summary$model)
-    } else {
-      print(res$summary$model)
-    }
-  })
-  
-  output$hasFSResults <- reactive({
-    !is.null(run_fs())
+    # !is.null(run_fs())
+    !is.null(rv$fs_result)
   })
   outputOptions(output, "hasFSResults", suspendWhenHidden = FALSE)
   
@@ -2536,8 +2544,8 @@ server <- function(input, output, session) {
       paste0(info$method, "_feature_selection_with_outcome_", info$outcome, ".csv")
     },
     content = function(file) {
-      res <- run_fs()
-      req(res)
+      # res <- run_fs(); req(res)
+      res <- rv$fs_result; req(res)
       # res$results already has Method, Outcome, Alpha as last columns
       utils::write.csv(res$results, file, row.names = FALSE)
     },
