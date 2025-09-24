@@ -23,7 +23,7 @@ suppressPackageStartupMessages({
     library(caret) # train(), trainControl, resampling
     library(nnet) # multinom() for multi-class logistic regression
     library(pROC)
-    library(multiROC)
+    library(yardstick)
     library(rsample) # vfold_cv(), initial_split (if you want tidy resampling)
     library(boot) # bootstrapping CIs for AUC
     library(rlang) # tidy evaluation for !!!syms
@@ -38,6 +38,10 @@ options(shiny.maxRequestSize = 100000 * 1024^2)
 pct_clip <- function(x, p = c(0.01, 0.99)) {
   q <- quantile(x, probs = p, na.rm = TRUE)
   pmin(pmax(x, q[1]), q[2])
+}
+
+clean_dummy_names <- function(nms) {
+  gsub(pattern = 'leiden_cluster', replacement = 'leiden_cluster:', x = nms)
 }
 
 spearman_test <- function(df, freq_col = "freq", cont_var) {
@@ -2158,160 +2162,177 @@ server <- function(input, output, session) {
   })
   
   run_fs <- eventReactive(input$run_fs, {
-    req(rv$clusters$abundance, rv$meta_cell)
+    req(rv$meta_cell, input$fs_outcome, input$fs_predictors)
     
-    # --- Merge abundance with sample-level metadata ---
-    abund0 <- rv$clusters$abundance
-    sources <- rownames(abund0)
-    ids <- unique(rv$meta_cell$patient_ID)
-    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
-    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
-    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
-    pid <- stringr::str_extract(sources, pattern)
+    meta_patient <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
     
-    abund_df <- as.data.frame(abund0)
-    abund_df$patient_ID <- pid
-    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
-    df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
-    
-    abund_cols <- colnames(abund0)
-    
-    # --- Capture inputs ---
-    outcome <- input$fs_outcome
-    predictors_in <- input$fs_predictors
-    req(outcome, predictors_in)
-    
-    # Map method to short name
-    method <- input$fs_method
-    method_short <- switch(method,
-                           "Ridge Regression" = "ridge",
-                           "Elastic Net" = "elastic_net",
-                           "Random Forest (Boruta)" = "random_forest"
-    )
-    
-    # Snapshot run-time info for later use in table and export
-    rv$last_fs_info <- list(
-      method = method_short,
-      alpha  = if (method_short == "elastic_net") input$fs_alpha else NA,
-      outcome = outcome
-    )
-    
-    # --- Expand leiden_cluster into abundance predictors if selected ---
-    predictors <- predictors_in
-    if ("leiden_cluster" %in% predictors) {
-      chosen <- abund_cols
-      if (!is.null(input$fs_leiden_subset) && length(input$fs_leiden_subset) > 0) {
-        chosen <- intersect(chosen, input$fs_leiden_subset)
-        if (!length(chosen)) {
-          showNotification("No selected clusters found in abundance matrix.", type = "error")
-          return(NULL)
-        }
-      }
-      predictors <- c(setdiff(predictors, "leiden_cluster"), chosen)
-    }
-    
-    # --- Drop samples with missing outcome ---
-    n_before <- nrow(df)
-    df <- df[!is.na(df[[outcome]]), , drop = FALSE]
-    
-    # Remove predictors not present in df
-    predictors <- predictors[predictors %in% colnames(df)]
-    if (!length(predictors)) {
-      showNotification("No valid predictors available after filtering.", type = "error")
+    # Outcome
+    if (!(input$fs_outcome %in% colnames(meta_patient))) {
+      showNotification("Selected outcome not found in metadata.", type = "error")
       return(NULL)
     }
+    y_raw <- meta_patient[[input$fs_outcome]]
     
-    # Drop single-level factors to avoid contrasts errors
-    single_level <- vapply(predictors, function(p) {
-      is.factor(df[[p]]) && length(levels(droplevels(df[[p]]))) < 2
-    }, logical(1))
-    if (any(single_level)) {
-      dropped <- predictors[single_level]
-      predictors <- predictors[!single_level]
-      showNotification(sprintf("Dropped single-level factor(s): %s", paste(dropped, collapse = ", ")),
-                       type = "warning")
-    }
-    if (!length(predictors)) {
-      showNotification("All predictors dropped due to single-level factors.", type = "error")
+    # Predictors
+    pred_meta <- intersect(input$fs_predictors, colnames(meta_patient))
+    if (length(pred_meta) == 0) {
+      showNotification("Select at least one predictor.", type = "error")
       return(NULL)
     }
+    X_raw <- meta_patient[, pred_meta, drop = FALSE]
     
-    # Drop rows with missing predictor values
-    df <- df[stats::complete.cases(df[, predictors, drop = FALSE]), , drop = FALSE]
-    n_after <- nrow(df)
+    # Optional cluster subset
+    if ("leiden_cluster" %in% pred_meta &&
+        "leiden_cluster" %in% colnames(meta_patient) &&
+        !is.null(input$fs_leiden_subset) && length(input$fs_leiden_subset) > 0) {
+      keep <- as.character(meta_patient$leiden_cluster) %in% input$fs_leiden_subset
+      y_raw <- y_raw[keep]
+      X_raw <- X_raw[keep, , drop = FALSE]
+      meta_patient <- meta_patient[keep, , drop = FALSE]
+    }
+    
+    # Sample counts
+    n_before <- length(y_raw)
+    complete_rows <- stats::complete.cases(data.frame(X_raw, .y = y_raw))
+    X_raw <- X_raw[complete_rows, , drop = FALSE]
+    y_raw <- y_raw[complete_rows]
+    n_after <- length(y_raw)
     n_dropped <- n_before - n_after
-    if (n_dropped > 0) {
-      showNotification(
-        sprintf("%d sample(s) dropped due to missing outcome/predictor data. %d sample(s) used.",
-                n_dropped, n_after),
-        type = "warning"
-      )
-    }
     if (n_after < 3) {
-      showNotification("Fewer than 3 samples remain; results may be unstable.", type = "warning")
+      showNotification("Too few samples after filtering for feature selection.", type = "error")
+      return(NULL)
     }
     
-    # Helper to map abundance colnames to display names
-    as_display_name <- function(var) {
-      if (var %in% abund_cols) paste0("leiden_cluster:", var) else var
+    # Outcome coercion
+    y <- y_raw
+    if (is.character(y)) y <- factor(y)
+    
+    # User controls
+    method <- input$fs_method %||% "Elastic Net"
+    tolerance <- 1e-4
+    seed_val <- input$fs_seed %||% 123
+    reps <- input$fs_reps %||% 1
+    boruta_maxruns <- input$fs_maxruns %||% 500
+    
+    set.seed(seed_val)
+    
+    # Helper: clean dummy names
+    clean_dummy_names <- function(nms) {
+      gsub(pattern = "leiden_cluster", replacement = "leiden_cluster:", x = nms)
     }
     
-    if (method %in% c("Ridge Regression", "Elastic Net")) {
-      alpha_val <- if (method == "Ridge Regression") 0 else input$fs_alpha
+    if (method == "Random Forest (Boruta)") {
+      # Replicated Boruta runs
+      all_imp <- list()
+      for (r in seq_len(reps)) {
+        set.seed(seed_val + r - 1)
+        X_boruta <- model.matrix(~ . - 1, data = X_raw)
+        colnames(X_boruta) <- clean_dummy_names(colnames(X_boruta))
+        X_boruta <- as.data.frame(X_boruta)
+        
+        if (is.factor(y)) {
+          bor <- Boruta::Boruta(x = X_boruta, y = y, doTrace = 0, maxRuns = boruta_maxruns)
+        } else {
+          bor <- Boruta::Boruta(x = X_boruta, y = as.numeric(y), doTrace = 0, maxRuns = boruta_maxruns)
+        }
+        imp <- Boruta::attStats(bor)
+        imp$meanImp[!is.finite(imp$meanImp)] <- 0
+        all_imp[[r]] <- imp
+      }
+      # Aggregate importance across runs (median)
+      merged <- Reduce(function(a, b) {
+        common <- intersect(rownames(a), rownames(b))
+        a[common, "meanImp"] <- (a[common, "meanImp"] + b[common, "meanImp"]) / 2
+        a
+      }, all_imp)
+      merged <- merged[abs(merged$meanImp) >= tolerance, , drop = FALSE]
       
-      # Use ~ . to avoid formula parsing issues with special chars
-      x <- model.matrix(~ ., data = df[, predictors, drop = FALSE])[ , -1, drop = FALSE]
-      y <- df[[outcome]]
-      
-      cvfit <- glmnet::cv.glmnet(x, y, alpha = alpha_val, standardize = TRUE)
-      coefs <- coef(cvfit, s = "lambda.min")
-      coefs_df <- data.frame(Feature = rownames(coefs),
-                             Coefficient = as.numeric(coefs),
-                             stringsAsFactors = FALSE)
-      coefs_df <- coefs_df[coefs_df$Feature != "(Intercept)", , drop = FALSE]
-      coefs_df$Feature <- vapply(coefs_df$Feature, as_display_name, character(1))
-      coefs_df <- coefs_df[order(abs(coefs_df$Coefficient), decreasing = TRUE), , drop = FALSE]
-      
-      # Append method/outcome/alpha as last columns
-      coefs_df$Method <- method_short
-      coefs_df$Outcome <- outcome
-      coefs_df$Alpha <- if (!is.na(rv$last_fs_info$alpha)) rv$last_fs_info$alpha else NA
-      
-      return(list(
-        results = coefs_df,
-        summary = list(model = cvfit,
-                       n_before = n_before,
-                       n_after = n_after,
-                       n_dropped = n_dropped,
-                       sd_y = sd(y, na.rm = TRUE))
-      ))
-      
-    } else if (method == "Random Forest (Boruta)") {
-      # Use x/y interface to avoid formula parsing issues
-      x_bor <- df[, predictors, drop = FALSE]
-      y_bor <- df[[outcome]]
-      
-      bor <- Boruta::Boruta(x = x_bor, y = y_bor, doTrace = 0)
-      bor_final <- Boruta::TentativeRoughFix(bor)
-      
-      imp <- Boruta::attStats(bor_final)
-      imp <- data.frame(Feature = rownames(imp), imp, row.names = NULL, check.names = FALSE)
-      imp$Feature <- vapply(imp$Feature, as_display_name, character(1))
-      imp <- imp[order(-imp$meanImp), , drop = FALSE]
-      
-      # Append method/outcome/alpha as last columns
-      imp$Method <- method_short
-      imp$Outcome <- outcome
-      imp$Alpha <- if (!is.na(rv$last_fs_info$alpha)) rv$last_fs_info$alpha else NA
+      sel <- rownames(merged)[merged$decision %in% c("Confirmed", "Tentative")]
+      res_df <- data.frame(
+        Feature = rownames(merged),
+        ImportanceMean = merged$meanImp,
+        Decision = merged$decision,
+        stringsAsFactors = FALSE
+      )
       
       return(list(
-        results = imp,
-        summary = list(model = bor_final,
-                       n_before = n_before,
-                       n_after = n_after,
-                       n_dropped = n_dropped)
+        method = "Boruta",
+        results = res_df,
+        selected = sel,
+        outcome = y,
+        predictors = colnames(X_raw),
+        tolerance = tolerance,
+        details = list(samples_before = n_before, samples_after = n_after, samples_dropped = n_dropped)
       ))
     }
+    
+    # glmnet-based methods
+    family <- if (is.factor(y)) {
+      if (nlevels(y) == 2) "binomial" else "multinomial"
+    } else {
+      "gaussian"
+    }
+    
+    Xmat <- model.matrix(~ . - 1, data = X_raw)
+    colnames(Xmat) <- clean_dummy_names(colnames(Xmat))
+    storage.mode(Xmat) <- "double"
+    
+    alpha_val <- if (method == "Ridge Regression") 0 else (input$fs_alpha %||% 0.5)
+    nfolds_val <- input$fs_nfolds %||% 5
+    if (nfolds_val > n_after) nfolds_val <- max(3, floor(n_after / 2))
+    
+    coef_list <- list()
+    for (r in seq_len(reps)) {
+      set.seed(seed_val + r - 1)
+      cvfit <- glmnet::cv.glmnet(
+        x = Xmat, y = y, family = family,
+        alpha = alpha_val, nfolds = nfolds_val
+      )
+      coef_obj <- coef(cvfit, s = "lambda.min")
+      if (family == "multinomial") {
+        coef_df <- do.call(rbind, lapply(names(coef_obj), function(cls) {
+          cm <- as.matrix(coef_obj[[cls]])
+          data.frame(Feature = rownames(cm), Class = cls, Coef = as.numeric(cm[, 1]), stringsAsFactors = FALSE)
+        }))
+        coef_df <- coef_df[coef_df$Feature != "(Intercept)", , drop = FALSE]
+        coef_list[[r]] <- coef_df
+      } else {
+        cm <- as.matrix(coef_obj)
+        coef_df <- data.frame(Feature = rownames(cm), Coef = as.numeric(cm[, 1]), stringsAsFactors = FALSE)
+        coef_df <- coef_df[coef_df$Feature != "(Intercept)", , drop = FALSE]
+        coef_list[[r]] <- coef_df
+      }
+    }
+    
+    # Aggregate coefficients across runs (median)
+    if (family == "multinomial") {
+      all_df <- do.call(rbind, coef_list)
+      agg <- all_df %>%
+        dplyr::group_by(Feature, Class) %>%
+        dplyr::summarise(Coef = median(Coef, na.rm = TRUE), .groups = "drop")
+      agg <- agg[abs(agg$Coef) >= tolerance, , drop = FALSE]
+      res_df <- agg[order(agg$Coef, decreasing = TRUE), ]
+      selected <- unique(head(res_df$Feature, 50))
+    } else {
+      all_df <- do.call(rbind, coef_list)
+      agg <- all_df %>%
+        dplyr::group_by(Feature) %>%
+        dplyr::summarise(Coef = median(Coef, na.rm = TRUE), .groups = "drop")
+      agg <- agg[abs(agg$Coef) >= tolerance, , drop = FALSE]
+      res_df <- agg[order(agg$Coef, decreasing = TRUE), ]
+      selected <- head(res_df$Feature, 50)
+    }
+    
+    return(list(
+      method = if (alpha_val == 0) "Ridge" else "Elastic Net",
+      family = family,
+      results = res_df,
+      selected = selected,
+      outcome = y,
+      predictors = colnames(Xmat),
+      tolerance = tolerance,
+      details = list(samples_before = n_before, samples_after = n_after, samples_dropped = n_dropped)
+    ))
   })
   
   output$fs_results <- renderTable({
@@ -2328,84 +2349,117 @@ server <- function(input, output, session) {
   }, sanitize.text.function = function(x) x)
   
   output$fs_plot <- renderPlot({
-    res <- run_fs()
-    req(res)
-    title_hjust <- 0.5
+    res <- run_fs(); req(res)
+    tol <- res$tolerance
     
-    # Get method/alpha/outcome snapshot from last run
-    info <- rv$last_fs_info
-    method_label <- if (!is.null(info)) {
-      lbl <- paste0("Method: ", info$method)
-      if (!is.na(info$alpha)) {
-        lbl <- paste0(lbl, " | Alpha: ", info$alpha)
-      }
-      lbl
+    if (identical(res$method, "Boruta")) {
+      # --- Boruta importance plot ---
+      df <- res$results
+      df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+      df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
+      top_n <- head(df, 30)
+      
+      ggplot2::ggplot(top_n,
+                      ggplot2::aes(x = reorder(Feature, ImportanceMean),
+                                   y = ImportanceMean,
+                                   fill = Decision)) +
+        ggplot2::geom_col(color = 'black', lwd = 0.4) +
+        ggplot2::coord_flip() +
+        ggplot2::labs(title = "Boruta feature importance",
+                      x = "Feature", y = "Mean importance") +
+        scale_fill_manual(values = c('Confirmed' = 'green4', 'Rejected' = 'red4', 'Tentative' = 'grey40')) + 
+        ggplot2::theme_bw(base_size = 14)
+      
     } else {
-      ""
-    }
-    
-    if (inherits(res$summary$model, "Boruta")) {
-      # --- Boruta ggplot2 boxplot ---
-      imp_df <- Boruta::attStats(res$summary$model)
-      imp_df <- data.frame(Feature = rownames(imp_df), imp_df, row.names = NULL)
+      # --- Elastic Net / Ridge ---
+      df <- res$results
+      df <- df[abs(df$Coef) >= tol, , drop = FALSE]
       
-      # Replace newlines with spaces in feature names
-      imp_df$Feature <- gsub("\\s*\\n\\s*", " ", imp_df$Feature)
-      
-      # Order features by mean importance
-      imp_df$Feature <- factor(imp_df$Feature, levels = imp_df$Feature[order(imp_df$meanImp)])
-      
-      ggplot(imp_df, aes(x = Feature, y = meanImp, fill = decision)) +
-        geom_col() +
-        geom_errorbar(aes(ymin = minImp, ymax = maxImp), width = 0.2) +
-        scale_fill_manual(values = c("Confirmed" = "forestgreen",
-                                     "Tentative" = "gold",
-                                     "Rejected" = "firebrick")) +
-        labs(title = paste("Boruta Feature Importance", method_label, sep = " | "),
-             x = NULL,
-             y = "Mean Importance") +
-        theme_bw(base_size = 24) +
-        theme(plot.title = element_text(hjust = title_hjust),
-              axis.text.x = element_text(angle = 45, hjust = 1))
-      
-    } else if (inherits(res$summary$model, "cv.glmnet")) {
-      # --- Ridge / Elastic Net coefficient bar plot ---
-      coefs_df <- res$results
-      coefs_df <- coefs_df[coefs_df$Feature != "(Intercept)", , drop = FALSE]
-      
-      # Replace newlines with spaces in feature names
-      coefs_df$Feature <- gsub("\\s*\\n\\s*", " ", coefs_df$Feature)
-      
-      # Aggregate to one row per base predictor: keep coefficient with largest abs value
-      agg <- coefs_df |>
-        dplyr::group_by(Feature) |>
-        dplyr::summarise(
-          idx = which.max(abs(Coefficient)),
-          Coefficient = Coefficient[idx],
-          .groups = "drop"
-        )
-      
-      # Apply tolerance filter based on outcome scale
-      tol <- 1e-6 * res$summary$sd_y
-      agg <- agg[abs(agg$Coefficient) > tol, , drop = FALSE]
-      
-      # Order by absolute magnitude and take top N
-      agg <- agg[order(abs(agg$Coefficient), decreasing = TRUE), , drop = FALSE]
-      top_n <- min(20, nrow(agg))
-      agg_top <- utils::head(agg, top_n)
-      
-      ggplot(agg_top, aes(x = reorder(Feature, Coefficient),
-                          y = Coefficient,
-                          fill = Coefficient > 0)) +
-        geom_col(show.legend = FALSE) +
-        coord_flip() +
-        labs(title = paste("Top Coefficients (Ridge/Elastic Net)", method_label, sep = " | "),
-             x = "Feature",
-             y = "Coefficient") +
-        theme_bw(base_size = 24) +
-        theme(plot.title = element_text(hjust = title_hjust))
+      if ("Class" %in% names(df)) {
+        # Multinomial: facet by Class
+        top_n <- df %>%
+          dplyr::group_by(Class) %>%
+          dplyr::arrange(dplyr::desc(Coef), .by_group = TRUE) %>%
+          dplyr::slice_head(n = 20)
+        
+        ggplot2::ggplot(top_n,
+                        ggplot2::aes(x = reorder(Feature, Coef),
+                                     y = Coef,
+                                     fill = Coef)) +
+          ggplot2::geom_col(color = 'black', lwd = 0.4) +
+          ggplot2::facet_wrap(~Class, scales = "free_y") +
+          ggplot2::coord_flip() +
+          ggplot2::labs(title = paste(res$method, "coefficients (lambda.min)"),
+                        x = "Feature", y = "Coefficient") + 
+          scale_fill_gradient(low = 'blue3', high = 'red3') + 
+          ggplot2::theme_bw(base_size = 14)
+        
+      } else {
+        # Binary/continuous outcome
+        df <- df[order(df$Coef, decreasing = TRUE), ]
+        top_n <- head(df, 30)
+        
+        ggplot2::ggplot(top_n,
+                        ggplot2::aes(x = reorder(Feature, Coef),
+                                     y = Coef,
+                                     fill = Coef)) +
+          ggplot2::geom_col(color = 'black', lwd = 0.4) +
+          ggplot2::coord_flip() +
+          ggplot2::labs(title = paste(res$method, "coefficients (lambda.min)"),
+                        x = "Feature", y = "Coefficient") + 
+          scale_fill_gradient(low = 'blue3', high = 'red3') + 
+          ggplot2::theme_bw(base_size = 14)
+      }
     }
   })
+  
+  output$fs_results <- renderTable({
+    res <- run_fs(); req(res)
+    df <- res$results
+    tol <- res$tolerance
+    
+    if (identical(res$method, "Boruta")) {
+      df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+      df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
+    } else {
+      if ("Coef" %in% names(df)) {
+        df <- df[abs(df$Coef) >= tol, , drop = FALSE]
+        df <- df[order(df$Coef, decreasing = TRUE), ]
+      }
+    }
+    df
+  }, sanitize.text.function = function(x) x)
+  
+  output$fs_summary <- renderPrint({
+    res <- run_fs(); req(res)
+    det <- res$details %||% list(samples_before = NA, samples_after = NA, samples_dropped = NA)
+    tol <- res$tolerance
+    
+    cat("Samples before filtering:", det$samples_before, "\n")
+    cat("Samples after filtering:", det$samples_after, "\n")
+    cat("Samples dropped:", det$samples_dropped, "\n\n")
+    
+    cat("Selected features (top):\n")
+    if (identical(res$method, "Boruta")) {
+      df <- res$results
+      df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+      df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
+      print(utils::head(df$Feature, 20))
+    } else {
+      df <- res$results
+      if ("Coef" %in% names(df)) {
+        df <- df[abs(df$Coef) >= tol, , drop = FALSE]
+        df <- df[order(df$Coef, decreasing = TRUE), ]
+        print(utils::head(df$Feature, 20))
+      }
+    }
+  })
+  
+  output$hasFSResults <- reactive({
+    res <- run_fs()
+    !is.null(res) && !is.null(res$results) && nrow(res$results) > 0
+  })
+  outputOptions(output, "hasFSResults", suspendWhenHidden = FALSE)
   
   output$fs_summary <- renderPrint({
     res <- run_fs()
@@ -2697,28 +2751,26 @@ server <- function(input, output, session) {
     n_classes <- nlevels(preds$obs)
     
     if (n_classes == 2) {
-      # --- Binary ROC with pROC ---
+      # Binary ROC with pROC
       classes <- levels(preds$obs)
-      positive <- classes[2]  # treat second level as "positive"
+      positive <- classes[2]
       roc_obj <- pROC::roc(response = preds$obs,
                            predictor = preds[[paste0(".pred_", positive)]],
                            levels = rev(classes))
       plot(roc_obj, main = "Binary ROC Curve", col = "blue", lwd = 2, print.auc = TRUE)
       abline(a = 0, b = 1, lty = 2, col = "red")
     } else {
-      # --- Multiclass ROC with multiROC ---
-      roc_res <- tryCatch({
-        compute_multiROC(preds)
-      }, error = function(e) {
-        showNotification(paste("ROC computation failed:", e$message), type = "error")
-        return(NULL)
-      })
-      req(roc_res)
+      # Multiclass ROC with yardstick (one-vs-rest curves per class)
+      long_preds <- preds %>%
+        dplyr::select(obs, starts_with(".pred_"))
       
-      plot_roc_data(roc_res) +
-        ggplot2::labs(title = "Multiclass ROC Curves",
-                      subtitle = "Includes macro and micro averages") +
-        ggplot2::theme_minimal(base_size = 14)
+      roc_curves <- yardstick::roc_curve(long_preds, truth = obs, dplyr::starts_with(".pred_"))
+      
+      ggplot2::ggplot(roc_curves, ggplot2::aes(x = 1 - specificity, y = sensitivity, color = .level)) +
+        ggplot2::geom_path(size = 1) +
+        ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+        ggplot2::labs(title = "Multiclass ROC Curves (yardstick)", color = "Class") +
+        ggplot2::theme_bw(base_size = 14)
     }
   })
   
@@ -2728,10 +2780,8 @@ server <- function(input, output, session) {
     
     n_classes <- nlevels(preds$obs)
     
-    # Start with core metrics
     obs <- preds$obs
     pred <- preds$pred
-    
     if (is.null(pred)) {
       pred_cols <- grep("^\\.pred_", names(preds), value = TRUE)
       classes <- gsub("^\\.pred_", "", pred_cols)
@@ -2750,61 +2800,55 @@ server <- function(input, output, session) {
     majority_safe <- names(which.max(table(obs)))
     majority_orig <- rv$lm_label_map[[majority_safe]]
     
-    # Build base performance table
     perf_table <- data.frame(
-      Metric = c("Null Accuracy (most frequent class)", "Model Accuracy",
-                 "Binomial p-value vs Null"),
+      Metric = c("Null Accuracy (most frequent class)", "Model Accuracy", "Binomial p-value vs Null"),
       Value  = c(paste0(round(res$null_acc, 3), " (", majority_orig, ")"),
                  round(model_acc, 3),
-                 signif(binom_p, 3))
+                 signif(binom_p, 3)),
+      stringsAsFactors = FALSE
     )
     
     if (n_classes == 2) {
-      # --- Binary ROC with pROC ---
+      # Binary AUC with pROC
       classes <- levels(preds$obs)
       positive <- classes[2]
       roc_obj <- pROC::roc(response = preds$obs,
                            predictor = preds[[paste0(".pred_", positive)]],
                            levels = rev(classes))
       auc_val <- as.numeric(pROC::auc(roc_obj))
-      
       perf_table <- rbind(perf_table,
-                          data.frame(Metric = "AUC (pROC)",
-                                     Value = round(auc_val, 3)))
+                          data.frame(Metric = "AUC (pROC)", Value = round(auc_val, 3), stringsAsFactors = FALSE))
     } else {
-      # --- Multiclass ROC with multiROC ---
-      roc_res <- tryCatch({
-        compute_multiROC(preds)
-      }, error = function(e) {
-        showNotification(paste("ROC computation failed:", e$message), type = "error")
-        return(NULL)
-      })
-      req(roc_res)
+      # Multiclass AUCs with yardstick
+      long_preds <- preds %>%
+        dplyr::select(obs, starts_with(".pred_"))
       
-      aucs <- roc_res$AUC
-      macro_auc <- if ("macro" %in% aucs$Group) aucs[aucs$Group == "macro", "AUC"] else NA
-      micro_auc <- if ("micro" %in% aucs$Group) aucs[aucs$Group == "micro", "AUC"] else NA
+      auc_macro <- yardstick::roc_auc(long_preds, truth = obs,
+                                      dplyr::starts_with(".pred_"), estimator = "macro")
+      auc_macro_wt <- yardstick::roc_auc(long_preds, truth = obs,
+                                         dplyr::starts_with(".pred_"), estimator = "macro_weighted")
+      auc_ht <- yardstick::roc_auc(long_preds, truth = obs,
+                                   dplyr::starts_with(".pred_"), estimator = "hand_till")
       
-      perf_table <- rbind(perf_table,
-                          data.frame(Metric = c("Macro AUC (multiROC)", "Micro AUC (multiROC)"),
-                                     Value  = c(round(macro_auc, 3), round(micro_auc, 3))))
+      perf_table <- rbind(
+        perf_table,
+        data.frame(Metric = "Macro AUC (yardstick)", Value = round(auc_macro$.estimate, 3), stringsAsFactors = FALSE),
+        data.frame(Metric = "Macro-weighted AUC (yardstick)", Value = round(auc_macro_wt$.estimate, 3), stringsAsFactors = FALSE),
+        data.frame(Metric = "Hand-Till AUC (yardstick)", Value = round(auc_ht$.estimate, 3), stringsAsFactors = FALSE)
+      )
     }
     
-    # --- Add Train/Test split info if available ---
+    # Train/Test split info
     if (!is.null(res$split_info)) {
       train_summary <- paste(names(res$split_info$train_counts),
                              res$split_info$train_counts, collapse = "; ")
       test_summary  <- paste(names(res$split_info$test_counts),
-                             res$split_info$test_counts, collapse = "; ")
-      
+                             res$split_info$test_counts,  collapse = "; ")
       extra_rows <- data.frame(
         Metric = c("Train size", "Test size", "Train breakdown", "Test breakdown"),
-        Value  = c(res$split_info$n_train,
-                   res$split_info$n_test,
-                   train_summary,
-                   test_summary)
+        Value  = c(res$split_info$n_train, res$split_info$n_test, train_summary, test_summary),
+        stringsAsFactors = FALSE
       )
-      
       perf_table <- rbind(perf_table, extra_rows)
     }
     
