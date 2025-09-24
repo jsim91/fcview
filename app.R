@@ -40,6 +40,24 @@ pct_clip <- function(x, p = c(0.01, 0.99)) {
   pmin(pmax(x, q[1]), q[2])
 }
 
+# appendLog <- function(msg) {
+#   old <- rv$log()
+#   new <- c(old, paste0(format(Sys.time(), "%H:%M:%S"), " | ", msg))
+#   if (length(new) > 10) new <- tail(new, 10)  # keep last 10
+#   rv$log(new)
+# }
+
+align_metadata_abundance <- function(metadata, abundance) {
+  # Extract patient_ID from abundance rownames ("patientID_runDate.fcs" is the expected format; the pattern "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$" will always match the _runDate.fcs part)
+  patient_ids <- gsub(pattern = "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$", replacement = "", x = rownames(abundance))
+  abund_df <- as.data.frame(abundance)
+  abund_df$patient_ID <- patient_ids
+  
+  # Merge with metadata
+  merged <- dplyr::left_join(metadata, abund_df, by = "patient_ID")
+  return(merged)
+}
+
 clean_dummy_names <- function(nms) {
   gsub(pattern = 'leiden_cluster', replacement = 'leiden_cluster:', x = nms)
 }
@@ -868,6 +886,7 @@ server <- function(input, output, session) {
   )
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
+  # rv$log <- reactiveVal(character())
   
   # Disable tabs at startup
   # observe({
@@ -2162,34 +2181,24 @@ server <- function(input, output, session) {
   })
   
   run_fs <- eventReactive(input$run_fs, {
-    req(rv$meta_cell, input$fs_outcome, input$fs_predictors)
+    req(rv$meta_cell, rv$clusters$abundance, input$fs_outcome, input$fs_predictors)
     
-    meta_patient <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
+    # Align metadata and abundance
+    merged <- align_metadata_abundance(rv$meta_cell, rv$clusters$abundance)
+    
+    # Drop NA outcomes
+    merged <- merged[!is.na(merged[[input$fs_outcome]]), ]
     
     # Outcome
-    if (!(input$fs_outcome %in% colnames(meta_patient))) {
-      showNotification("Selected outcome not found in metadata.", type = "error")
-      return(NULL)
-    }
-    y_raw <- meta_patient[[input$fs_outcome]]
+    y_raw <- merged[[input$fs_outcome]]
     
     # Predictors
-    pred_meta <- intersect(input$fs_predictors, colnames(meta_patient))
+    pred_meta <- intersect(input$fs_predictors, colnames(merged))
     if (length(pred_meta) == 0) {
       showNotification("Select at least one predictor.", type = "error")
       return(NULL)
     }
-    X_raw <- meta_patient[, pred_meta, drop = FALSE]
-    
-    # Optional cluster subset
-    if ("leiden_cluster" %in% pred_meta &&
-        "leiden_cluster" %in% colnames(meta_patient) &&
-        !is.null(input$fs_leiden_subset) && length(input$fs_leiden_subset) > 0) {
-      keep <- as.character(meta_patient$leiden_cluster) %in% input$fs_leiden_subset
-      y_raw <- y_raw[keep]
-      X_raw <- X_raw[keep, , drop = FALSE]
-      meta_patient <- meta_patient[keep, , drop = FALSE]
-    }
+    X_raw <- merged[, pred_meta, drop = FALSE]
     
     # Sample counts
     n_before <- length(y_raw)
@@ -2222,7 +2231,6 @@ server <- function(input, output, session) {
     }
     
     if (method == "Random Forest (Boruta)") {
-      # Replicated Boruta runs
       all_imp <- list()
       for (r in seq_len(reps)) {
         set.seed(seed_val + r - 1)
@@ -2239,19 +2247,18 @@ server <- function(input, output, session) {
         imp$meanImp[!is.finite(imp$meanImp)] <- 0
         all_imp[[r]] <- imp
       }
-      # Aggregate importance across runs (median)
-      merged <- Reduce(function(a, b) {
+      merged_imp <- Reduce(function(a, b) {
         common <- intersect(rownames(a), rownames(b))
         a[common, "meanImp"] <- (a[common, "meanImp"] + b[common, "meanImp"]) / 2
         a
       }, all_imp)
-      merged <- merged[abs(merged$meanImp) >= tolerance, , drop = FALSE]
+      merged_imp <- merged_imp[abs(merged_imp$meanImp) >= tolerance, , drop = FALSE]
       
-      sel <- rownames(merged)[merged$decision %in% c("Confirmed", "Tentative")]
+      sel <- rownames(merged_imp)[merged_imp$decision %in% c("Confirmed", "Tentative")]
       res_df <- data.frame(
-        Feature = rownames(merged),
-        ImportanceMean = merged$meanImp,
-        Decision = merged$decision,
+        Feature = rownames(merged_imp),
+        ImportanceMean = merged_imp$meanImp,
+        Decision = merged_imp$decision,
         stringsAsFactors = FALSE
       )
       
@@ -2304,7 +2311,6 @@ server <- function(input, output, session) {
       }
     }
     
-    # Aggregate coefficients across runs (median)
     if (family == "multinomial") {
       all_df <- do.call(rbind, coef_list)
       agg <- all_df %>%
