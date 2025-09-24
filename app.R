@@ -40,12 +40,12 @@ pct_clip <- function(x, p = c(0.01, 0.99)) {
   pmin(pmax(x, q[1]), q[2])
 }
 
-# appendLog <- function(msg) {
-#   old <- rv$log()
-#   new <- c(old, paste0(format(Sys.time(), "%H:%M:%S"), " | ", msg))
-#   if (length(new) > 10) new <- tail(new, 10)  # keep last 10
-#   rv$log(new)
-# }
+appendLog <- function(msg) {
+  old <- rv$log()
+  new <- c(old, paste0(format(Sys.time(), "%H:%M:%S"), " | ", msg))
+  if (length(new) > 10) new <- tail(new, 10)  # keep last 10 lines
+  rv$log(new)
+}
 
 align_metadata_abundance <- function(metadata, abundance) {
   # Extract patient_ID from abundance rownames ("patientID_runDate.fcs" is the expected format; the pattern "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$" will always match the _runDate.fcs part)
@@ -796,25 +796,32 @@ ui <- navbarPage(
     "Feature Selection",
     sidebarLayout(
       sidebarPanel(
-        pickerInput("fs_method", "Method", 
-                    choices = c("Ridge Regression", "Elastic Net", "Random Forest (Boruta)")),
-        pickerInput("fs_outcome", "Outcome variable", choices = NULL),
-        pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
-        conditionalPanel(
-          condition = "input.fs_predictors.includes('leiden_cluster')",
-          pickerInput("fs_leiden_subset", "Select clusters to include",
-                      choices = NULL, multiple = TRUE)
-        ), 
-        conditionalPanel(
-          condition = "input.fs_method == 'Elastic Net'",
-          sliderInput("fs_alpha", "Alpha (0 = Ridge, 1 = Lasso)", 
-                      min = 0, max = 1, value = 0.5, step = 0.05)
-        ),
-        actionButton("run_fs", "Run Feature Selection"),
-        br(), br(),
-        conditionalPanel(
-          condition = "output.hasFSResults",
-          downloadButton("export_fs_results", "Export results as CSV")
+        tabsetPanel(
+          tabPanel("Controls",
+                   pickerInput("fs_method", "Method", 
+                               choices = c("Ridge Regression", "Elastic Net", "Random Forest (Boruta)")),
+                   pickerInput("fs_outcome", "Outcome variable", choices = NULL),
+                   pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
+                   conditionalPanel(
+                     condition = "input.fs_predictors.includes('leiden_cluster')",
+                     pickerInput("fs_leiden_subset", "Select clusters to include",
+                                 choices = NULL, multiple = TRUE)
+                   ), 
+                   conditionalPanel(
+                     condition = "input.fs_method == 'Elastic Net'",
+                     sliderInput("fs_alpha", "Alpha (0 = Ridge, 1 = Lasso)", 
+                                 min = 0, max = 1, value = 0.5, step = 0.05)
+                   ),
+                   actionButton("run_fs", "Run Feature Selection"),
+                   br(), br(),
+                   conditionalPanel(
+                     condition = "output.hasFSResults",
+                     downloadButton("export_fs_results", "Export results as CSV")
+                   )
+          ),
+          tabPanel("Console Log",
+                   verbatimTextOutput("console_log", placeholder = TRUE)
+          )
         )
       ),
       mainPanel(
@@ -886,7 +893,11 @@ server <- function(input, output, session) {
   )
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
-  # rv$log <- reactiveVal(character())
+  rv$log <- reactiveVal(character())
+  
+  output$console_log <- renderText({
+    paste(rv$log(), collapse = "\n")
+  })
   
   # Disable tabs at startup
   # observe({
@@ -2339,6 +2350,33 @@ server <- function(input, output, session) {
       tolerance = tolerance,
       details = list(samples_before = n_before, samples_after = n_after, samples_dropped = n_dropped)
     ))
+  })
+  
+  observeEvent(input$run_fs, {
+    rv$log(character())  # clear log
+    appendLog("Starting feature selection...")
+    
+    # Run FS with live message capture
+    withCallingHandlers(
+      {
+        res <- run_fs()   # this triggers your eventReactive code
+        rv$fs_result <- res
+      },
+      message = function(m) {
+        appendLog(conditionMessage(m))
+        invokeRestart("muffleMessage")  # prevent double printing
+      },
+      warning = function(w) {
+        appendLog(paste("Warning:", conditionMessage(w)))
+        invokeRestart("muffleWarning")
+      },
+      error = function(e) {
+        appendLog(paste("Error:", conditionMessage(e)))
+        stop(e)  # still stop the app on error
+      }
+    )
+    
+    appendLog("Finished feature selection.")
   })
   
   output$fs_results <- renderTable({
