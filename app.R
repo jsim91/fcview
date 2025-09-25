@@ -40,14 +40,59 @@ pct_clip <- function(x, p = c(0.01, 0.99)) {
   pmin(pmax(x, q[1]), q[2])
 }
 
-align_metadata_abundance <- function(metadata, abundance) {
-  # Extract patient_ID from abundance rownames ("patientID_runDate.fcs" is the expected format; the pattern "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$" will always match the _runDate.fcs part)
-  patient_ids <- gsub(pattern = "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$", replacement = "", x = rownames(abundance))
+# appendLog <- function(msg) {
+#   old <- rv$log()
+#   new <- c(old, paste0(format(Sys.time(), "%H:%M:%S"), " | ", msg))
+#   if (length(new) > 10) new <- tail(new, 10)  # keep last 10
+#   rv$log(new)
+# }
+
+align_metadata_abundance <- function(metadata, abundance, notify = NULL) {
+  # Extract patient_ID from abundance rownames
+  patient_ids <- gsub(
+    pattern = "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$",
+    replacement = "",
+    x = rownames(abundance)
+  )
+  
   abund_df <- as.data.frame(abundance)
   abund_df$patient_ID <- patient_ids
   
-  # Merge with metadata
+  # Duplicate checks
+  if (anyDuplicated(metadata$patient_ID)) {
+    msg <- "Duplicate patient_IDs found in metadata. Consider deduplicating with distinct()."
+    warning(msg)
+    if (!is.null(notify)) notify(msg, type = "warning")
+  }
+  if (anyDuplicated(abund_df$patient_ID)) {
+    msg <- "Duplicate patient_IDs found in abundance rownames. Check your input files."
+    warning(msg)
+    if (!is.null(notify)) notify(msg, type = "warning")
+  }
+  
+  # Mismatch checks
+  meta_ids <- unique(metadata$patient_ID)
+  abund_ids <- unique(abund_df$patient_ID)
+  
+  missing_in_abund <- setdiff(meta_ids, abund_ids)
+  missing_in_meta  <- setdiff(abund_ids, meta_ids)
+  
+  if (length(missing_in_abund) > 0) {
+    msg <- paste("These patient_IDs are in metadata but not in abundance:",
+                 paste(missing_in_abund, collapse = ", "))
+    warning(msg)
+    if (!is.null(notify)) notify(msg, type = "warning")
+  }
+  if (length(missing_in_meta) > 0) {
+    msg <- paste("These patient_IDs are in abundance but not in metadata:",
+                 paste(missing_in_meta, collapse = ", "))
+    warning(msg)
+    if (!is.null(notify)) notify(msg, type = "warning")
+  }
+  
+  # Merge with metadata (metadata is the anchor)
   merged <- dplyr::left_join(metadata, abund_df, by = "patient_ID")
+  
   return(merged)
 }
 
@@ -633,20 +678,20 @@ ui <- navbarPage(
     "))
   ),
   tabPanel("Home",
-    sidebarLayout(
-      sidebarPanel(
-        fileInput("rdata_upload", "Upload .RData (FCSimple analysis object)", accept = ".RData"),
-        numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
-        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled after upload. This is done to speed up UMAP and tSNE facet plotting."), 
-        width = 3
-      ),
-      mainPanel(
-        h3("Dataset overview"),
-        verbatimTextOutput("ds_summary"),
-        h3("Available metadata"),
-        tableOutput("meta_overview")
-      )
-    )
+           sidebarLayout(
+             sidebarPanel(
+               fileInput("rdata_upload", "Upload .RData (FCSimple analysis object)", accept = ".RData"),
+               numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
+               helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled after upload. This is done to speed up UMAP and tSNE facet plotting."), 
+               width = 3
+             ),
+             mainPanel(
+               h3("Dataset overview"),
+               verbatimTextOutput("ds_summary"),
+               h3("Available metadata"),
+               tableOutput("meta_overview")
+             )
+           )
   ),
   
   tabPanel("UMAP", EmbeddingUI("umap", title = "UMAP")),
@@ -789,66 +834,34 @@ ui <- navbarPage(
     "Feature Selection",
     sidebarLayout(
       sidebarPanel(
-        tabsetPanel(
-          tabPanel("Controls",
-                   pickerInput("fs_method", "Method", 
-                               choices = c("Ridge Regression", "Elastic Net", "Random Forest (Boruta)")),
-                   pickerInput("fs_outcome", "Outcome variable", choices = NULL),
-                   pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
-                   
-                   conditionalPanel(
-                     condition = "input.fs_predictors.includes('leiden_cluster')",
-                     pickerInput("fs_leiden_subset", "Select clusters to include",
-                                 choices = NULL, multiple = TRUE)
-                   ), 
-                   
-                   conditionalPanel(
-                     condition = "input.fs_method == 'Elastic Net'",
-                     sliderInput("fs_alpha", "Alpha (0 = Ridge, 1 = Lasso)", 
-                                 min = 0, max = 1, value = 0.5, step = 0.05)
-                   ),
-                   
-                   # --- Quick Run toggle (always visible for FS methods) ---
-                   checkboxInput("fs_quickrun", "Quick Run (exploratory)", value = FALSE),
-                   conditionalPanel(
-                     condition = "input.fs_method == 'Random Forest (Boruta)'",
-                     helpText("Quick Run = 1 repetition, 200 maxRuns (much faster, less stable).")
-                   ),
-                   conditionalPanel(
-                     condition = "input.fs_method == 'Ridge Regression' || input.fs_method == 'Elastic Net'",
-                     helpText("Quick Run = 1 repetition, 3-fold CV (faster, less stable).")
-                   ),
-                   
-                   # Boruta-specific numeric controls (only shown if not Quick Run)
-                   conditionalPanel(
-                     condition = "input.fs_method == 'Random Forest (Boruta)' && !input.fs_quickrun",
-                     numericInput("fs_reps", "Number of Boruta repetitions", 
-                                  value = 3, min = 1, max = 10, step = 1),
-                     helpText("More repetitions = more stable consensus, but runtime increases linearly."),
-                     numericInput("fs_maxruns", "Boruta maxRuns per repetition", 
-                                  value = 300, min = 50, max = 1000, step = 50),
-                     helpText("Higher maxRuns = more thorough feature testing, but each run takes longer.")
-                   ),
-                   
-                   actionButton("run_fs", "Run Feature Selection"),
-                   br(), br(),
-                   conditionalPanel(
-                     condition = "output.hasFSResults",
-                     downloadButton("export_fs_results", "Export results as CSV")
-                   )
-          ),
-          tabPanel("Console Log",
-                   verbatimTextOutput("console_log", placeholder = TRUE)
-          )
+        pickerInput("fs_method", "Method", 
+                    choices = c("Ridge Regression", "Elastic Net", "Random Forest (Boruta)")),
+        pickerInput("fs_outcome", "Outcome variable", choices = NULL),
+        pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
+        conditionalPanel(
+          condition = "input.fs_predictors.includes('leiden_cluster')",
+          pickerInput("fs_leiden_subset", "Select clusters to include",
+                      choices = NULL, multiple = TRUE)
+        ), 
+        conditionalPanel(
+          condition = "input.fs_method == 'Elastic Net'",
+          sliderInput("fs_alpha", "Alpha (0 = Ridge, 1 = Lasso)", 
+                      min = 0, max = 1, value = 0.5, step = 0.05)
+        ),
+        actionButton("run_fs", "Run Feature Selection"),
+        br(), br(),
+        conditionalPanel(
+          condition = "output.hasFSResults",
+          downloadButton("export_fs_results", "Export results as CSV")
         )
       ),
       mainPanel(
         h4("Summary Plot"),
         plotOutput("fs_plot", height = "550px"),
-        
         h4("Selected Features"),
         tableOutput("fs_results"),
-        
+        h4("Data used for Feature Selection (head)"),
+        tableOutput("fs_data_head"), 
         h4("Details"),
         verbatimTextOutput("fs_summary")
       )
@@ -911,18 +924,7 @@ server <- function(input, output, session) {
   )
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
-  rv$log <- reactiveVal(character())
-  
-  appendLog <- function(msg) {
-    old <- rv$log()
-    new <- c(old, paste0(format(Sys.time(), "%H:%M:%S"), " | ", msg))
-    if (length(new) > 200) new <- tail(new, 200)  # keep last 200 lines
-    rv$log(new)
-  }
-  
-  output$console_log <- renderText({
-    paste(rv$log(), collapse = "\n")
-  })
+  # rv$log <- reactiveVal(character())
   
   # Disable tabs at startup
   # observe({
@@ -1153,6 +1155,17 @@ server <- function(input, output, session) {
     if (!isTRUE(rv$data_ready) && !identical(input$main_tab, "Home")) {
       updateNavbarPage(session, "main_tab", selected = "Home")
     }
+  })
+  
+  get_leiden_clusters <- function() colnames(rv$clusters$abundance)
+  
+  # keep choices in sync with data
+  observe({
+    updatePickerInput(
+      session, "fs_leiden_subset",
+      choices = get_leiden_clusters(),
+      selected = NULL
+    )
   })
   
   # UI-facing flag for conditionalPanel (no nested reactive)
@@ -2219,68 +2232,69 @@ server <- function(input, output, session) {
   run_fs <- eventReactive(input$run_fs, {
     req(rv$meta_cell, rv$clusters$abundance, input$fs_outcome, input$fs_predictors)
     
-    # Align metadata and abundance
-    merged <- align_metadata_abundance(rv$meta_cell, rv$clusters$abundance)
+    # Metadata predictors (exclude the placeholder "leiden_cluster")
+    pred_meta <- setdiff(intersect(input$fs_predictors, colnames(rv$meta_cell)), "leiden_cluster")
     
-    # Drop NA outcomes
-    merged <- merged[!is.na(merged[[input$fs_outcome]]), ]
+    # Cluster predictors
+    all_clusters <- colnames(rv$clusters$abundance)
+    if ("leiden_cluster" %in% input$fs_predictors) {
+      if (!is.null(input$fs_leiden_subset) && length(input$fs_leiden_subset) > 0) {
+        cluster_predictors <- intersect(input$fs_leiden_subset, all_clusters)
+      } else {
+        cluster_predictors <- all_clusters
+      }
+    } else {
+      cluster_predictors <- character(0)
+    }
     
-    # Outcome
-    y_raw <- merged[[input$fs_outcome]]
-    
-    # Predictors
-    pred_meta <- intersect(input$fs_predictors, colnames(merged))
-    if (length(pred_meta) == 0) {
+    predictors_final <- c(pred_meta, cluster_predictors)
+    if (length(predictors_final) == 0) {
       showNotification("Select at least one predictor.", type = "error")
       return(NULL)
     }
-    X_raw <- merged[, pred_meta, drop = FALSE]
     
-    # Sample counts
-    n_before <- length(y_raw)
+    # Subset metadata and abundance before merge
+    meta_unique <- rv$meta_cell %>%
+      dplyr::distinct(patient_ID, .keep_all = TRUE) %>%
+      dplyr::select(patient_ID, input$fs_outcome, dplyr::all_of(pred_meta))
+    abund_sub <- rv$clusters$abundance[, cluster_predictors, drop = FALSE]
+    
+    merged <- align_metadata_abundance(meta_unique, abund_sub, notify = showNotification)
+    
+    # Filter missingness
+    merged <- merged[!is.na(merged[[input$fs_outcome]]), ]
+    y_raw <- merged[[input$fs_outcome]]
+    X_raw <- merged[, predictors_final, drop = FALSE]
+    
+    n_before <- nrow(merged)
     complete_rows <- stats::complete.cases(data.frame(X_raw, .y = y_raw))
+    dropped_ids <- merged$patient_ID[!complete_rows]
+    
     X_raw <- X_raw[complete_rows, , drop = FALSE]
     y_raw <- y_raw[complete_rows]
-    n_after <- length(y_raw)
+    
+    n_after <- sum(complete_rows)
     n_dropped <- n_before - n_after
     if (n_after < 3) {
       showNotification("Too few samples after filtering for feature selection.", type = "error")
       return(NULL)
     }
     
-    # Outcome coercion
-    y <- y_raw
-    if (is.character(y)) y <- factor(y)
+    y <- if (is.character(y_raw)) factor(y_raw) else y_raw
     
-    # User controls
     method <- input$fs_method %||% "Elastic Net"
     tolerance <- 1e-4
     seed_val <- input$fs_seed %||% 123
     reps <- input$fs_reps %||% 1
     boruta_maxruns <- input$fs_maxruns %||% 500
+    set.seed(seed_val)
     
-    quick_flag <- FALSE
-    
-    # Override with Quick Run defaults if enabled
-    if (isTRUE(input$fs_quickrun)) {
-      quick_flag <- TRUE
-      if (method == "Random Forest (Boruta)") {
-        reps <- 1
-        boruta_maxruns <- 200
-      } else if (method %in% c("Ridge Regression", "Elastic Net")) {
-        reps <- 1
-        nfolds_val <- 3   # fewer folds for speed
-      }
-    }
-    
-    # Helper: clean dummy names
     clean_dummy_names <- function(nms) {
       gsub(pattern = "leiden_cluster", replacement = "leiden_cluster:", x = nms)
     }
     
     if (method == "Random Forest (Boruta)") {
       all_imp <- list()
-      bor_models <- list()
       for (r in seq_len(reps)) {
         set.seed(seed_val + r - 1)
         X_boruta <- model.matrix(~ . - 1, data = X_raw)
@@ -2295,34 +2309,21 @@ server <- function(input, output, session) {
         imp <- Boruta::attStats(bor)
         imp$meanImp[!is.finite(imp$meanImp)] <- 0
         all_imp[[r]] <- imp
-        bor_models[[r]] <- bor
       }
-      
-      # Average importance across runs
       merged_imp <- Reduce(function(a, b) {
         common <- intersect(rownames(a), rownames(b))
         a[common, "meanImp"] <- (a[common, "meanImp"] + b[common, "meanImp"]) / 2
         a
       }, all_imp)
-      
-      # Consensus vote for decision
-      decisions <- lapply(all_imp, function(df) df$decision)
-      decisions_mat <- do.call(cbind, decisions)
-      consensus_decision <- apply(decisions_mat, 1, function(x) {
-        tab <- table(x)
-        names(tab)[which.max(tab)]
-      })
-      
       merged_imp <- merged_imp[abs(merged_imp$meanImp) >= tolerance, , drop = FALSE]
       
+      sel <- rownames(merged_imp)[merged_imp$decision %in% c("Confirmed", "Tentative")]
       res_df <- data.frame(
         Feature = rownames(merged_imp),
         ImportanceMean = merged_imp$meanImp,
-        Decision = consensus_decision[rownames(merged_imp)],
+        Decision = merged_imp$decision,
         stringsAsFactors = FALSE
       )
-      
-      sel <- res_df$Feature[res_df$Decision %in% c("Confirmed", "Tentative")]
       
       return(list(
         method = "Boruta",
@@ -2331,17 +2332,14 @@ server <- function(input, output, session) {
         outcome = y,
         predictors = colnames(X_raw),
         tolerance = tolerance,
-        summary = list(
-          n_before = n_before,
-          n_after = n_after,
-          n_dropped = n_dropped,
-          model = bor_models[[1]],
-          quick_run = quick_flag
-        )
+        details = list(samples_before = n_before,
+                       samples_after = n_after,
+                       samples_dropped = n_dropped,
+                       dropped_ids = dropped_ids),
+        merged = merged
       ))
     }
     
-    # glmnet-based methods
     family <- if (is.factor(y)) {
       if (nlevels(y) == 2) "binomial" else "multinomial"
     } else {
@@ -2352,14 +2350,19 @@ server <- function(input, output, session) {
     colnames(Xmat) <- clean_dummy_names(colnames(Xmat))
     storage.mode(Xmat) <- "double"
     
+    added_dummy <- FALSE
+    if (ncol(Xmat) == 1) {
+      Xmat <- cbind(Xmat, `__DUMMY__` = 0)
+      added_dummy <- TRUE
+    }
+    
     alpha_val <- if (method == "Ridge Regression") 0 else (input$fs_alpha %||% 0.5)
     nfolds_val <- input$fs_nfolds %||% 5
     if (nfolds_val > n_after) nfolds_val <- max(3, floor(n_after / 2))
     
     coef_list <- list()
-    cv_models <- list()
     for (r in seq_len(reps)) {
-      set.seed(seed_val + r + 1)
+      set.seed(seed_val + r - 1)
       cvfit <- glmnet::cv.glmnet(
         x = Xmat, y = y, family = family,
         alpha = alpha_val, nfolds = nfolds_val
@@ -2371,14 +2374,15 @@ server <- function(input, output, session) {
           data.frame(Feature = rownames(cm), Class = cls, Coef = as.numeric(cm[, 1]), stringsAsFactors = FALSE)
         }))
         coef_df <- coef_df[coef_df$Feature != "(Intercept)", , drop = FALSE]
+        if (added_dummy) coef_df <- coef_df[coef_df$Feature != "__DUMMY__", , drop = FALSE]
         coef_list[[r]] <- coef_df
       } else {
         cm <- as.matrix(coef_obj)
         coef_df <- data.frame(Feature = rownames(cm), Coef = as.numeric(cm[, 1]), stringsAsFactors = FALSE)
         coef_df <- coef_df[coef_df$Feature != "(Intercept)", , drop = FALSE]
+        if (added_dummy) coef_df <- coef_df[coef_df$Feature != "__DUMMY__", , drop = FALSE]
         coef_list[[r]] <- coef_df
       }
-      cv_models[[r]] <- cvfit
     }
     
     if (family == "multinomial") {
@@ -2407,88 +2411,49 @@ server <- function(input, output, session) {
       outcome = y,
       predictors = colnames(Xmat),
       tolerance = tolerance,
-      summary = list(
-        n_before = n_before,
-        n_after = n_after,
-        n_dropped = n_dropped,
-        model = cv_models[[1]],
-        quick_run = quick_flag
-      )
+      details = list(samples_before = n_before,
+                     samples_after = n_after,
+                     samples_dropped = n_dropped,
+                     dropped_ids = dropped_ids),
+      merged = merged
     ))
   })
   
-  observeEvent(input$run_fs, {
-    rv$log(character())  # clear log
-    appendLog("Starting feature selection...")
+  output$fs_data_head <- renderTable({
+    res <- run_fs(); req(res)
+    head(res$merged, 10)
+  }, sanitize.text.function = function(x) x)
+  
+  output$fs_results <- renderTable({
+    res <- run_fs()
+    req(res)
     
-    withCallingHandlers(
-      {
-        # --- Capture user inputs ---
-        method <- input$fs_method %||% "Elastic Net"
-        reps <- input$fs_reps %||% 1
-        boruta_maxruns <- input$fs_maxruns %||% 500
-        nfolds_val <- input$fs_nfolds %||% 5
-        quick_flag <- FALSE
-        
-        # --- Quick Run overrides ---
-        if (isTRUE(input$fs_quickrun)) {
-          quick_flag <- TRUE
-          if (method == "Random Forest (Boruta)") {
-            reps <- 1
-            boruta_maxruns <- 200
-            appendLog("Running Boruta in QUICK RUN mode (1 repetition, 200 maxRuns).")
-          } else if (method %in% c("Ridge Regression", "Elastic Net")) {
-            reps <- 1
-            nfolds_val <- 3
-            appendLog("Running Elastic Net/Ridge in QUICK RUN mode (1 repetition, 3-fold CV).")
-          }
-        } else {
-          if (method == "Random Forest (Boruta)") {
-            appendLog(paste("Running Boruta with", reps, "repetitions and", boruta_maxruns, "maxRuns each."))
-          } else {
-            appendLog(paste("Running", method, "with", reps, "repetitions and", nfolds_val, "fold CV."))
-          }
-        }
-        
-        # --- Run feature selection ---
-        res <- run_fs()
-        # Ensure the quick_run flag is stored in the summary
-        if (!is.null(res$summary)) {
-          res$summary$quick_run <- quick_flag
-        }
-        rv$fs_result <- res
-      },
-      message = function(m) {
-        appendLog(conditionMessage(m))
-        invokeRestart("muffleMessage")
-      },
-      warning = function(w) {
-        appendLog(paste("Warning:", conditionMessage(w)))
-        invokeRestart("muffleWarning")
-      },
-      error = function(e) {
-        appendLog(paste("Error:", conditionMessage(e)))
-        stop(e)
-      }
-    )
+    # Columns to hide in the UI but keep in CSV
+    hide_cols <- c("Method", "Outcome", "Alpha")
     
-    # --- Final log message with run type ---
-    if (isTRUE(rv$fs_result$summary$quick_run)) {
-      appendLog("Finished feature selection (Quick Run).")
-    } else {
-      appendLog("Finished feature selection (Full Run).")
-    }
-  })
+    # Only show the other columns in the UI table
+    display_df <- res$results[, setdiff(names(res$results), hide_cols), drop = FALSE]
+    
+    display_df
+  }, sanitize.text.function = function(x) x)
   
   output$fs_plot <- renderPlot({
-    # res <- run_fs(); req(res)
-    res <- rv$fs_result; req(res)
+    res <- run_fs(); req(res)
     tol <- res$tolerance
     
     if (identical(res$method, "Boruta")) {
-      # --- Boruta importance plot with consensus decision ---
+      # --- Boruta importance plot ---
       df <- res$results
       df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+      
+      if (nrow(df) == 0) {
+        plot.new()
+        text(0.5, 0.5,
+             "No Boruta features pass the tolerance threshold.\nNothing to plot.",
+             cex = 1.1)
+        return()
+      }
+      
       df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
       top_n <- head(df, 30)
       
@@ -2496,25 +2461,27 @@ server <- function(input, output, session) {
                       ggplot2::aes(x = reorder(Feature, ImportanceMean),
                                    y = ImportanceMean,
                                    fill = Decision)) +
-        ggplot2::geom_col(colour = "black", linewidth = 0.3) +
+        ggplot2::geom_col(color = 'black', lwd = 0.4) +
         ggplot2::coord_flip() +
-        ggplot2::labs(
-          title = "Boruta Feature Importance (Consensus Decision)",
-          subtitle = if (isTRUE(res$summary$quick_run)) "Quick Run (exploratory)" else NULL,
-          x = "Feature",
-          y = "Mean importance",
-          fill = "Consensus Decision"
-        ) +
-        ggplot2::scale_fill_manual(values = c(
-          "Confirmed" = "green4",
-          "Rejected"  = "red4",
-          "Tentative" = "grey40"
-        )) +
+        ggplot2::labs(title = "Boruta feature importance",
+                      x = "Feature", y = "Mean importance") +
+        ggplot2::scale_fill_manual(values = c('Confirmed' = 'green4',
+                                              'Rejected' = 'red4',
+                                              'Tentative' = 'grey40')) +
         ggplot2::theme_bw(base_size = 14)
+      
     } else {
       # --- Elastic Net / Ridge ---
       df <- res$results
       df <- df[abs(df$Coef) >= tol, , drop = FALSE]
+      
+      if (nrow(df) == 0) {
+        plot.new()
+        text(0.5, 0.5,
+             "All coefficients are zero after regularization.\nTry lowering alpha or adding predictors.",
+             cex = 1.1)
+        return()
+      }
       
       if ("Class" %in% names(df)) {
         # Multinomial: facet by Class
@@ -2531,8 +2498,8 @@ server <- function(input, output, session) {
           ggplot2::facet_wrap(~Class, scales = "free_y") +
           ggplot2::coord_flip() +
           ggplot2::labs(title = paste(res$method, "coefficients (lambda.min)"),
-                        x = "Feature", y = "Coefficient") + 
-          scale_fill_gradient(low = 'blue3', high = 'red3') + 
+                        x = "Feature", y = "Coefficient") +
+          ggplot2::scale_fill_gradient(low = 'blue3', high = 'red3') +
           ggplot2::theme_bw(base_size = 14)
         
       } else {
@@ -2547,111 +2514,128 @@ server <- function(input, output, session) {
           ggplot2::geom_col(color = 'black', lwd = 0.4) +
           ggplot2::coord_flip() +
           ggplot2::labs(title = paste(res$method, "coefficients (lambda.min)"),
-                        x = "Feature", y = "Coefficient") + 
-          scale_fill_gradient(low = 'blue3', high = 'red3') + 
+                        x = "Feature", y = "Coefficient") +
+          ggplot2::scale_fill_gradient(low = 'blue3', high = 'red3') +
           ggplot2::theme_bw(base_size = 14)
       }
     }
   })
   
   output$fs_results <- renderTable({
-    # res <- run_fs(); req(res)
-    res <- rv$fs_result; req(res)
+    res <- run_fs(); req(res)
     df <- res$results
     tol <- res$tolerance
     
     if (identical(res$method, "Boruta")) {
       df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
-      df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
+      df <- df[order(df$ImportanceMean, decreasing = TRUE), , drop = FALSE]
+      
+      if (nrow(df) == 0) {
+        return(data.frame(Message = "No Boruta features passed the tolerance threshold."))
+      }
+      
     } else {
       if ("Coef" %in% names(df)) {
         df <- df[abs(df$Coef) >= tol, , drop = FALSE]
-        df <- df[order(df$Coef, decreasing = TRUE), ]
+        df <- df[order(df$Coef, decreasing = TRUE), , drop = FALSE]
+        
+        if (nrow(df) == 0) {
+          return(data.frame(Message = "All coefficients shrank to zero after regularization."))
+        }
       }
     }
+    
     df
   }, sanitize.text.function = function(x) x)
   
-  # output$fs_summary <- renderPrint({
-  #   res <- run_fs(); req(res)
-  #   det <- res$details %||% list(samples_before = NA, samples_after = NA, samples_dropped = NA)
-  #   tol <- res$tolerance
-  #   
-  #   cat("Samples before filtering:", det$samples_before, "\n")
-  #   cat("Samples after filtering:", det$samples_after, "\n")
-  #   cat("Samples dropped:", det$samples_dropped, "\n\n")
-  #   
-  #   cat("Selected features (top):\n")
-  #   if (identical(res$method, "Boruta")) {
-  #     df <- res$results
-  #     df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
-  #     df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
-  #     print(utils::head(df$Feature, 20))
-  #   } else {
-  #     df <- res$results
-  #     if ("Coef" %in% names(df)) {
-  #       df <- df[abs(df$Coef) >= tol, , drop = FALSE]
-  #       df <- df[order(df$Coef, decreasing = TRUE), ]
-  #       print(utils::head(df$Feature, 20))
-  #     }
-  #   }
-  # })
-  
   output$fs_summary <- renderPrint({
-    res <- rv$fs_result; req(res)
-    sumry <- res$summary
-    tol <- res$tolerance
+    res <- run_fs(); req(res)
     
-    # --- Quick Run indicator ---
-    if (isTRUE(sumry$quick_run)) {
-      cat("*** NOTE: Results obtained in QUICK RUN (exploratory) mode ***\n\n")
+    det <- res$details %||% list(
+      samples_before = NA,
+      samples_after = NA,
+      samples_dropped = NA,
+      dropped_ids = character(0)
+    )
+    
+    cat("Samples before filtering:", det$samples_before, "\n")
+    cat("Samples after filtering:", det$samples_after, "\n")
+    cat("Samples dropped:", det$samples_dropped, "\n\n")
+    
+    if (!is.null(det$dropped_ids) && length(det$dropped_ids) > 0) {
+      cat("Dropped patient_IDs:\n")
+      print(det$dropped_ids)
+      cat("\n")
     }
-    
-    cat("Samples before filtering:", sumry$n_before, "\n")
-    cat("Samples after filtering:", sumry$n_after, "\n")
-    cat("Samples dropped:", sumry$n_dropped, "\n\n")
     
     cat("Selected features (top):\n")
     if (identical(res$method, "Boruta")) {
       df <- res$results
-      df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
-      df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
-      print(utils::head(df$Feature, 20))
+      df <- df[order(df$ImportanceMean, decreasing = TRUE), , drop = FALSE]
+      if (nrow(df) == 0) {
+        cat("No Boruta features passed the tolerance threshold.\n")
+      } else {
+        print(utils::head(df$Feature, 20))
+      }
     } else {
       df <- res$results
       if ("Coef" %in% names(df)) {
-        df <- df[abs(df$Coef) >= tol, , drop = FALSE]
-        df <- df[order(df$Coef, decreasing = TRUE), ]
-        print(utils::head(df$Feature, 20))
+        df <- df[order(df$Coef, decreasing = TRUE), , drop = FALSE]
+        if (nrow(df) == 0) {
+          cat("All coefficients shrank to zero after regularization.\n")
+        } else {
+          print(utils::head(df$Feature, 20))
+        }
       }
     }
-    
-    cat("\nModel object:\n")
-    print(sumry$model)
   })
   
   output$hasFSResults <- reactive({
-    # !is.null(run_fs())
-    !is.null(rv$fs_result)
+    res <- run_fs()
+    !is.null(res) && !is.null(res$results) && nrow(res$results) > 0
   })
   outputOptions(output, "hasFSResults", suspendWhenHidden = FALSE)
   
   output$export_fs_results <- downloadHandler(
     filename = function() {
-      info <- rv$last_fs_info
-      res <- rv$fs_result
-      if (is.null(info) || is.null(res)) {
-        return(paste0("feature_selection_", Sys.Date(), ".csv"))
-      }
-      base <- paste0(info$method, "_feature_selection_with_outcome_", info$outcome)
-      if (isTRUE(res$summary$quick_run)) {
-        base <- paste0(base, "_quickrun")
-      }
-      paste0(base, ".csv")
+      res <- run_fs(); req(res)
+      method <- res$method %||% "FeatureSelection"
+      outcome <- input$fs_outcome %||% "outcome"
+      paste0(method, "_feature_selection_with_outcome_", outcome, "_", Sys.Date(), ".csv")
     },
     content = function(file) {
-      res <- rv$fs_result; req(res)
-      utils::write.csv(res$results, file, row.names = FALSE)
+      res <- run_fs(); req(res)
+      df <- res$results
+      tol <- res$tolerance
+      
+      if (identical(res$method, "Boruta")) {
+        df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+        df <- df[order(df$ImportanceMean, decreasing = TRUE), , drop = FALSE]
+        
+        if (nrow(df) == 0) {
+          utils::write.csv(
+            data.frame(Message = "No Boruta features passed the tolerance threshold."),
+            file, row.names = FALSE
+          )
+          return()
+        }
+        
+      } else {
+        if ("Coef" %in% names(df)) {
+          df <- df[abs(df$Coef) >= tol, , drop = FALSE]
+          df <- df[order(df$Coef, decreasing = TRUE), , drop = FALSE]
+          
+          if (nrow(df) == 0) {
+            utils::write.csv(
+              data.frame(Message = "All coefficients shrank to zero after regularization."),
+              file, row.names = FALSE
+            )
+            return()
+          }
+        }
+      }
+      
+      utils::write.csv(df, file, row.names = FALSE)
     },
     contentType = "text/csv"
   )
@@ -3014,3 +2998,4 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
