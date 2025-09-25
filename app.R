@@ -27,6 +27,7 @@ suppressPackageStartupMessages({
     library(rsample) # vfold_cv(), initial_split (if you want tidy resampling)
     library(boot) # bootstrapping CIs for AUC
     library(rlang) # tidy evaluation for !!!syms
+    library(randomForest)
   })
 })
 
@@ -47,14 +48,57 @@ pct_clip <- function(x, p = c(0.01, 0.99)) {
 #   rv$log(new)
 # }
 
-align_metadata_abundance <- function(metadata, abundance) {
-  # Extract patient_ID from abundance rownames ("patientID_runDate.fcs" is the expected format; the pattern "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$" will always match the _runDate.fcs part)
-  patient_ids <- gsub(pattern = "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$", replacement = "", x = rownames(abundance))
+resetResults <- function(resultReactive, cacheReactive = NULL) {
+  resultReactive(NULL)
+  if (!is.null(cacheReactive)) cacheReactive(NULL)
+}
+
+align_metadata_abundance <- function(metadata, abundance, notify = NULL) {
+  # Extract patient_ID from abundance rownames
+  patient_ids <- gsub(
+    pattern = "_[0-9]+\\-[A-Za-z]+\\-[0-9]+.*$",
+    replacement = "",
+    x = rownames(abundance)
+  )
+  
   abund_df <- as.data.frame(abundance)
   abund_df$patient_ID <- patient_ids
   
-  # Merge with metadata
+  # Duplicate checks
+  if (anyDuplicated(metadata$patient_ID)) {
+    msg <- "Duplicate patient_IDs found in metadata. Consider deduplicating with distinct()."
+    warning(msg)
+    if (!is.null(notify)) notify(msg, type = "warning")
+  }
+  if (anyDuplicated(abund_df$patient_ID)) {
+    msg <- "Duplicate patient_IDs found in abundance rownames. Check your input files."
+    warning(msg)
+    if (!is.null(notify)) notify(msg, type = "warning")
+  }
+  
+  # Mismatch checks
+  meta_ids <- unique(metadata$patient_ID)
+  abund_ids <- unique(abund_df$patient_ID)
+  
+  missing_in_abund <- setdiff(meta_ids, abund_ids)
+  missing_in_meta  <- setdiff(abund_ids, meta_ids)
+  
+  if (length(missing_in_abund) > 0) {
+    msg <- paste("These patient_IDs are in metadata but not in abundance:",
+                 paste(missing_in_abund, collapse = ", "))
+    warning(msg)
+    if (!is.null(notify)) notify(msg, type = "warning")
+  }
+  if (length(missing_in_meta) > 0) {
+    msg <- paste("These patient_IDs are in abundance but not in metadata:",
+                 paste(missing_in_meta, collapse = ", "))
+    warning(msg)
+    if (!is.null(notify)) notify(msg, type = "warning")
+  }
+  
+  # Merge with metadata (metadata is the anchor)
   merged <- dplyr::left_join(metadata, abund_df, by = "patient_ID")
+  
   return(merged)
 }
 
@@ -640,20 +684,20 @@ ui <- navbarPage(
     "))
   ),
   tabPanel("Home",
-    sidebarLayout(
-      sidebarPanel(
-        fileInput("rdata_upload", "Upload .RData (FCSimple analysis object)", accept = ".RData"),
-        numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
-        helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled after upload. This is done to speed up UMAP and tSNE facet plotting."), 
-        width = 3
-      ),
-      mainPanel(
-        h3("Dataset overview"),
-        verbatimTextOutput("ds_summary"),
-        h3("Available metadata"),
-        tableOutput("meta_overview")
-      )
-    )
+           sidebarLayout(
+             sidebarPanel(
+               fileInput("rdata_upload", "Upload .RData (FCSimple analysis object)", accept = ".RData"),
+               numericInput("max_cells_upload", "Max cells to read in", value = 300000, min = 1000, step = 1000),
+               helpText("If the uploaded dataset has more cells than this number, it will be randomly downsampled after upload. This is done to speed up UMAP and tSNE facet plotting."), 
+               width = 3
+             ),
+             mainPanel(
+               h3("Dataset overview"),
+               verbatimTextOutput("ds_summary"),
+               h3("Available metadata"),
+               tableOutput("meta_overview")
+             )
+           )
   ),
   
   tabPanel("UMAP", EmbeddingUI("umap", title = "UMAP")),
@@ -674,164 +718,161 @@ ui <- navbarPage(
       column(9, plotOutput("cluster_heatmap", height = "700px"))
     )
   ),
-  tabPanel(
-    "Testing",
-    h4("Abundance testing"),
-    fluidRow(
-      column(
-        3,
-        conditionalPanel(
-          condition = "output.hasClusterMap",
-          pickerInput("test_entity", "Entity",
-                      choices = c("Clusters", "Celltypes"),
-                      selected = "Clusters")
-        ),
-        pickerInput("group_var", "Categorical metadata", choices = NULL,
-                    options = list(`none-selected-text` = "None")),
-        pickerInput("cont_var", "Continuous metadata", choices = NULL,
-                    options = list(`none-selected-text` = "None")),
-        radioButtons("test_type", "Test",
-                     choices = c("Wilcoxon (2-group)",
-                                 "Kruskal–Wallis (multi-group)",
-                                 "Spearman (continuous)")),
-        selectInput("p_adj_method", "P‑value adjustment method",
-                    choices = c("BH", "bonferroni", "BY", "fdr"),
-                    selected = "BH"),
-        actionButton("run_test", "Run tests"),
-        br(), br(),
-        conditionalPanel(
-          condition = "output.hasResults",
-          downloadButton("export_results", "Export results as CSV")
-        )
-      ),
-      column(9, tableOutput("test_table"))
-    )
+  tabPanel("Testing",
+           h4("Test Settings"),
+           fluidRow(
+             column(
+               3,
+               conditionalPanel(
+                 condition = "output.hasClusterMap",
+                 pickerInput("test_entity", "Entity", choices = c("Clusters", "Celltypes"), selected = "Clusters")
+               ),
+               pickerInput("group_var", "Categorical metadata", choices = NULL, options = list(`none-selected-text` = "None")),
+               pickerInput("cont_var", "Continuous metadata", choices = NULL, options = list(`none-selected-text` = "None")),
+               radioButtons("test_type", "Test",
+                            choices = c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)", "Spearman (continuous)")),
+               selectInput("p_adj_method", "P‑value adjustment method",
+                           choices = c("BH", "bonferroni", "BY", "fdr"), selected = "BH"),
+               actionButton("run_test", "Run tests"),
+               br(), br(),
+               conditionalPanel(
+                 condition = "output.hasResults",
+                 downloadButton("export_results", "Export results as CSV"),
+                 br(), br(),
+                 actionButton("reset_test", "Clear Results")
+               )
+             ),
+             column(
+               9,
+               conditionalPanel(
+                 condition = "output.hasResults",
+                 h4("Test Results"),
+                 tableOutput("test_table")
+               ), 
+               textOutput("test_cleared_msg")
+             )
+           )
   ), 
-  tabPanel(
-    "Categorical",
-    h4("Categorical plotting"),
-    fluidRow(
-      column(
-        3,
-        conditionalPanel(
-          condition = "output.hasClusterMap",
-          pickerInput("cat_entity", "Entity",
-                      choices = c("Clusters", "Celltypes"),
-                      selected = "Clusters")
-        ),
-        # If no cluster map, show a disabled picker fixed to Clusters
-        conditionalPanel(
-          condition = "!output.hasClusterMap",
-          pickerInput("cat_entity", "Entity",
-                      choices = c("Clusters"),
-                      selected = "Clusters")
-        ),
-        pickerInput("cat_group_var", "Categorical metadata",
-                    choices = NULL,
-                    options = list(`none-selected-text` = "None")),
-        radioButtons("cat_test_type", "Test",
-                     choices = c("Wilcoxon (2-group)",
-                                 "Kruskal–Wallis (multi-group)")),
-        selectInput("cat_p_adj_method", "P‑value adjustment method",
-                    choices = c("BH", "bonferroni", "BY", "fdr"),
-                    selected = "BH"),
-        checkboxInput("cat_use_adj_p", "Plot adjusted pvalues", value = TRUE),
-        selectInput("cat_max_facets", "Facet columns",
-                    choices = 2:6, selected = 4), 
-        selectInput("cat_plot_type", "Plot type",
-                    choices = c("Boxplot" = "box", "Violin" = "violin"), selected = "box"),
-        radioButtons("cat_points", "Show data points", 
-                     choices = c("Draw" = "draw", "Draw with jitter" = "jitter", "Do not draw" = "none"), selected = "draw"), 
-        actionButton("cat_populate_colors", "Populate colors for selected group variable"), 
-        uiOutput("cat_color_pickers_ui"),  # dynamic UI container for per-group color pickers
-        br(), 
-        actionButton("generate_cat_plots", "Generate plots"), 
-        br(), br(),
-        downloadButton("export_cat_pdf", "Export boxplots as PDF")
-      ),
-      column(
-        9,
-        column(9, plotOutput("categorical_plot"))
-      )
-    )
+  tabPanel("Categorical",
+           h4("Plot Settings"),
+           fluidRow(
+             column(
+               3,
+               pickerInput("cat_entity", "Entity", choices = c("Clusters", "Celltypes"), selected = "Clusters"),
+               pickerInput("cat_group_var", "Categorical metadata", choices = NULL, options = list(`none-selected-text` = "None")),
+               radioButtons("cat_test_type", "Test", choices = c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")),
+               selectInput("cat_p_adj_method", "P‑value adjustment method",
+                           choices = c("BH", "bonferroni", "BY", "fdr"), selected = "BH"),
+               checkboxInput("cat_use_adj_p", "Plot adjusted pvalues", value = TRUE),
+               selectInput("cat_max_facets", "Facet columns", choices = 2:6, selected = 4),
+               selectInput("cat_plot_type", "Plot type", choices = c("Boxplot" = "box", "Violin" = "violin"), selected = "box"),
+               radioButtons("cat_points", "Show data points",
+                            choices = c("Draw" = "draw", "Draw with jitter" = "jitter", "Do not draw" = "none"),
+                            selected = "draw"),
+               br(), 
+               actionButton("cat_populate_colors", "Populate colors for selected group variable"),
+               uiOutput("cat_color_pickers_ui"),
+               br(), 
+               actionButton("generate_cat_plots", "Generate plots"),
+               br(), br(),
+               conditionalPanel(
+                 condition = "output.hasCatResults",
+                 downloadButton("export_cat_pdf", "Export boxplots as PDF"),
+                 br(), br(),
+                 actionButton("reset_cat", "Clear Results")
+               )
+             ),
+             column(
+               9,
+               conditionalPanel(
+                 condition = "output.hasCatResults",
+                 h4("Categorical Plots"),
+                 plotOutput("categorical_plot")
+               ), 
+               textOutput("cat_cleared_msg")
+             )
+           )
   ), 
-  tabPanel(
-    "Continuous",
-    h4("Continuous metadata scatter plots"),
-    fluidRow(
-      column(
-        3,
-        conditionalPanel(
-          condition = "output.hasClusterMap",
-          pickerInput("cont_entity", "Entity",
-                      choices = c("Clusters", "Celltypes"),
-                      selected = "Clusters")
-        ),
-        conditionalPanel(
-          condition = "!output.hasClusterMap",
-          pickerInput("cont_entity", "Entity",
-                      choices = c("Clusters"),
-                      selected = "Clusters")
-        ),
-        pickerInput("cont_group_var", "Continuous metadata",
-                    choices = NULL,
-                    options = list(`none-selected-text` = "None")),
-        selectInput("cont_p_adj_method", "P‑value adjustment method",
-                    choices = c("BH", "bonferroni", "BY", "fdr"),
-                    selected = "BH"),
-        checkboxInput("cont_use_adj_p", "Plot adjusted pvalues", value = TRUE),
-        checkboxInput("cont_transpose", "Transpose axes", value = FALSE), 
-        selectInput("cont_max_facets", "Facet columns", choices = 2:6, selected = 4),
-        actionButton("generate_cont_plots", "Generate plots"),
-        br(), br(),
-        downloadButton("export_cont_pdf", "Export scatter plots as PDF")
-      ),
-      column(
-        9,
-        column(9, plotOutput("continuous_plot"))
-      )
-    )
+  tabPanel("Continuous",
+           h4("Plot Settings"),
+           fluidRow(
+             column(
+               3,
+               pickerInput("cont_entity", "Entity", choices = c("Clusters", "Celltypes"), selected = "Clusters"),
+               pickerInput("cont_group_var", "Continuous metadata", choices = NULL, options = list(`none-selected-text` = "None")),
+               selectInput("cont_p_adj_method", "P‑value adjustment method",
+                           choices = c("BH", "bonferroni", "BY", "fdr"), selected = "BH"),
+               checkboxInput("cont_use_adj_p", "Plot adjusted pvalues", value = TRUE),
+               checkboxInput("cont_transpose", "Transpose axes", value = FALSE),
+               selectInput("cont_max_facets", "Facet columns", choices = 2:6, selected = 4),
+               actionButton("generate_cont_plots", "Generate plots"),
+               br(), br(),
+               conditionalPanel(
+                 condition = "output.hasContResults",
+                 downloadButton("export_cont_pdf", "Export scatter plots as PDF"),
+                 br(), br(),
+                 actionButton("reset_cont", "Clear Results")
+               )
+             ),
+             column(
+               9,
+               conditionalPanel(
+                 condition = "output.hasContResults",
+                 h4("Continuous Plots"),
+                 plotOutput("continuous_plot")
+               ), 
+               textOutput("cont_cleared_msg")
+             )
+           )
   ), 
-  tabPanel(
-    "Feature Selection",
-    sidebarLayout(
-      sidebarPanel(
-        pickerInput("fs_method", "Method", 
-                    choices = c("Ridge Regression", "Elastic Net", "Random Forest (Boruta)")),
-        pickerInput("fs_outcome", "Outcome variable", choices = NULL),
-        pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
-        conditionalPanel(
-          condition = "input.fs_predictors.includes('leiden_cluster')",
-          pickerInput("fs_leiden_subset", "Select clusters to include",
-                      choices = NULL, multiple = TRUE)
-        ), 
-        conditionalPanel(
-          condition = "input.fs_method == 'Elastic Net'",
-          sliderInput("fs_alpha", "Alpha (0 = Ridge, 1 = Lasso)", 
-                      min = 0, max = 1, value = 0.5, step = 0.05)
-        ),
-        actionButton("run_fs", "Run Feature Selection"),
-        br(), br(),
-        conditionalPanel(
-          condition = "output.hasFSResults",
-          downloadButton("export_fs_results", "Export results as CSV")
-        )
-      ),
-      mainPanel(
-        h4("Summary Plot"),
-        plotOutput("fs_plot", height = "550px"),
-        
-        h4("Selected Features"),
-        tableOutput("fs_results"),
-        
-        h4("Details"),
-        verbatimTextOutput("fs_summary")
-      )
-    )
+  tabPanel("Feature Selection",
+           h4("Model Settings"),
+           fluidRow(
+             column(
+               3,
+               pickerInput("fs_method", "Method", 
+                           choices = c("Ridge Regression", "Elastic Net", "Random Forest (Boruta)")),
+               pickerInput("fs_outcome", "Outcome variable", choices = NULL),
+               pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
+               conditionalPanel(
+                 condition = "input.fs_predictors.includes('leiden_cluster')",
+                 pickerInput("fs_leiden_subset", "Select clusters to include",
+                             choices = NULL, multiple = TRUE)
+               ), 
+               conditionalPanel(
+                 condition = "input.fs_method == 'Elastic Net'",
+                 sliderInput("fs_alpha", "Alpha (0 = Ridge, 1 = Lasso)", 
+                             min = 0, max = 1, value = 0.5, step = 0.05)
+               ),
+               actionButton("run_fs", "Run Feature Selection"),
+               br(), br(),
+               conditionalPanel(
+                 condition = "output.hasFSResults",
+                 downloadButton("export_fs_results", "Export results as CSV"),
+                 br(), br(),
+                 actionButton("reset_fs", "Clear Results")
+               )
+             ),
+             column(
+               9,
+               conditionalPanel(
+                 condition = "output.hasFSResults",
+                 h4("Summary Plot"),
+                 plotOutput("fs_plot", height = "550px"),
+                 h4("Selected Features"),
+                 tableOutput("fs_results"), 
+                 h4("Details"),
+                 verbatimTextOutput("fs_summary")
+               ),
+               textOutput("fs_cleared_msg")
+             )
+           )
   ), 
-  tabPanel("Logistic Modeling",
-           sidebarLayout(
-             sidebarPanel(
+  tabPanel("Classification",
+           h4("Model Settings"),
+           fluidRow(
+             column(
+               3,
                pickerInput("lm_outcome", "Outcome variable", choices = NULL),
                pickerInput("lm_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
                conditionalPanel(
@@ -856,13 +897,35 @@ ui <- navbarPage(
                  condition = "input.lm_validation == 'k-fold CV'",
                  numericInput("lm_k", "Number of folds", value = 5, min = 2, max = 20)
                ),
-               actionButton("run_lm", "Run Model")
+               actionButton("run_lm", "Run Model"),
+               br(), br(),
+               conditionalPanel(
+                 condition = "output.hasLMResults",
+                 downloadButton("export_lm_results", "Download Logistic Model Results"),
+                 br(), br(),
+                 actionButton("reset_lm", "Clear Results")
+               )
              ),
-             mainPanel(
-               h4("ROC Curves"),
-               plotOutput("lm_roc_plot", height = "500px"),
-               h4("Performance Summary"),
-               tableOutput("lm_perf_table")
+             column(
+               9,
+               conditionalPanel(
+                 condition = "output.hasLMResults",
+                 fluidRow(
+                   column(
+                     width = 6,
+                     h4("Model Summary"),
+                     verbatimTextOutput("lm_summary"),
+                     h4("Performance Metrics"),
+                     tableOutput("lm_perf_table")
+                   ),
+                   column(
+                     width = 6,
+                     h4("ROC Curve"),
+                     plotOutput("lm_roc_plot", height = "500px")
+                   )
+                 )
+               ),
+               textOutput("lm_cleared_msg")
              )
            )
   )
@@ -886,6 +949,11 @@ server <- function(input, output, session) {
   )
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
+  test_results_rv <- reactiveVal(NULL)
+  cat_state <- reactiveVal(NULL)
+  cont_state <- reactiveVal(NULL)
+  fs_state <- reactiveVal(NULL)
+  lm_state <- reactiveVal(NULL)
   # rv$log <- reactiveVal(character())
   
   # Disable tabs at startup
@@ -902,7 +970,6 @@ server <- function(input, output, session) {
   # Upload RData and initialize datasets immediately (no mapping button)
   observeEvent(input$rdata_upload, {
     session$sendCustomMessage("enableTabs", FALSE)  # lock tabs during load
-    
     req(input$rdata_upload)
     
     # Load all objects from the uploaded .RData
@@ -952,10 +1019,10 @@ server <- function(input, output, session) {
       if (!is.null(obj$leiden$clusters) && length(obj$leiden$clusters) == n_cells) {
         obj$leiden$clusters <- obj$leiden$clusters[keep_idx]
       }
-      if (hasUMAP(obj) && nrow(obj$umap$coordinates) == n_cells) {
+      if (!is.null(obj$umap$coordinates) && nrow(obj$umap$coordinates) == n_cells) {
         obj$umap$coordinates <- obj$umap$coordinates[keep_idx, , drop = FALSE]
       }
-      if (hasTSNE(obj) && nrow(obj$tsne$coordinates) == n_cells) {
+      if (!is.null(obj$tsne$coordinates) && nrow(obj$tsne$coordinates) == n_cells) {
         obj$tsne$coordinates <- obj$tsne$coordinates[keep_idx, , drop = FALSE]
       }
       if (!is.null(obj$run_date) && length(obj$run_date) == n_cells) {
@@ -972,7 +1039,7 @@ server <- function(input, output, session) {
     expr <- obj$data
     run_date <- obj$run_date %||% NULL
     
-    # --- Build meta_cell with robust patient_ID mapping ---
+    # --- Build meta_cell (per-cell) with robust patient_ID mapping for UMAP/tSNE tabs ---
     meta_cell <- data.frame(
       source  = as.character(obj$source),
       RunDate = if (!is.null(run_date)) run_date else NA
@@ -994,7 +1061,7 @@ server <- function(input, output, session) {
       return()
     }
     
-    # Escape any regex metacharacters in IDs, then sort by length (longest first)
+    # Escape regex metacharacters in IDs, then sort by length (longest first)
     ids_escaped <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
     ids_escaped <- ids_escaped[order(nchar(ids_escaped), decreasing = TRUE)]
     pattern <- paste0("(", paste0(ids_escaped, collapse = "|"), ")")
@@ -1023,7 +1090,6 @@ server <- function(input, output, session) {
       }
     })
     
-    # --- Post-join check for unmatched IDs ---
     unmatched <- sum(is.na(meta_cell$patient_ID))
     if (unmatched > 0) {
       showNotification(
@@ -1035,12 +1101,10 @@ server <- function(input, output, session) {
       print(utils::head(meta_cell$source[is.na(meta_cell$patient_ID)], 10))
     }
     
-    # Ensure PatientID column exists for downstream code
     if (!("PatientID" %in% names(meta_cell))) {
       meta_cell$PatientID <- meta_cell$patient_ID
     }
     
-    # Factor RunDate if present
     if ("RunDate" %in% names(meta_cell)) {
       meta_cell$RunDate <- as.factor(meta_cell$RunDate)
     }
@@ -1057,23 +1121,23 @@ server <- function(input, output, session) {
       assignments = obj$leiden$clusters,
       settings    = obj$leiden$settings %||% list()
     )
-    cluster_map <- if (hasClusterMapping(obj)) obj$cluster_mapping else NULL
+    cluster_map <- if (!is.null(obj$cluster_mapping)) obj$cluster_mapping else NULL
     
-    UMAP <- if (hasUMAP(obj)) list(coords = obj$umap$coordinates,
-                                   settings = obj$umap$settings) else NULL
-    tSNE <- if (hasTSNE(obj)) list(coords = obj$tsne$coordinates,
-                                   settings = obj$tsne$settings) else NULL
+    UMAP <- if (!is.null(obj$umap)) list(coords = obj$umap$coordinates,
+                                         settings = obj$umap$settings) else NULL
+    tSNE <- if (!is.null(obj$tsne)) list(coords = obj$tsne$coordinates,
+                                         settings = obj$tsne$settings) else NULL
     
-    cluster_heat <- if (hasHeatmap(obj)) obj$leiden_heatmap$heatmap_tile_data else NULL
-    pop_size     <- if (hasHeatmap(obj)) obj$leiden_heatmap$population_size else NULL
-    rep_used     <- if (hasHeatmap(obj)) obj$leiden_heatmap$rep_used else NA
+    cluster_heat <- if (!is.null(obj$leiden_heatmap)) obj$leiden_heatmap$heatmap_tile_data else NULL
+    pop_size     <- if (!is.null(obj$leiden_heatmap)) obj$leiden_heatmap$population_size else NULL
+    rep_used     <- if (!is.null(obj$leiden_heatmap)) obj$leiden_heatmap$rep_used else NA
     
-    # Add abundance matrix if present and well-formed
+    # --- Add per-sample abundance matrix and canonical per-sample metadata for downstream tabs ---
     if (!is.null(obj$leiden$abundance) && is.matrix(obj$leiden$abundance)) {
       clusters$abundance <- obj$leiden$abundance
+      rv$abundance_sample <- clusters$abundance
       
-      # Strongly recommended: require rownames(sources) for mapping to metadata
-      if (is.null(rownames(clusters$abundance)) || any(!nzchar(rownames(clusters$abundance)))) {
+      if (is.null(rownames(rv$abundance_sample)) || any(!nzchar(rownames(rv$abundance_sample)))) {
         showNotification(
           "leiden$abundance has missing rownames; cannot map to metadata. Please set rownames to source strings.",
           type = "error",
@@ -1082,14 +1146,25 @@ server <- function(input, output, session) {
         message("Abundance matrix rownames are missing or empty; mapping to metadata will fail.")
       } else {
         message(sprintf("Abundance matrix loaded: %d sources × %d entities",
-                        nrow(clusters$abundance), ncol(clusters$abundance)))
+                        nrow(rv$abundance_sample), ncol(rv$abundance_sample)))
       }
     } else {
-      showNotification("No leiden$abundance matrix found in upload; abundance testing will be disabled.", type = "warning")
-      message("No obj$leiden$abundance; rv$clusters$abundance will remain NULL.")
+      clusters$abundance <- NULL
+      rv$abundance_sample <- NULL
+      showNotification("No leiden$abundance matrix found in upload; abundance-based tabs will be disabled.", type = "warning")
     }
     
-    # Store in rv
+    # Canonical per-sample metadata (prefer direct sample-level object if provided)
+    # If obj already includes a per-sample metadata frame, use it; otherwise derive from metadata_unique.
+    if (!is.null(obj$metadata_sample) && is.data.frame(obj$metadata_sample) &&
+        "patient_ID" %in% colnames(obj$metadata_sample)) {
+      rv$meta_sample <- obj$metadata_sample %>%
+        dplyr::distinct(patient_ID, .keep_all = TRUE)
+    } else {
+      rv$meta_sample <- metadata_unique  # one row per patient_ID
+    }
+    
+    # Store in rv (cell-level objects preserved for UMAP/tSNE/Heatmap)
     rv$expr         <- expr
     rv$meta_cell    <- meta_cell
     rv$clusters     <- clusters
@@ -1100,14 +1175,33 @@ server <- function(input, output, session) {
     rv$pop_size     <- pop_size
     rv$rep_used     <- rep_used
     
-    rv$cluster_map <- cluster_map
-    
     message("Upload complete: expr rows=", nrow(rv$expr),
             " meta_cell rows=", nrow(rv$meta_cell),
-            " UMAP coords=", if (!is.null(rv$UMAP)) nrow(rv$UMAP$coords) else "NULL",
-            " tSNE coords=", if (!is.null(rv$tSNE)) nrow(rv$tSNE$coords) else "NULL")
+            " meta_sample rows=", nrow(rv$meta_sample),
+            " abundance_sample rows=", if (!is.null(rv$abundance_sample)) nrow(rv$abundance_sample) else 0,
+            " UMAP coords=", if (!is.null(rv$UMAP)) nrow(rv$UMAP$coords) else 0,
+            " tSNE coords=", if (!is.null(rv$tSNE)) nrow(rv$tSNE$coords) else 0)
     
     showNotification("Data loaded and initialized.", type = "message")
+    
+    # Initialize FS/LM pickers from per-sample objects
+    if (!is.null(rv$meta_sample)) {
+      meta_cols <- colnames(rv$meta_sample)
+      categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.factor(x) || is.character(x))])
+      predictor_choices <- sort(meta_cols)
+      
+      updatePickerInput(session, "fs_outcome", choices = categorical_choices, selected = NULL)
+      updatePickerInput(session, "fs_predictors", choices = c(predictor_choices, "leiden_cluster"), selected = NULL)
+      updatePickerInput(session, "fs_leiden_subset",
+                        choices = if (!is.null(rv$abundance_sample)) colnames(rv$abundance_sample) else character(0),
+                        selected = character(0))
+      
+      updatePickerInput(session, "lm_outcome", choices = categorical_choices, selected = NULL)
+      updatePickerInput(session, "lm_predictors", choices = c(predictor_choices, "leiden_cluster"), selected = NULL)
+      updatePickerInput(session, "lm_leiden_subset",
+                        choices = if (!is.null(rv$abundance_sample)) colnames(rv$abundance_sample) else character(0),
+                        selected = character(0))
+    }
     
     rv$data_ready <- TRUE
     session$sendCustomMessage("enableTabs", TRUE)
@@ -1117,6 +1211,17 @@ server <- function(input, output, session) {
     if (!isTRUE(rv$data_ready) && !identical(input$main_tab, "Home")) {
       updateNavbarPage(session, "main_tab", selected = "Home")
     }
+  })
+  
+  get_leiden_clusters <- function() colnames(rv$clusters$abundance)
+  
+  # keep choices in sync with data
+  observe({
+    updatePickerInput(
+      session, "fs_leiden_subset",
+      choices = get_leiden_clusters(),
+      selected = NULL
+    )
   })
   
   # UI-facing flag for conditionalPanel (no nested reactive)
@@ -1310,38 +1415,25 @@ server <- function(input, output, session) {
     contentType = "application/pdf"
   )
   
-  output$hasResults <- reactive({
-    df <- run_tests()
-    !is.null(df) && nrow(df) > 0
-  })
-  outputOptions(output, "hasResults", suspendWhenHidden = FALSE)
-  
   # Store results + adj_col name from the run
   run_tests <- eventReactive(input$run_test, {
-    req(rv$meta_cell)
+    req(rv$meta_sample, rv$abundance_sample)
     
-    # Capture all relevant inputs at run time
-    test_type_run     <- input$test_type
-    p_adj_method_run  <- input$p_adj_method
-    group_var_run     <- input$group_var
-    cont_var_run      <- input$cont_var
-    test_entity_run   <- input$test_entity
+    test_type_run   <- input$test_type
+    p_adj_method_run <- input$p_adj_method
+    group_var_run   <- input$group_var
+    cont_var_run    <- input$cont_var
+    test_entity_run <- input$test_entity
     
-    abund0 <- rv$clusters$abundance
+    abund0 <- rv$abundance_sample
     if (is.null(abund0)) {
-      showNotification("No abundance matrix available. Ensure obj$leiden$abundance is present in the upload.",
-                       type = "error", duration = NULL)
-      return(list(df = NULL, adj_col = NULL))
-    }
-    if (is.null(rownames(abund0)) || any(!nzchar(rownames(abund0)))) {
-      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.",
-                       type = "error", duration = NULL)
+      showNotification("No abundance matrix available.", type = "error")
       return(list(df = NULL, adj_col = NULL))
     }
     
+    # Aggregate to celltypes if requested
     abund <- abund0
-    if (test_entity_run == "Celltypes" && !is.null(rv$cluster_map) &&
-        all(c("cluster", "celltype") %in% names(rv$cluster_map))) {
+    if (test_entity_run == "Celltypes" && !is.null(rv$cluster_map)) {
       cm <- rv$cluster_map
       keep <- cm$cluster %in% colnames(abund)
       cm <- cm[keep, , drop = FALSE]
@@ -1354,159 +1446,122 @@ server <- function(input, output, session) {
       abund <- as.matrix(abund)
     }
     
-    if (!nzchar(group_var_run) && !nzchar(cont_var_run)) {
-      return(list(df = data.frame(entity = NA, test = NA, p = NA, n = NA), adj_col = NULL))
-    }
-    
-    # Map abundance rows to patient_ID
-    sources <- rownames(abund)
-    ids <- unique(rv$meta_cell$patient_ID)
-    ids_esc <- stringr::str_replace_all(ids, "([\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
-    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
-    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
-    pid <- stringr::str_extract(sources, pattern)
-    
+    # Merge with per-sample metadata
+    meta_sub <- rv$meta_sample %>% dplyr::select(patient_ID, dplyr::everything())
     abund_df <- as.data.frame(abund)
-    abund_df$patient_ID <- pid
-    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
-    abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
-    
-    abund_long <- abund_df %>%
+    abund_df$patient_ID <- stringr::str_extract(string = rownames(abund_df), pattern = paste0('(',paste0(meta_sub$patient_ID,collapse='|'),')'))
+    merged <- merge(x = meta_sub, y = abund_df, by = 'patient_ID')
+    # Long format
+    abund_long <- merged %>%
       tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq")
     
+    # Run tests per entity
     res <- abund_long %>%
       dplyr::group_by(entity) %>%
       dplyr::group_modify(~ {
         if (test_type_run == "Wilcoxon (2-group)") {
           if (!nzchar(group_var_run)) return(data.frame(test = "wilcox", p = NA, n = nrow(.x)))
-          g <- droplevels(factor(.x[[group_var_run]]))
-          ok <- !is.na(g)
-          g <- g[ok]; freq_ok <- .x$freq[ok]
-          if (length(levels(g)) != 2) return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
-          summaries <- tapply(freq_ok, g, function(v) {
-            med <- median(v, na.rm = TRUE)
-            q25 <- quantile(v, 0.25, na.rm = TRUE)
-            q75 <- quantile(v, 0.75, na.rm = TRUE)
-            n_grp <- sum(!is.na(v))
-            sprintf("%.2f (%.2f-%.2f, n=%d)", med, q25, q75, n_grp)
-          })
-          sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
-          names(sum_df) <- paste0(names(sum_df), "_IQR")
+          
+          g_raw <- .x[[group_var_run]]
+          ok <- !is.na(g_raw)
+          g <- droplevels(factor(g_raw[ok]))
+          freq_ok <- .x$freq[ok]
+          
+          if (length(levels(g)) != 2) {
+            # Not exactly 2 groups after NA removal
+            return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
+          }
+          
           wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
-          cbind(data.frame(test = "wilcox", n = sum(ok), p = wt$p.value), sum_df)
-          
+          data.frame(test = "wilcox", n = sum(ok), p = wt$p.value)
         } else if (test_type_run == "Kruskal–Wallis (multi-group)") {
-          if (!nzchar(group_var_run)) return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
-          g <- .x[[group_var_run]]
-          ok <- !is.na(g)
-          if (!any(ok)) return(data.frame(test = "kruskal", p = NA, n = 0))
-          summaries <- tapply(.x$freq[ok], g[ok], function(v) {
-            med <- median(v, na.rm = TRUE)
-            q25 <- quantile(v, 0.25, na.rm = TRUE)
-            q75 <- quantile(v, 0.75, na.rm = TRUE)
-            n_grp <- sum(!is.na(v))
-            sprintf("%.2f (%.2f-%.2f, n=%d)", med, q25, q75, n_grp)
-          })
-          sum_df <- as.data.frame(as.list(summaries), stringsAsFactors = FALSE)
-          names(sum_df) <- paste0(names(sum_df), "_IQR")
-          kw <- kruskal.test(.x$freq[ok] ~ as.factor(g[ok]))
-          cbind(data.frame(test = "kruskal", n = sum(ok), p = kw$p.value), sum_df)
+          if (!nzchar(group_var_run)) {
+            return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
+          }
           
-        } else { # Spearman
-          if (!nzchar(cont_var_run)) return(data.frame(test = "spearman", rho = NA, p = NA, n = nrow(.x)))
-          cont <- cont_var_run
-          ct <- spearman_test(.x, cont_var = cont)
-          cbind(data.frame(test = "spearman"), ct)
+          g_raw <- .x[[group_var_run]]
+          ok <- !is.na(g_raw)
+          g <- droplevels(factor(g_raw[ok]))
+          freq_ok <- .x$freq[ok]
+          
+          if (length(levels(g)) < 2) {
+            # Not enough groups with data
+            return(data.frame(test = "kruskal", p = NA, n = sum(ok)))
+          }
+          
+          kw <- suppressWarnings(kruskal.test(freq_ok ~ g))
+          data.frame(test = "kruskal", n = sum(ok), p = kw$p.value)
+        } else if (test_type_run == "Spearman (continuous)") {
+          if (!nzchar(cont_var_run)) {
+            return(data.frame(test = "spearman", rho = NA, p = NA, n = nrow(.x)))
+          }
+          
+          x <- .x$freq
+          y <- suppressWarnings(as.numeric(.x[[cont_var_run]]))
+          
+          ok <- complete.cases(x, y)
+          if (sum(ok) < 3) {
+            return(data.frame(test = "spearman", rho = NA, p = NA, n = sum(ok)))
+          }
+          
+          ct <- suppressWarnings(cor.test(x[ok], y[ok], method = "spearman"))
+          data.frame(test = "spearman", rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
         }
       }) %>%
       dplyr::ungroup()
     
+    # Adjust p-values
     adj_col <- NULL
-    if (nrow(res) && "p" %in% colnames(res) && nzchar(p_adj_method_run)) {
+    if (nrow(res) && "p" %in% names(res) && nzchar(p_adj_method_run)) {
       adj_col <- paste0(tolower(p_adj_method_run), "_padj")
       res[[adj_col]] <- p.adjust(res$p, method = p_adj_method_run)
     }
     
-    # Add metadata column name being tested
-    tested_var <- if (test_type_run == "Spearman (continuous)") {
-      if (nzchar(cont_var_run)) cont_var_run else NA_character_
-    } else if (test_type_run %in% c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")) {
-      if (nzchar(group_var_run)) group_var_run else NA_character_
-    } else {
-      NA_character_
-    }
-    
-    # Determine entity used in this run
-    has_map <- !is.null(rv$cluster_map) && all(c("cluster","celltype") %in% names(rv$cluster_map))
-    entity_used <- if (!has_map) "clusters" else tolower(test_entity_run)
-    
-    # Determine test short name
-    test_map <- c(
-      "Wilcoxon (2-group)" = "wilcoxon",
-      "Kruskal–Wallis (multi-group)" = "kruskal_wallis",
-      "Spearman (continuous)" = "spearman"
-    )
-    test_used <- test_map[[test_type_run]]
-    
-    # Determine metadata used
-    metadata_used <- if (test_type_run == "Spearman (continuous)") {
-      if (nzchar(cont_var_run)) cont_var_run else "none"
-    } else if (test_type_run %in% c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")) {
-      if (nzchar(group_var_run)) group_var_run else "none"
-    } else {
-      "none"
-    }
-    
-    # Save for later use in downloadHandler
-    rv$last_test_info <- list(
-      entity = entity_used,
-      test = test_used,
-      metadata = metadata_used
-    )
-    
-    res$metadata <- tested_var
-    
-    # Ensure column order: entity, metadata, test, n, p, padj, rho (if present), then all *_IQR
-    iqr_cols <- grep("_IQR$", names(res), value = TRUE)
-    base_cols <- c("entity", "metadata", "test", "n", "p")
-    if (!is.null(adj_col) && adj_col %in% names(res)) base_cols <- c(base_cols, adj_col)
-    if ("rho" %in% names(res)) base_cols <- c(base_cols, "rho")
-    res <- res[, c(base_cols, iqr_cols), drop = FALSE]
-    
     list(df = res, adj_col = adj_col)
   })
   
+  observeEvent(input$run_test, {
+    res <- run_tests()
+    test_results_rv(res)
+    output$test_cleared_msg <- renderText(NULL)
+  })
+  
+  observeEvent(input$reset_test, {
+    test_results_rv(NULL)        # clear
+    showNotification("Testing results cleared.", type = "message", duration = 5)
+    output$test_cleared_msg <- renderText("Results cleared. Run a new test to see results here.")
+  })
+  
+  output$hasResults <- reactive({
+    run <- test_results_rv()
+    !is.null(run) && !is.null(run$df) && nrow(run$df) > 0
+  })
+  outputOptions(output, "hasResults", suspendWhenHidden = FALSE)
+  
   output$test_table <- renderTable({
-    run <- run_tests()
+    run <- test_results_rv()
     df <- req(run$df)
     adj_col <- run$adj_col
     
-    # Format p and adjusted p (only if numeric)
-    num_cols <- intersect(c("p", adj_col), names(df))
+    # sort while numeric
+    if (!is.null(adj_col) && adj_col %in% names(df) && is.numeric(df[[adj_col]])) {
+      df <- df[order(df[[adj_col]], na.last = TRUE), ]
+    }
+    
+    # format for display
+    df_display <- df
+    num_cols <- intersect(c("p", adj_col), names(df_display))
     for (col in num_cols) {
-      if (is.numeric(df[[col]])) {
-        df[[col]] <- formatC(df[[col]], format = "f", digits = 3)
+      if (is.numeric(df_display[[col]])) {
+        df_display[[col]] <- formatC(df_display[[col]], format = "f", digits = 3)
       }
     }
-    
-    # Format rho if present and numeric
-    if ("rho" %in% names(df) && is.numeric(df$rho)) {
-      df$rho <- formatC(df$rho, format = "f", digits = 2)
+    if ("rho" %in% names(df_display) && is.numeric(df_display$rho)) {
+      df_display$rho <- formatC(df_display$rho, format = "f", digits = 2)
     }
     
-    # Order by adjusted p if present
-    if (!is.null(adj_col) && adj_col %in% names(df) && is.numeric(as.numeric(df[[adj_col]]))) {
-      df <- df[order(as.numeric(df[[adj_col]]), na.last = TRUE), ]
-    }
-    
-    df
+    df_display
   }, sanitize.text.function = function(x) x)
-  
-  output$hasResults <- reactive({
-    run <- run_tests()
-    !is.null(run$df) && nrow(run$df) > 0
-  })
-  outputOptions(output, "hasResults", suspendWhenHidden = FALSE)
   
   output$export_results <- downloadHandler(
     filename = function() {
@@ -1564,38 +1619,18 @@ server <- function(input, output, session) {
   # This version will use the currently-selected metadata column (input$cat_group_var)
   # even if the user has not yet clicked Generate plots. NA is excluded from the choices.
   observeEvent(input$cat_populate_colors, {
-    req(rv$meta_cell)   # require metadata to be present
+    req(rv$meta_cell)
     
-    # Preferred source: use the last generated cat_plot_data if available (ensures exact plotting groups)
-    levels_vec <- NULL
-    cp <- NULL
-    # try to use the precomputed eventReactive if it exists and has data
-    if (exists("cat_plot_data", mode = "function")) {
-      # guard around possible NULL result if not run yet
-      try({
-        cp <- cat_plot_data()
-      }, silent = TRUE)
-    }
-    if (!is.null(cp) && is.list(cp) && !is.null(cp$data) && nrow(cp$data) > 0) {
-      # use group values from the prepared plotting data (guarantees match)
-      group_col <- cp$group_var
-      if (!is.null(group_col) && nzchar(group_col) && group_col %in% colnames(cp$data)) {
-        levels_vec <- unique(as.character(cp$data[[group_col]]))
-      }
+    gv <- input$cat_group_var
+    if (is.null(gv) || !nzchar(gv) || !(gv %in% colnames(rv$meta_cell))) {
+      showNotification("No valid grouping variable selected for colors.", type = "error")
+      output$cat_color_pickers_ui <- renderUI(NULL)
+      rv$cat_colors <- NULL
+      return()
     }
     
-    # If not available, fall back to the metadata column selected by the user (cat_group_var)
-    if (is.null(levels_vec) || length(levels_vec) == 0) {
-      gv <- input$cat_group_var
-      if (!is.null(gv) && nzchar(gv) && gv %in% colnames(rv$meta_cell)) {
-        levels_vec <- sort(unique(as.character(rv$meta_cell[[gv]])))
-      } else {
-        # nothing to show
-        levels_vec <- character(0)
-      }
-    }
-    
-    # Exclude NA from choices so no color is created for NA
+    # Always pull levels from the currently selected metadata column
+    levels_vec <- sort(unique(as.character(rv$meta_cell[[gv]])))
     levels_vec <- levels_vec[!is.na(levels_vec)]
     
     if (length(levels_vec) == 0) {
@@ -1605,49 +1640,29 @@ server <- function(input, output, session) {
       return()
     }
     
-    # Default palette sized to number of levels
-    n_levels <- length(levels_vec)
-    default_pal <- viridis::viridis(n_levels)
+    # Default palette
+    default_pal <- viridis::viridis(length(levels_vec))
     names(default_pal) <- levels_vec
     
-    # Prefer GUI picker from colourpicker package if available; fallback to textInput
-    use_colourpicker <- requireNamespace("colourpicker", quietly = TRUE)
-    if (!use_colourpicker) {
-      showNotification("Package 'colourpicker' not installed; using text inputs for hex colors. Install with install.packages('colourpicker') for a GUI picker.", type = "message", duration = 8)
-    }
-    
-    # Build UI inputs (one per non-missing group)
+    # Build UI inputs
     ui_list <- lapply(seq_along(levels_vec), function(i) {
       lv <- levels_vec[i]
       input_id <- paste0("cat_color_", sanitize_id(lv))
-      label_text <- paste0("Color for ", lv)
-      if (use_colourpicker) {
-        colourpicker::colourInput(
-          inputId = input_id,
-          label = label_text,
-          value = default_pal[i],
-          showColour = "both"
-        )
-      } else {
-        textInput(
-          inputId = input_id,
-          label = label_text,
-          value = default_pal[i],
-          placeholder = "#RRGGBB"
-        )
-      }
+      colourpicker::colourInput(
+        inputId = input_id,
+        label = paste0("Color for ", lv),
+        value = default_pal[i],
+        showColour = "both"
+      )
     })
     
     output$cat_color_pickers_ui <- renderUI({
       tagList(
-        tags$div(
-          style = "max-height: 300px; overflow-y: auto; padding-right: 6px;",
-          ui_list
-        )
+        tags$div(style = "max-height: 300px; overflow-y: auto; padding-right: 6px;", ui_list)
       )
     })
     
-    # Initialize rv$cat_colors with the defaults (named vector keyed by group label)
+    # Initialize rv$cat_colors
     rv$cat_colors <- setNames(as.character(default_pal), levels_vec)
   })
   
@@ -1666,11 +1681,11 @@ server <- function(input, output, session) {
   })
   
   cat_plot_data <- eventReactive(input$generate_cat_plots, {
-    req(rv$meta_cell, rv$clusters$abundance)
+    req(rv$meta_sample, rv$abundance_sample)
     
-    abund0 <- rv$clusters$abundance
-    if (is.null(rownames(abund0)) || any(!nzchar(rownames(abund0)))) {
-      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.", type = "error")
+    abund0 <- rv$abundance_sample
+    if (is.null(abund0)) {
+      showNotification("No abundance matrix available.", type = "error")
       return(NULL)
     }
     
@@ -1686,36 +1701,27 @@ server <- function(input, output, session) {
       abund <- as.matrix(abund)
     }
     
-    # Map abundance rows to patient_ID via robust escaped regex
-    sources <- rownames(abund)
-    ids <- unique(rv$meta_cell$patient_ID)
-    ids_esc <- stringr::str_replace_all(ids, "([\\\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
-    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
-    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
-    pid <- stringr::str_extract(sources, pattern)
-    
+    # Merge with per-sample metadata
+    meta_sub <- rv$meta_sample %>% dplyr::select(patient_ID, dplyr::everything())
     abund_df <- as.data.frame(abund, check.names = FALSE, stringsAsFactors = FALSE)
-    abund_df$patient_ID <- pid
-    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
-    abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
+    abund_df$patient_ID <- stringr::str_extract(string = rownames(abund_df), pattern = paste0('(',paste0(meta_sub$patient_ID,collapse='|'),')'))
+    # merged <- dplyr::left_join(meta_sub, abund_df, by = "patient_ID")
+    merged <- merge(x = meta_sub, y = abund_df, by = 'patient_ID')
     
-    # Long format and remove NA abundance rows immediately (so testing/plotting ignore NA freqs)
-    abund_long <- abund_df %>%
+    # Long format and clean
+    abund_long <- merged %>%
       tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq") %>%
-      dplyr::mutate(entity = gsub(pattern = "\\n", replacement = " ", x = entity))
+      dplyr::mutate(entity = gsub(pattern = "\\n", replacement = " ", x = entity)) %>%
+      dplyr::filter(!is.na(freq))
     
-    # Remove rows with NA freq up-front and also rows with NA grouping variable later
-    abund_long <- abund_long %>% dplyr::filter(!is.na(freq))
+    # Capture plot-type and point-mode at Generate time
+    plot_type_selected <- input$cat_plot_type %||% "box"
+    point_mode_selected <- input$cat_points %||% "draw"
     
-    # Capture plot-type and point-mode at Generate time so later UI changes do not re-trigger calculations
-    plot_type_selected <- input$cat_plot_type %||% "box"    # "box" or "violin"
-    point_mode_selected <- input$cat_points %||% "draw"    # "draw", "jitter", "none"
-    
-    # Run test per entity; ensure we drop NA grouping values for the tested grouping variable
+    # Run test per entity
     test_type <- input$cat_test_type
     group_var <- input$cat_group_var
     
-    # If group_var is blank, return NA p-values for each entity
     if (is.null(group_var) || !nzchar(group_var)) {
       res <- abund_long %>%
         dplyr::group_by(entity) %>%
@@ -1724,21 +1730,16 @@ server <- function(input, output, session) {
       res <- abund_long %>%
         dplyr::group_by(entity) %>%
         dplyr::group_modify(~ {
-          # drop rows where group_var is NA
-          if (!(group_var %in% colnames(.x))) return(data.frame(p = NA_real_))
           g_raw <- .x[[group_var]]
           ok_rows <- !is.na(g_raw)
           if (!any(ok_rows)) return(data.frame(p = NA_real_))
           g <- droplevels(factor(g_raw[ok_rows]))
           freq_ok <- .x$freq[ok_rows]
-          
-          # guard against too few groups
           if (length(unique(g)) < 2) return(data.frame(p = NA_real_))
-          
           if (test_type == "Wilcoxon (2-group)" && length(unique(g)) == 2) {
             wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
             data.frame(p = wt$p.value)
-          } else if (test_type == "Kruskal\u2013Wallis (multi-group)") {
+          } else if (test_type == "Kruskal–Wallis (multi-group)") {
             kw <- kruskal.test(freq_ok ~ as.factor(g))
             data.frame(p = kw$p.value)
           } else {
@@ -1748,7 +1749,7 @@ server <- function(input, output, session) {
         dplyr::ungroup()
     }
     
-    # Adjust p-values if appropriate
+    # Adjust p-values if requested
     if (nrow(res) && nzchar(input$cat_p_adj_method) && "p" %in% names(res)) {
       res$padj <- p.adjust(res$p, method = input$cat_p_adj_method)
     }
@@ -1760,7 +1761,7 @@ server <- function(input, output, session) {
       test_raw = input$cat_test_type %||% "test"
     )
     
-    # Return everything needed for plotting; include captured plot-type and point-mode
+    # Return everything needed for plotting
     list(
       data = abund_long,
       results = res,
@@ -1772,9 +1773,112 @@ server <- function(input, output, session) {
     )
   })
   
+  observeEvent(input$generate_cat_plots, {
+    cp <- cat_plot_data()     # your existing eventReactive
+    cat_state(cp)
+    output$cat_cleared_msg <- renderText(NULL)
+  })
+  
+  observeEvent(input$reset_cat, {
+    cat_state(NULL)           # clear the state
+    cat_plot_cache(NULL)      # also clear cached ggplot
+    showNotification("Categorical plots cleared.", type = "message", duration = 5)
+    output$cat_cleared_msg <- renderText("Results cleared. Generate new plots to see them here.")
+  })
+  
+  output$hasCatResults <- reactive({
+    cp <- cat_state()
+    !is.null(cp) && !is.null(cp$data) && nrow(cp$data) > 0
+  })
+  outputOptions(output, "hasCatResults", suspendWhenHidden = FALSE)
+  
+  # Helper to sanitize IDs for input names
+  sanitize_id <- function(x) {
+    x <- as.character(x)
+    gsub("[^A-Za-z0-9_\\-]", "_", x)
+  }
+  
+  # Populate color pickers when button is clicked
+  observeEvent(input$cat_populate_colors, {
+    req(rv$meta_sample)
+    
+    levels_vec <- NULL
+    cp <- NULL
+    
+    # Try to use the last generated cat_plot_data (ensures exact plotting groups)
+    try({ cp <- cat_plot_data() }, silent = TRUE)
+    if (!is.null(cp) && is.list(cp) && !is.null(cp$data) && nrow(cp$data) > 0) {
+      group_col <- cp$group_var
+      if (!is.null(group_col) && nzchar(group_col) && group_col %in% colnames(cp$data)) {
+        levels_vec <- unique(as.character(cp$data[[group_col]]))
+      }
+    }
+    
+    # Fallback: use metadata column directly
+    if (is.null(levels_vec) || length(levels_vec) == 0) {
+      gv <- input$cat_group_var
+      if (!is.null(gv) && nzchar(gv) && gv %in% colnames(rv$meta_sample)) {
+        levels_vec <- sort(unique(as.character(rv$meta_sample[[gv]])))
+      }
+    }
+    
+    levels_vec <- levels_vec[!is.na(levels_vec)]
+    if (length(levels_vec) == 0) {
+      showNotification("No non-missing group levels found to populate colors for.", type = "warning")
+      output$cat_color_pickers_ui <- renderUI(NULL)
+      rv$cat_colors <- NULL
+      return()
+    }
+    
+    # Default palette
+    default_pal <- viridis::viridis(length(levels_vec))
+    names(default_pal) <- levels_vec
+    
+    # Build UI inputs
+    ui_list <- lapply(seq_along(levels_vec), function(i) {
+      lv <- levels_vec[i]
+      input_id <- paste0("cat_color_", sanitize_id(lv))
+      colourpicker::colourInput(
+        inputId = input_id,
+        label = paste0("Color for ", lv),
+        value = default_pal[i],
+        showColour = "both"
+      )
+    })
+    
+    output$cat_color_pickers_ui <- renderUI({
+      tagList(
+        tags$div(style = "max-height: 300px; overflow-y: auto; padding-right: 6px;", ui_list)
+      )
+    })
+    
+    # Initialize rv$cat_colors
+    rv$cat_colors <- setNames(as.character(default_pal), levels_vec)
+  })
+  
+  # Observe manual color changes
+  observe({
+    req(!is.null(rv$cat_colors))
+    new_colors <- rv$cat_colors
+    for (grp in names(rv$cat_colors)) {
+      input_name <- paste0("cat_color_", sanitize_id(grp))
+      if (!is.null(input[[input_name]])) {
+        new_colors[[grp]] <- input[[input_name]]
+      }
+    }
+    rv$cat_colors <- new_colors
+  })
+  
+  # Reset colors when group_var changes
+  observeEvent(input$cat_group_var, {
+    output$cat_color_pickers_ui <- renderUI(NULL)
+    rv$cat_colors <- NULL
+  })
+  
+  
   output$categorical_plot <- renderPlot({
-    cp <- cat_plot_data()
-    req(cp)
+    # cp <- cat_plot_data(); req(cp)
+    cp <- cat_state(); req(cp)
     abund_long <- cp$data
     res <- cp$results
     group_var <- cp$group_var
@@ -1803,7 +1907,7 @@ server <- function(input, output, session) {
         p_to_show = if (isTRUE(use_adj_p) && "padj" %in% names(res)) padj else p,
         label = paste0("p = ", signif(p_to_show, 3)),
         x = length(unique(abund_long_plot[[group_var]])) / 2 + 0.5,
-        y = tapply(abund_long_plot$freq, abund_long_plot$entity, max, na.rm = TRUE)[entity] * 1.05
+        y = tapply(abund_long_plot$freq, abund_long_plot$entity, max, na.rm = TRUE)[entity] * 1.15
       )
     
     # Determine group levels present in plotting data
@@ -1916,11 +2020,10 @@ server <- function(input, output, session) {
     filename = function() {
       info <- rv$last_cat_info
       if (is.null(info)) return("categorical_plots.pdf")
-      # Normalise test name
       test <- tolower(info$test_raw)
-      test <- gsub("\\s+", "_", test)           # spaces → underscores
-      test <- gsub("_\\(.*\\)", "", test)       # remove "(...)" parts
-      test <- gsub("kruskal_wallis", "kruskal-wallis", test)  # special case
+      test <- gsub("\\s+", "_", test)
+      test <- gsub("_\\(.*\\)", "", test)
+      test <- gsub("kruskal_wallis", "kruskal-wallis", test)
       paste0("categorical_", info$entity, "_", info$group, "_", test, ".pdf")
     },
     content = function(file) {
@@ -1935,24 +2038,23 @@ server <- function(input, output, session) {
       if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
       nrow_facets <- ceiling(n_facets / ncol_facets)
       if (!is.finite(nrow_facets) || nrow_facets < 1) nrow_facets <- 1
-      pdf_width  <- 4 * ncol_facets
+      pdf_width <- 4 * ncol_facets
       pdf_height <- 3 * nrow_facets
-      ggsave(file, plot = gg, device = cairo_pdf,
-             width = pdf_width, height = pdf_height, units = "in")
+      ggsave(file, plot = gg, device = cairo_pdf, width = pdf_width, height = pdf_height, units = "in")
     },
     contentType = "application/pdf"
   )
   
   cont_plot_data <- eventReactive(input$generate_cont_plots, {
-    req(rv$meta_cell, rv$clusters$abundance)
+    req(rv$meta_sample, rv$abundance_sample)
     
-    abund0 <- rv$clusters$abundance
-    if (is.null(rownames(abund0)) || any(!nzchar(rownames(abund0)))) {
-      showNotification("Abundance matrix has no valid rownames; cannot map to metadata.", type = "error")
+    abund0 <- rv$abundance_sample
+    if (is.null(abund0)) {
+      showNotification("No abundance matrix available.", type = "error")
       return(NULL)
     }
     
-    # Aggregate to celltypes if needed
+    # Aggregate to celltypes if requested
     abund <- abund0
     if (input$cont_entity == "Celltypes" && !is.null(rv$cluster_map)) {
       cm <- rv$cluster_map
@@ -1964,31 +2066,25 @@ server <- function(input, output, session) {
       abund <- as.matrix(abund)
     }
     
-    # Map abundance rows to patient_ID
-    sources <- rownames(abund)
-    ids <- unique(rv$meta_cell$patient_ID)
-    ids_esc <- stringr::str_replace_all(ids, "([\\\\^$.|?*+()\\[\\]{}\\\\])", "\\\\\\1")
-    ids_esc <- ids_esc[order(nchar(ids_esc), decreasing = TRUE)]
-    pattern <- paste0("(", paste0(ids_esc, collapse = "|"), ")")
-    pid <- stringr::str_extract(sources, pattern)
-    
+    # Merge with per-sample metadata
+    meta_sub <- rv$meta_sample %>% dplyr::select(patient_ID, dplyr::everything())
     abund_df <- as.data.frame(abund, check.names = FALSE, stringsAsFactors = FALSE)
-    abund_df$patient_ID <- pid
-    meta_unique <- rv$meta_cell %>% dplyr::distinct(patient_ID, .keep_all = TRUE)
-    abund_df <- abund_df %>% dplyr::left_join(meta_unique, by = "patient_ID")
+    abund_df$patient_ID <- stringr::str_extract(string = rownames(abund_df), pattern = paste0('(',paste0(meta_sub$patient_ID,collapse='|'),')'))
+    # merged <- dplyr::left_join(meta_sub, abund_df, by = "patient_ID")
+    merged <- merge(x = meta_sub, y = abund_df, by = 'patient_ID')
     
-    # Long format; remove NA freq immediately so tests and plotting ignore NA abundances
-    abund_long <- abund_df %>%
+    # Long format; remove NA freqs immediately
+    abund_long <- merged %>%
       tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq") %>%
       dplyr::mutate(entity = gsub("\\n", " ", entity)) %>%
       dplyr::filter(!is.na(freq))
     
-    # Capture transpose and cont_var at Generate time
+    # Capture inputs at Generate time
     cont_var <- input$cont_group_var
     transpose_flag <- isTRUE(input$cont_transpose)
     test_padj_method <- input$cont_p_adj_method
     
-    # Run Spearman per entity: drop rows where freq or cont_var is NA
+    # Run Spearman per entity
     res <- abund_long %>%
       dplyr::group_by(entity) %>%
       dplyr::group_modify(~ {
@@ -1997,7 +2093,6 @@ server <- function(input, output, session) {
         }
         ok <- complete.cases(.x$freq, .x[[cont_var]])
         if (!any(ok)) return(data.frame(rho = NA_real_, p = NA_real_, n = 0))
-        # Spearman is symmetric; orientation does not affect rho/p
         ct <- suppressWarnings(cor.test(.x$freq[ok], .x[[cont_var]][ok], method = "spearman"))
         data.frame(rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
       }) %>%
@@ -2016,7 +2111,7 @@ server <- function(input, output, session) {
       transpose = transpose_flag
     )
     
-    # Return everything needed for plotting; include the transpose flag and captured cont_var
+    # Return everything needed for plotting
     list(
       data = abund_long,
       results = res,
@@ -2027,10 +2122,28 @@ server <- function(input, output, session) {
     )
   })
   
+  observeEvent(input$generate_cont_plots, {
+    cp <- cont_plot_data()    # your existing eventReactive
+    cont_state(cp)
+    output$cont_cleared_msg <- renderText(NULL)
+  })
+  
+  observeEvent(input$reset_cont, {
+    cont_state(NULL)          # clear the state
+    cont_plot_cache(NULL)     # clear cached ggplot
+    showNotification("Continuous plots cleared.", type = "message", duration = 5)
+    output$cont_cleared_msg <- renderText("Results cleared. Generate new plots to see them here.")
+  })
+  
+  output$hasContResults <- reactive({
+    cp <- cont_state()
+    !is.null(cp) && !is.null(cp$data) && nrow(cp$data) > 0
+  })
+  outputOptions(output, "hasContResults", suspendWhenHidden = FALSE)
+  
   output$continuous_plot <- renderPlot({
-    cp <- cont_plot_data()
-    req(cp)
-    
+    # cp <- cont_plot_data(); req(cp)
+    cp <- cont_state(); req(cp)
     abund_long <- cp$data
     res <- cp$results
     cont_var <- cp$cont_var
@@ -2038,53 +2151,40 @@ server <- function(input, output, session) {
     facet_cols <- cp$facet_cols
     transpose_flag <- cp$transpose %||% FALSE
     
-    # Validate cont_var
+    # Validate continuous variable
     if (is.null(cont_var) || !nzchar(cont_var) || !(cont_var %in% colnames(abund_long))) {
       showNotification("No valid continuous metadata variable selected for continuous plotting.", type = "error")
       return(invisible(NULL))
     }
     
-    # Remove rows with NA in either plotted axis (safe: cont_plot_data already removed NA freq but cont_var could have NA)
-    if (!transpose_flag) {
-      # Default: Abundance = x, continuous metadata = y
-      plot_df <- abund_long %>% dplyr::filter(!is.na(freq) & !is.na(.data[[cont_var]]))
-    } else {
-      # Transposed: continuous metadata = x, Abundance = y
-      plot_df <- abund_long %>% dplyr::filter(!is.na(freq) & !is.na(.data[[cont_var]]))
-    }
-    
+    # Remove rows with NA in either axis
+    plot_df <- abund_long %>% dplyr::filter(!is.na(freq) & !is.na(.data[[cont_var]]))
     if (nrow(plot_df) == 0) {
       showNotification("No datapoints available for plotting after removing missing values.", type = "warning")
       return(invisible(NULL))
     }
     
-    # Prepare p-value annotation dataframe (use same results computed at generate time)
+    # Prepare p-value annotation dataframe
     p_df <- res %>%
       dplyr::mutate(
         p_to_show = if (isTRUE(use_adj_p) && "padj" %in% names(res)) padj else p,
         label = paste0("p = ", signif(p_to_show, 3), "\n", "rho = ", signif(rho, 3))
       )
     
-    # Choose aesthetics and trendline according to transpose_flag
+    # Choose aesthetics and label positions
     if (!transpose_flag) {
-      # Abundance on x, continuous on y
       aes_pt <- ggplot2::aes(x = freq, y = .data[[cont_var]])
       smooth_aes <- ggplot2::aes(x = freq, y = .data[[cont_var]])
-      x_lab <- "Abundance"
-      y_lab <- cont_var
-      # p-value label positions: put near top-right by entity
+      x_lab <- "Abundance"; y_lab <- cont_var
       p_df <- p_df %>%
         dplyr::mutate(
           x = tapply(plot_df$freq, plot_df$entity, function(v) mean(range(v, na.rm = TRUE)))[entity],
           y = tapply(plot_df[[cont_var]], plot_df$entity, max, na.rm = TRUE)[entity] * 1.05
         )
     } else {
-      # Transposed: continuous on x, Abundance on y
       aes_pt <- ggplot2::aes(x = .data[[cont_var]], y = freq)
       smooth_aes <- ggplot2::aes(x = .data[[cont_var]], y = freq)
-      x_lab <- cont_var
-      y_lab <- "Abundance"
-      # p-value label positions: put near top-right by entity
+      x_lab <- cont_var; y_lab <- "Abundance"
       p_df <- p_df %>%
         dplyr::mutate(
           x = tapply(plot_df[[cont_var]], plot_df$entity, function(v) mean(range(v, na.rm = TRUE)))[entity],
@@ -2092,9 +2192,10 @@ server <- function(input, output, session) {
         )
     }
     
-    # Build the ggplot
+    # Build ggplot with your preferred aesthetics
     gg <- ggplot2::ggplot(plot_df, mapping = aes_pt) +
-      ggplot2::geom_point(alpha = 0.75, pch = 21, color = 'black', fill = 'grey40', stroke = 0.1, size = 3) +
+      ggplot2::geom_point(alpha = 0.75, pch = 21, color = 'black', fill = 'grey40',
+                          stroke = 0.1, size = 3) +
       ggplot2::geom_smooth(mapping = smooth_aes, method = "lm", se = FALSE, color = "red2") +
       ggplot2::facet_wrap(~entity, ncol = facet_cols, scales = "free") +
       ggplot2::scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
@@ -2102,9 +2203,11 @@ server <- function(input, output, session) {
       ggplot2::theme_bw(base_size = 18) +
       ggplot2::theme(legend.position = "none") +
       ggplot2::labs(x = x_lab, y = y_lab) +
-      ggplot2::theme(strip.text.x = ggplot2::element_text(margin = ggplot2::margin(t = 1.1, b = 1.1)))
+      ggplot2::theme(strip.text.x = ggplot2::element_text(
+        margin = ggplot2::margin(t = 1.1, b = 1.1))
+      )
     
-    # Add p-value / rho annotations (filter to entities actually plotted)
+    # Add p/rho annotations
     if (!is.null(p_df) && nrow(p_df) > 0) {
       p_df_plot <- p_df %>% dplyr::filter(entity %in% unique(plot_df$entity))
       if (nrow(p_df_plot) > 0) {
@@ -2118,14 +2221,11 @@ server <- function(input, output, session) {
       }
     }
     
-    # Cache for export
     cont_plot_cache(gg)
-    
     gg
   },
   height = function() {
-    gg <- cont_plot_cache()
-    cp <- cont_plot_data()
+    gg <- cont_plot_cache(); cp <- cont_plot_data()
     if (is.null(gg) || is.null(cp)) return(400)
     n_facets <- length(unique(gg$data$entity))
     ncol_facets <- cp$facet_cols
@@ -2134,8 +2234,7 @@ server <- function(input, output, session) {
     200 * nrow_facets
   },
   width = function() {
-    gg <- cont_plot_cache()
-    cp <- cont_plot_data()
+    gg <- cont_plot_cache(); cp <- cont_plot_data()
     if (is.null(gg) || is.null(cp)) return(400)
     ncol_facets <- cp$facet_cols
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
@@ -2146,7 +2245,7 @@ server <- function(input, output, session) {
     filename = function() {
       info <- rv$last_cont_info
       if (is.null(info)) return("continuous_plots.pdf")
-      paste0("continuous_", info$entity, "_", info$group, "_", info$test_raw, ".pdf")
+      paste0("continuous_", info$entity, "_", info$group, "_spearman.pdf")
     },
     content = function(file) {
       gg <- cont_plot_cache()
@@ -2160,10 +2259,9 @@ server <- function(input, output, session) {
       if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
       nrow_facets <- ceiling(n_facets / ncol_facets)
       if (!is.finite(nrow_facets) || nrow_facets < 1) nrow_facets <- 1
-      pdf_width  <- 4 * ncol_facets
+      pdf_width <- 4 * ncol_facets
       pdf_height <- 3 * nrow_facets
-      ggsave(file, plot = gg, device = cairo_pdf,
-             width = pdf_width, height = pdf_height, units = "in")
+      ggsave(file, plot = gg, device = cairo_pdf, width = pdf_width, height = pdf_height, units = "in")
     },
     contentType = "application/pdf"
   )
@@ -2180,41 +2278,58 @@ server <- function(input, output, session) {
     updatePickerInput(session, "fs_leiden_subset", choices = cluster_names)
   })
   
-  run_fs <- eventReactive(input$run_fs, {
-    req(rv$meta_cell, rv$clusters$abundance, input$fs_outcome, input$fs_predictors)
+  run_fs <- function() {
+    req(rv$meta_sample, rv$abundance_sample, input$fs_outcome, input$fs_predictors)
     
-    # Align metadata and abundance
-    merged <- align_metadata_abundance(rv$meta_cell, rv$clusters$abundance)
+    # Metadata predictors (exclude placeholder)
+    pred_meta <- setdiff(intersect(input$fs_predictors, colnames(rv$meta_sample)), "leiden_cluster")
     
-    # Drop NA outcomes
-    merged <- merged[!is.na(merged[[input$fs_outcome]]), ]
+    # Cluster predictors
+    all_clusters <- colnames(rv$abundance_sample)
+    if ("leiden_cluster" %in% input$fs_predictors) {
+      if (!is.null(input$fs_leiden_subset) && length(input$fs_leiden_subset) > 0) {
+        cluster_predictors <- intersect(input$fs_leiden_subset, all_clusters)
+      } else {
+        cluster_predictors <- all_clusters
+      }
+    } else {
+      cluster_predictors <- character(0)
+    }
     
-    # Outcome
-    y_raw <- merged[[input$fs_outcome]]
-    
-    # Predictors
-    pred_meta <- intersect(input$fs_predictors, colnames(merged))
-    if (length(pred_meta) == 0) {
+    predictors_final <- c(pred_meta, cluster_predictors)
+    if (length(predictors_final) == 0) {
       showNotification("Select at least one predictor.", type = "error")
       return(NULL)
     }
-    X_raw <- merged[, pred_meta, drop = FALSE]
     
-    # Sample counts
-    n_before <- length(y_raw)
-    complete_rows <- stats::complete.cases(data.frame(X_raw, .y = y_raw))
+    # Subset before merge
+    meta_sub <- rv$meta_sample %>%
+      dplyr::select(patient_ID, !!input$fs_outcome, dplyr::all_of(pred_meta))
+    abund_sub <- rv$abundance_sample[, cluster_predictors, drop = FALSE]
+    
+    merged <- align_metadata_abundance(meta_sub, abund_sub, notify = showNotification)
+    
+    # Filter missingness
+    merged <- merged[!is.na(merged[[input$fs_outcome]]), ]
+    y_raw <- merged[[input$fs_outcome]]
+    X_raw <- merged[, predictors_final, drop = FALSE]
+    
+    n_before <- nrow(merged)
+    complete_rows <- complete.cases(data.frame(X_raw, .y = y_raw))
+    dropped_ids <- merged$patient_ID[!complete_rows]
+    
     X_raw <- X_raw[complete_rows, , drop = FALSE]
     y_raw <- y_raw[complete_rows]
-    n_after <- length(y_raw)
+    merged <- merged[complete_rows, , drop = FALSE]
+    
+    n_after <- sum(complete_rows)
     n_dropped <- n_before - n_after
     if (n_after < 3) {
       showNotification("Too few samples after filtering for feature selection.", type = "error")
       return(NULL)
     }
     
-    # Outcome coercion
-    y <- y_raw
-    if (is.character(y)) y <- factor(y)
+    y <- if (is.character(y_raw)) factor(y_raw) else y_raw
     
     # User controls
     method <- input$fs_method %||% "Elastic Net"
@@ -2222,14 +2337,13 @@ server <- function(input, output, session) {
     seed_val <- input$fs_seed %||% 123
     reps <- input$fs_reps %||% 1
     boruta_maxruns <- input$fs_maxruns %||% 500
-    
     set.seed(seed_val)
     
-    # Helper: clean dummy names
     clean_dummy_names <- function(nms) {
       gsub(pattern = "leiden_cluster", replacement = "leiden_cluster:", x = nms)
     }
     
+    # --- Boruta branch ---
     if (method == "Random Forest (Boruta)") {
       all_imp <- list()
       for (r in seq_len(reps)) {
@@ -2269,11 +2383,15 @@ server <- function(input, output, session) {
         outcome = y,
         predictors = colnames(X_raw),
         tolerance = tolerance,
-        details = list(samples_before = n_before, samples_after = n_after, samples_dropped = n_dropped)
+        details = list(samples_before = n_before,
+                       samples_after = n_after,
+                       samples_dropped = n_dropped,
+                       dropped_ids = dropped_ids),
+        merged = merged
       ))
     }
     
-    # glmnet-based methods
+    # --- glmnet branch ---
     family <- if (is.factor(y)) {
       if (nlevels(y) == 2) "binomial" else "multinomial"
     } else {
@@ -2283,6 +2401,12 @@ server <- function(input, output, session) {
     Xmat <- model.matrix(~ . - 1, data = X_raw)
     colnames(Xmat) <- clean_dummy_names(colnames(Xmat))
     storage.mode(Xmat) <- "double"
+    
+    added_dummy <- FALSE
+    if (ncol(Xmat) == 1) {
+      Xmat <- cbind(Xmat, `__DUMMY__` = 0)
+      added_dummy <- TRUE
+    }
     
     alpha_val <- if (method == "Ridge Regression") 0 else (input$fs_alpha %||% 0.5)
     nfolds_val <- input$fs_nfolds %||% 5
@@ -2302,11 +2426,13 @@ server <- function(input, output, session) {
           data.frame(Feature = rownames(cm), Class = cls, Coef = as.numeric(cm[, 1]), stringsAsFactors = FALSE)
         }))
         coef_df <- coef_df[coef_df$Feature != "(Intercept)", , drop = FALSE]
+        if (added_dummy) coef_df <- coef_df[coef_df$Feature != "__DUMMY__", , drop = FALSE]
         coef_list[[r]] <- coef_df
       } else {
         cm <- as.matrix(coef_obj)
         coef_df <- data.frame(Feature = rownames(cm), Coef = as.numeric(cm[, 1]), stringsAsFactors = FALSE)
         coef_df <- coef_df[coef_df$Feature != "(Intercept)", , drop = FALSE]
+        if (added_dummy) coef_df <- coef_df[coef_df$Feature != "__DUMMY__", , drop = FALSE]
         coef_list[[r]] <- coef_df
       }
     }
@@ -2337,34 +2463,35 @@ server <- function(input, output, session) {
       outcome = y,
       predictors = colnames(Xmat),
       tolerance = tolerance,
-      details = list(samples_before = n_before, samples_after = n_after, samples_dropped = n_dropped)
+      details = list(samples_before = n_before,
+                     samples_after = n_after,
+                     samples_dropped = n_dropped,
+                     dropped_ids = dropped_ids),
+      merged = merged
     ))
-  })
+  }
   
-  output$fs_results <- renderTable({
-    res <- run_fs()
-    req(res)
-    
-    # Columns to hide in the UI but keep in CSV
-    hide_cols <- c("Method", "Outcome", "Alpha")
-    
-    # Only show the other columns in the UI table
-    display_df <- res$results[, setdiff(names(res$results), hide_cols), drop = FALSE]
-    
-    display_df
+  output$fs_data_head <- renderTable({
+    # res <- run_fs(); req(res)
+    res <- fs_state(); req(res)
+    head(res$merged, 5)
   }, sanitize.text.function = function(x) x)
   
   output$fs_plot <- renderPlot({
-    res <- run_fs(); req(res)
+    # res <- run_fs(); req(res)
+    res <- fs_state(); req(res)
     tol <- res$tolerance
     
     if (identical(res$method, "Boruta")) {
-      # --- Boruta importance plot ---
       df <- res$results
       df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+      if (nrow(df) == 0) {
+        plot.new()
+        text(0.5, 0.5, "No Boruta features pass the tolerance threshold.\nNothing to plot.", cex = 1.1)
+        return()
+      }
       df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
       top_n <- head(df, 30)
-      
       ggplot2::ggplot(top_n,
                       ggplot2::aes(x = reorder(Feature, ImportanceMean),
                                    y = ImportanceMean,
@@ -2373,21 +2500,23 @@ server <- function(input, output, session) {
         ggplot2::coord_flip() +
         ggplot2::labs(title = "Boruta feature importance",
                       x = "Feature", y = "Mean importance") +
-        scale_fill_manual(values = c('Confirmed' = 'green4', 'Rejected' = 'red4', 'Tentative' = 'grey40')) + 
+        ggplot2::scale_fill_manual(values = c('Confirmed' = 'green4',
+                                              'Rejected' = 'red4',
+                                              'Tentative' = 'grey40')) +
         ggplot2::theme_bw(base_size = 14)
-      
     } else {
-      # --- Elastic Net / Ridge ---
       df <- res$results
       df <- df[abs(df$Coef) >= tol, , drop = FALSE]
-      
+      if (nrow(df) == 0) {
+        plot.new()
+        text(0.5, 0.5, "All coefficients are zero after regularization.\nTry lowering alpha or adding predictors.", cex = 1.1)
+        return()
+      }
       if ("Class" %in% names(df)) {
-        # Multinomial: facet by Class
         top_n <- df %>%
           dplyr::group_by(Class) %>%
           dplyr::arrange(dplyr::desc(Coef), .by_group = TRUE) %>%
           dplyr::slice_head(n = 20)
-        
         ggplot2::ggplot(top_n,
                         ggplot2::aes(x = reorder(Feature, Coef),
                                      y = Coef,
@@ -2396,15 +2525,12 @@ server <- function(input, output, session) {
           ggplot2::facet_wrap(~Class, scales = "free_y") +
           ggplot2::coord_flip() +
           ggplot2::labs(title = paste(res$method, "coefficients (lambda.min)"),
-                        x = "Feature", y = "Coefficient") + 
-          scale_fill_gradient(low = 'blue3', high = 'red3') + 
+                        x = "Feature", y = "Coefficient") +
+          ggplot2::scale_fill_gradient(low = 'blue3', high = 'red3') +
           ggplot2::theme_bw(base_size = 14)
-        
       } else {
-        # Binary/continuous outcome
         df <- df[order(df$Coef, decreasing = TRUE), ]
         top_n <- head(df, 30)
-        
         ggplot2::ggplot(top_n,
                         ggplot2::aes(x = reorder(Feature, Coef),
                                      y = Coef,
@@ -2412,139 +2538,158 @@ server <- function(input, output, session) {
           ggplot2::geom_col(color = 'black', lwd = 0.4) +
           ggplot2::coord_flip() +
           ggplot2::labs(title = paste(res$method, "coefficients (lambda.min)"),
-                        x = "Feature", y = "Coefficient") + 
-          scale_fill_gradient(low = 'blue3', high = 'red3') + 
+                        x = "Feature", y = "Coefficient") +
+          ggplot2::scale_fill_gradient(low = 'blue3', high = 'red3') +
           ggplot2::theme_bw(base_size = 14)
       }
     }
   })
   
   output$fs_results <- renderTable({
-    res <- run_fs(); req(res)
+    # res <- run_fs(); req(res)
+    res <- fs_state(); req(res)
     df <- res$results
     tol <- res$tolerance
     
     if (identical(res$method, "Boruta")) {
       df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
-      df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
+      df <- df[order(df$ImportanceMean, decreasing = TRUE), , drop = FALSE]
+      
+      if (nrow(df) == 0) {
+        return(data.frame(Message = "No Boruta features passed the tolerance threshold."))
+      }
+      
     } else {
       if ("Coef" %in% names(df)) {
         df <- df[abs(df$Coef) >= tol, , drop = FALSE]
-        df <- df[order(df$Coef, decreasing = TRUE), ]
+        df <- df[order(df$Coef, decreasing = TRUE), , drop = FALSE]
+        
+        if (nrow(df) == 0) {
+          return(data.frame(Message = "All coefficients shrank to zero after regularization."))
+        }
       }
     }
+    
     df
   }, sanitize.text.function = function(x) x)
   
   output$fs_summary <- renderPrint({
-    res <- run_fs(); req(res)
-    det <- res$details %||% list(samples_before = NA, samples_after = NA, samples_dropped = NA)
-    tol <- res$tolerance
+    # res <- run_fs(); req(res)
+    res <- fs_state(); req(res)
+    det <- res$details %||% list(samples_before = NA,
+                                 samples_after = NA,
+                                 samples_dropped = NA,
+                                 dropped_ids = character(0))
     
     cat("Samples before filtering:", det$samples_before, "\n")
     cat("Samples after filtering:", det$samples_after, "\n")
     cat("Samples dropped:", det$samples_dropped, "\n\n")
     
+    if (length(det$dropped_ids) > 0) {
+      cat("Dropped patient_IDs:\n")
+      print(det$dropped_ids)
+      cat("\n")
+    }
+    
     cat("Selected features (top):\n")
     if (identical(res$method, "Boruta")) {
       df <- res$results
-      df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
-      df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
-      print(utils::head(df$Feature, 20))
+      df <- df[order(df$ImportanceMean, decreasing = TRUE), , drop = FALSE]
+      if (nrow(df) == 0) {
+        cat("No Boruta features passed the tolerance threshold.\n")
+      } else {
+        print(utils::head(df$Feature, 20))
+      }
     } else {
       df <- res$results
       if ("Coef" %in% names(df)) {
-        df <- df[abs(df$Coef) >= tol, , drop = FALSE]
-        df <- df[order(df$Coef, decreasing = TRUE), ]
-        print(utils::head(df$Feature, 20))
+        df <- df[order(df$Coef, decreasing = TRUE), , drop = FALSE]
+        if (nrow(df) == 0) {
+          cat("All coefficients shrank to zero after regularization.\n")
+        } else {
+          print(utils::head(df$Feature, 20))
+        }
       }
     }
   })
   
   output$hasFSResults <- reactive({
-    res <- run_fs()
+    res <- fs_state()
     !is.null(res) && !is.null(res$results) && nrow(res$results) > 0
-  })
-  outputOptions(output, "hasFSResults", suspendWhenHidden = FALSE)
-  
-  output$fs_summary <- renderPrint({
-    res <- run_fs()
-    req(res)
-    
-    cat("Samples before filtering:", res$summary$n_before, "\n")
-    cat("Samples after filtering:", res$summary$n_after, "\n")
-    cat("Samples dropped:", res$summary$n_dropped, "\n\n")
-    
-    if (inherits(res$summary$model, "cv.glmnet")) {
-      print(res$summary$model)
-    } else if (inherits(res$summary$model, "Boruta")) {
-      print(res$summary$model)
-    } else {
-      print(res$summary$model)
-    }
-  })
-  
-  output$hasFSResults <- reactive({
-    !is.null(run_fs())
   })
   outputOptions(output, "hasFSResults", suspendWhenHidden = FALSE)
   
   output$export_fs_results <- downloadHandler(
     filename = function() {
-      info <- rv$last_fs_info
-      if (is.null(info)) {
-        return(paste0("feature_selection_", Sys.Date(), ".csv"))
-      }
-      paste0(info$method, "_feature_selection_with_outcome_", info$outcome, ".csv")
+      # res <- run_fs(); req(res)
+      res <- fs_state(); req(res)
+      method <- res$method %||% "FeatureSelection"
+      outcome <- input$fs_outcome %||% "outcome"
+      paste0(method, "_feature_selection_with_outcome_", outcome, "_", Sys.Date(), ".csv")
     },
     content = function(file) {
-      res <- run_fs()
-      req(res)
-      # res$results already has Method, Outcome, Alpha as last columns
-      utils::write.csv(res$results, file, row.names = FALSE)
+      # res <- run_fs(); req(res)
+      res <- fs_state(); req(res)
+      df <- res$results
+      tol <- res$tolerance
+      
+      if (identical(res$method, "Boruta")) {
+        df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+        df <- df[order(df$ImportanceMean, decreasing = TRUE), , drop = FALSE]
+        if (nrow(df) == 0) {
+          utils::write.csv(data.frame(Message = "No Boruta features passed the tolerance threshold."),
+                           file, row.names = FALSE)
+          return()
+        }
+      } else {
+        if ("Coef" %in% names(df)) {
+          df <- df[abs(df$Coef) >= tol, , drop = FALSE]
+          df <- df[order(df$Coef, decreasing = TRUE), , drop = FALSE]
+          if (nrow(df) == 0) {
+            utils::write.csv(data.frame(Message = "All coefficients shrank to zero after regularization."),
+                             file, row.names = FALSE)
+            return()
+          }
+        }
+      }
+      utils::write.csv(df, file, row.names = FALSE)
     },
     contentType = "text/csv"
   )
   
-  observeEvent(rv$meta_cell, {
-    req(rv$meta_cell)
+  observeEvent(list(rv$meta_sample, rv$abundance_sample), {
+    req(rv$meta_sample, rv$abundance_sample)
     
-    meta_cols <- colnames(rv$meta_cell)
-    
-    # Outcomes = categorical metadata only (factor/character)
-    categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.factor(x) || is.character(x))])
-    
-    # Predictors = metadata only (no expression markers)
+    meta_cols <- colnames(rv$meta_sample)
+    categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.factor(x) || is.character(x))])
     predictor_choices <- sort(meta_cols)
-    
-    updatePickerInput(session, "lm_outcome",
-                      choices = categorical_choices,
-                      selected = NULL)
-    
-    updatePickerInput(session, "lm_predictors",
-                      choices = predictor_choices,
-                      selected = NULL)
-    
-    # Populate leiden_cluster subset choices if present; default to none selected
-    if ("leiden_cluster" %in% meta_cols) {
-      levs <- sort(unique(as.character(rv$meta_cell$leiden_cluster)))
-      updatePickerInput(session, "lm_leiden_subset",
-                        choices = levs,
-                        selected = character(0))
+    if (!("leiden_cluster" %in% predictor_choices)) {
+      predictor_choices <- c(predictor_choices, "leiden_cluster")
     }
+    
+    updatePickerInput(session, "lm_outcome", choices = categorical_choices, selected = NULL)
+    updatePickerInput(session, "lm_predictors", choices = predictor_choices, selected = NULL)
+    updatePickerInput(session, "lm_leiden_subset",
+                      choices = colnames(rv$abundance_sample),
+                      selected = character(0))
   }, ignoreInit = TRUE)
   
-  lm_results <- eventReactive(input$run_lm, {
-    req(rv$meta_cell, input$lm_outcome, input$lm_predictors)
+  observeEvent(input$reset_fs, {
+    fs_state(NULL)
+    showNotification("Feature Selection results cleared.", type = "message", duration = 5)
+    output$fs_cleared_msg <- renderText("Results cleared. Run Feature Selection again to see results here.")
+  })
+  
+  observeEvent(input$run_fs, {
+    res <- run_fs()     # your existing eventReactive or function
+    fs_state(res)
+    output$fs_cleared_msg <- renderText(NULL)
+  })
+  
+  run_lm <- function() {
+    req(rv$meta_sample, rv$abundance_sample, input$lm_outcome, input$lm_predictors)
     
-    # --- Patient-level metadata ---
-    meta_patient <- rv$meta_cell %>%
-      dplyr::distinct(patient_ID, .keep_all = TRUE)
-    
-    if (!("patient_ID" %in% colnames(meta_patient))) {
-      showNotification("No patient_ID column available in metadata.", type = "error")
-      return(NULL)
-    }
+    meta_patient <- rv$meta_sample
     
     # Outcome
     if (!(input$lm_outcome %in% colnames(meta_patient))) {
@@ -2566,75 +2711,79 @@ server <- function(input, output, session) {
     }
     
     # Predictors
-    meta_cols <- colnames(meta_patient)
-    pred_meta <- intersect(input$lm_predictors, meta_cols)
-    if (length(pred_meta) == 0) {
+    pred_meta <- setdiff(intersect(input$lm_predictors, colnames(rv$meta_sample)), "leiden_cluster")
+    all_clusters <- colnames(rv$abundance_sample)
+    if ("leiden_cluster" %in% input$lm_predictors) {
+      if (!is.null(input$lm_leiden_subset) && length(input$lm_leiden_subset) > 0) {
+        cluster_predictors <- intersect(input$lm_leiden_subset, all_clusters)
+      } else {
+        cluster_predictors <- all_clusters
+      }
+    } else {
+      cluster_predictors <- character(0)
+    }
+    
+    predictors_final <- c(pred_meta, cluster_predictors)
+    if (length(predictors_final) == 0) {
       showNotification("Select at least one predictor.", type = "error")
       return(NULL)
     }
-    X <- meta_patient[, pred_meta, drop = FALSE]
     
-    # Optional cluster filter
-    if ("leiden_cluster" %in% input$lm_predictors &&
-        "leiden_cluster" %in% colnames(meta_patient) &&
-        !is.null(input$lm_leiden_subset) && length(input$lm_leiden_subset) > 0) {
-      keep <- as.character(meta_patient$leiden_cluster) %in% input$lm_leiden_subset
-      X <- X[keep, , drop = FALSE]
-      outcome <- outcome[keep]
-      meta_patient <- meta_patient[keep, , drop = FALSE]
-    }
+    # Subset before merge
+    meta_sub <- meta_patient %>%
+      dplyr::select(patient_ID, !!input$lm_outcome, dplyr::all_of(pred_meta))
+    abund_sub <- rv$abundance_sample[, cluster_predictors, drop = FALSE]
+    merged <- align_metadata_abundance(meta_sub, abund_sub, notify = showNotification)
     
-    # NA filtering
-    model_df <- cbind(X, .outcome = outcome, patient_ID = meta_patient$patient_ID)
-    na_rows <- which(!complete.cases(model_df[, setdiff(names(model_df), "patient_ID")]))
-    if (length(na_rows) > 0) {
-      dropped_ids <- model_df$patient_ID[na_rows]
-      showNotification(
-        paste("Dropped", length(na_rows), "patients due to missing values. Affected patient_IDs:",
-              paste(unique(dropped_ids), collapse = ", ")),
-        type = "warning", duration = 10
-      )
-      model_df <- model_df[-na_rows, , drop = FALSE]
-    }
+    # Filter missingness
+    merged <- merged[!is.na(merged[[input$lm_outcome]]), ]
+    X <- merged[, predictors_final, drop = FALSE]
+    y <- factor(merged[[input$lm_outcome]], levels = levels(outcome))
     
-    X <- model_df[, setdiff(names(model_df), c(".outcome", "patient_ID")), drop = FALSE]
-    outcome <- model_df$.outcome
+    n_before <- nrow(merged)
+    complete_rows <- complete.cases(data.frame(X, .y = y))
+    dropped_ids <- merged$patient_ID[!complete_rows]
     
-    if (length(outcome) < 10) {
+    X <- X[complete_rows, , drop = FALSE]
+    y <- y[complete_rows]
+    merged <- merged[complete_rows, , drop = FALSE]
+    
+    n_after <- sum(complete_rows)
+    n_dropped <- n_before - n_after
+    if (n_after < 10) {
       showNotification("Too few samples after filtering. Model not run.", type = "error")
       return(NULL)
     }
     
     # Null model baseline
-    majority_class <- names(which.max(table(outcome)))
-    null_acc <- mean(outcome == majority_class)
+    majority_class <- names(which.max(table(y)))
+    null_acc <- mean(y == majority_class)
     
     # Choose model method
     method <- switch(input$lm_model_type,
                      "Logistic Regression" = "multinom",
                      "Elastic Net"         = "glmnet",
                      "Random Forest"       = "rf")
+    cat("Running model type:", method, "\n")
     
     validation <- input$lm_validation
+    split_info <- NULL
     
     # --- Train/Test split ---
     if (validation == "Train/Test split") {
       set.seed(123)
       train_frac <- input$lm_train_frac %||% 0.7
-      idx <- caret::createDataPartition(outcome, p = train_frac, list = FALSE)
+      idx <- caret::createDataPartition(y, p = train_frac, list = FALSE)
       trainX <- X[idx, , drop = FALSE]
       testX  <- X[-idx, , drop = FALSE]
-      trainY <- outcome[idx]
-      testY  <- outcome[-idx]
-      
-      train_counts <- table(trainY)
-      test_counts  <- table(testY)
+      trainY <- y[idx]
+      testY  <- y[-idx]
       
       split_info <- list(
         n_train = length(trainY),
         n_test  = length(testY),
-        train_counts = train_counts,
-        test_counts  = test_counts
+        train_counts = table(trainY),
+        test_counts  = table(testY)
       )
       
       if (method == "glmnet") {
@@ -2642,12 +2791,12 @@ server <- function(input, output, session) {
         testMat  <- model.matrix(~ . - 1, data = testX)
         storage.mode(trainMat) <- "double"
         storage.mode(testMat)  <- "double"
-        
+        alpha_val <- input$lm_alpha %||% 0.5
         model <- caret::train(
           x = trainMat, y = trainY,
           method = "glmnet",
-          trControl = caret::trainControl(classProbs = TRUE),
-          tuneGrid = expand.grid(alpha = input$lm_alpha,
+          trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE),
+          tuneGrid = expand.grid(alpha = alpha_val,
                                  lambda = 10^seq(-3, 1, length = 20))
         )
         probs <- predict(model, newdata = testMat, type = "prob")
@@ -2656,7 +2805,7 @@ server <- function(input, output, session) {
         model <- caret::train(
           x = trainX, y = trainY,
           method = method,
-          trControl = caret::trainControl(classProbs = TRUE)
+          trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE)
         )
         probs <- predict(model, newdata = testX, type = "prob")
         pred_class <- predict(model, newdata = testX, type = "raw")
@@ -2666,57 +2815,55 @@ server <- function(input, output, session) {
         pos <- levels(trainY)[2]
         probs <- data.frame(setNames(list(as.numeric(probs)), pos), check.names = FALSE)
       }
-      
       preds_tbl <- dplyr::bind_cols(
         truth = testY,
         dplyr::rename(probs, !!!setNames(names(probs), paste0(".pred_", names(probs)))),
         pred = pred_class
       )
       names(preds_tbl)[1] <- "obs"
-      preds_tbl$obs <- factor(preds_tbl$obs, levels = levels(outcome))
+      preds_tbl$obs <- factor(preds_tbl$obs, levels = levels(y))
       
-      # Binary probability completion
-      classes <- levels(outcome)
-      have_cols <- grep("^\\.pred_", names(preds_tbl), value = TRUE)
-      if (length(classes) == 2 && length(have_cols) == 1) {
-        missing_cls <- setdiff(classes, gsub("^\\.pred_", "", have_cols))
-        preds_tbl[[paste0(".pred_", missing_cls)]] <- 1 - preds_tbl[[have_cols[1]]]
+      # Ensure pred column exists
+      if (!"pred" %in% names(preds_tbl)) {
+        prob_cols <- grep("^\\.pred_", names(preds_tbl), value = TRUE)
+        classes <- gsub("^\\.pred_", "", prob_cols)
+        max_idx <- apply(as.matrix(preds_tbl[, prob_cols, drop = FALSE]), 1, which.max)
+        preds_tbl$pred <- factor(classes[max_idx], levels = classes)
       }
       
-      # --- Console logging ---
-      message("=== Logistic Model (Train/Test) complete ===")
-      message("Outcome levels: ", paste(levels(outcome), collapse = ", "))
-      message("Prediction columns: ", paste(grep("^\\.pred_", names(preds_tbl), value = TRUE), collapse = ", "))
-      utils::str(utils::head(preds_tbl, 5))
-      
       return(list(model = model, preds = preds_tbl, null_acc = null_acc,
-                  split_info = split_info))
+                  split_info = split_info,
+                  details = list(samples_before = n_before,
+                                 samples_after = n_after,
+                                 samples_dropped = n_dropped,
+                                 dropped_ids = dropped_ids)))
     }
     
     # --- CV or LOO ---
     ctrl <- caret::trainControl(
       method = switch(validation,
                       "k-fold CV"     = "cv",
-                      "Leave-One-Out" = "LOOCV"
-      ),
+                      "Leave-One-Out" = "LOOCV"),
       number = if (validation == "k-fold CV") input$lm_k else 1,
       classProbs = TRUE,
-      savePredictions = "final"
+      savePredictions = "final",
+      verboseIter = TRUE
     )
     
     if (method == "glmnet") {
       Xmat <- model.matrix(~ . - 1, data = X)
       storage.mode(Xmat) <- "double"
+      alpha_val <- input$lm_alpha %||% 0.5
       model <- caret::train(
-        x = Xmat, y = outcome,
+        x = Xmat, y = y,
         method = "glmnet",
         trControl = ctrl,
-        tuneGrid = expand.grid(alpha = input$lm_alpha,
+        tuneGrid = expand.grid(alpha = alpha_val,
                                lambda = 10^seq(-3, 1, length = 20))
       )
     } else {
       model <- caret::train(
-        x = X, y = outcome,
+        x = X, y = y,
         method = method,
         trControl = ctrl
       )
@@ -2728,30 +2875,42 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    level_names <- levels(outcome)
+    level_names <- levels(y)
     prob_cols <- intersect(level_names, names(preds))
     rename_map <- setNames(prob_cols, paste0(".pred_", prob_cols))
     preds <- dplyr::rename(preds, !!!rename_map)
-    preds$obs <- factor(preds$obs, levels = levels(outcome))
+    preds$obs <- factor(preds$obs, levels = levels(y))
     
-    classes <- levels(outcome)
-    have_cols <- grep("^\\.pred_", names(preds), value = TRUE)
-    if (length(classes) == 2 && length(have_cols) == 1) {
-      missing_cls <- setdiff(classes, gsub("^\\.pred_", "", have_cols))
-      preds[[paste0(".pred_", missing_cls)]] <- 1 - preds[[have_cols[1]]]
+    # Ensure pred column exists
+    if (!"pred" %in% names(preds)) {
+      prob_cols <- grep("^\\.pred_", names(preds), value = TRUE)
+      classes <- gsub("^\\.pred_", "", prob_cols)
+      max_idx <- apply(as.matrix(preds[, prob_cols, drop = FALSE]), 1, which.max)
+      preds$pred <- factor(classes[max_idx], levels = classes)
     }
     
-    # --- Console logging ---
-    message("=== Logistic Model (CV/LOO) complete ===")
-    message("Outcome levels: ", paste(levels(outcome), collapse = ", "))
-    message("Prediction columns: ", paste(grep("^\\.pred_", names(preds), value = TRUE), collapse = ", "))
-    utils::str(utils::head(preds, 5))
-    
-    return(list(model = model, preds = preds, null_acc = null_acc))
+    return(list(model = model, preds = preds, null_acc = null_acc,
+                details = list(samples_before = n_before,
+                               samples_after = n_after,
+                               samples_dropped = n_dropped,
+                               dropped_ids = dropped_ids)))
+  }
+  
+  observeEvent(input$run_lm, {
+    res <- run_lm() 
+    lm_state(res)
+    output$lm_cleared_msg <- renderText(NULL)
+  })
+  
+  observeEvent(input$reset_lm, {
+    lm_state(NULL)
+    showNotification("Logistic Modeling results cleared.", type = "message", duration = 5)
+    output$lm_cleared_msg <- renderText("Results cleared. Run Logistic Modeling again to see results here.")
   })
   
   output$lm_roc_plot <- renderPlot({
-    res <- lm_results(); req(res)
+    # res <- lm_results(); req(res)
+    res <- lm_state(); req(res)
     preds <- res$preds; req(preds)
     
     n_classes <- nlevels(preds$obs)
@@ -2773,7 +2932,7 @@ server <- function(input, output, session) {
       roc_curves <- yardstick::roc_curve(long_preds, truth = obs, dplyr::starts_with(".pred_"))
       
       ggplot2::ggplot(roc_curves, ggplot2::aes(x = 1 - specificity, y = sensitivity, color = .level)) +
-        ggplot2::geom_path(size = 1) +
+        ggplot2::geom_path(linewidth = 1) +
         ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
         ggplot2::labs(title = "Multiclass ROC Curves (yardstick)", color = "Class") +
         ggplot2::theme_bw(base_size = 14)
@@ -2781,7 +2940,8 @@ server <- function(input, output, session) {
   })
   
   output$lm_perf_table <- renderTable({
-    res <- lm_results(); req(res)
+    # res <- lm_results(); req(res)
+    res <- lm_state(); req(res)
     preds <- res$preds; req(preds)
     
     n_classes <- nlevels(preds$obs)
@@ -2858,9 +3018,103 @@ server <- function(input, output, session) {
       perf_table <- rbind(perf_table, extra_rows)
     }
     
+    # Sample filtering info
+    det <- res$details
+    extra_rows2 <- data.frame(
+      Metric = c("Samples before filtering", "Samples after filtering", "Samples dropped"),
+      Value  = c(det$samples_before, det$samples_after, det$samples_dropped),
+      stringsAsFactors = FALSE
+    )
+    perf_table <- rbind(perf_table, extra_rows2)
+    if (length(det$dropped_ids) > 0) {
+      perf_table <- rbind(perf_table,
+                          data.frame(Metric = "Dropped patient_IDs",
+                                     Value = paste(unique(det$dropped_ids), collapse = ", "),
+                                     stringsAsFactors = FALSE))
+    }
+    
     perf_table
   })
   
+  output$lm_summary <- renderPrint({
+    # res <- lm_results(); req(res)
+    res <- lm_state(); req(res)
+    det <- res$details %||% list(samples_before = NA,
+                                 samples_after = NA,
+                                 samples_dropped = NA,
+                                 dropped_ids = character(0))
+    
+    cat("Samples before filtering:", det$samples_before, "\n")
+    cat("Samples after filtering:", det$samples_after, "\n")
+    cat("Samples dropped:", det$samples_dropped, "\n\n")
+    
+    if (length(det$dropped_ids) > 0) {
+      cat("Dropped patient_IDs:\n")
+      print(det$dropped_ids)
+      cat("\n")
+    }
+    
+    # Outcome distribution
+    preds <- res$preds
+    if (!is.null(preds) && "obs" %in% names(preds)) {
+      cat("Outcome distribution (observed):\n")
+      print(table(preds$obs))
+      cat("\n")
+    }
+    
+    # Train/Test breakdown if available
+    if (!is.null(res$split_info)) {
+      cat("Train breakdown:\n")
+      print(res$split_info$train_counts)
+      cat("\nTest breakdown:\n")
+      print(res$split_info$test_counts)
+      cat("\n")
+    }
+    
+    cat("Null accuracy (baseline):", round(res$null_acc, 3), "\n")
+  })
+  
+  output$hasLMResults <- reactive({
+    res <- lm_state()
+    !is.null(res) && !is.null(res$preds) && nrow(res$preds) > 0
+  })
+  outputOptions(output, "hasLMResults", suspendWhenHidden = FALSE)
+  
+  output$export_lm_results <- downloadHandler(
+    filename = function() {
+      # res <- lm_results(); req(res)
+      res <- lm_state(); req(res)
+      outcome <- input$lm_outcome %||% "outcome"
+      paste0("LogisticModel_results_with_outcome_", outcome, "_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      # res <- lm_results(); req(res)
+      res <- lm_state(); req(res)
+      preds <- res$preds; req(preds)
+      
+      export_df <- preds
+      det <- res$details
+      meta_info <- data.frame(
+        Metric = c("Null Accuracy",
+                   "Samples before filtering",
+                   "Samples after filtering",
+                   "Samples dropped",
+                   "Dropped patient_IDs"),
+        Value = c(res$null_acc,
+                  det$samples_before,
+                  det$samples_after,
+                  det$samples_dropped,
+                  paste(det$dropped_ids, collapse = ", ")),
+        stringsAsFactors = FALSE
+      )
+      
+      utils::write.csv(meta_info, file, row.names = FALSE)
+      cat("\n", file = file, append = TRUE)
+      utils::write.csv(export_df, file, row.names = FALSE, append = TRUE)
+    },
+    contentType = "text/csv"
+  )
 }
 
 shinyApp(ui, server)
+
