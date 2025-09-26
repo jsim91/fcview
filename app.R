@@ -913,14 +913,14 @@ ui <- navbarPage(
                  condition = "output.hasLMResults",
                  fluidRow(
                    column(
-                     width = 6,
+                     width = 5,
                      h4("Model Summary"),
                      verbatimTextOutput("lm_summary"),
                      h4("Performance Metrics"),
                      tableOutput("lm_perf_table")
                    ),
                    column(
-                     width = 6,
+                     width = 7,
                      h4("ROC Curve"),
                      plotOutput("lm_roc_plot", height = "500px"),
                      h4("Model Features"),
@@ -3094,7 +3094,38 @@ server <- function(input, output, session) {
     cat("Null accuracy (baseline):", round(res$null_acc, 3), "\n")
   })
   
+  order_features <- function(df, raw_col) {
+    if (is.null(df) || !raw_col %in% colnames(df)) return(df)
+    
+    # Always work with a plain data.frame
+    df <- as.data.frame(df)
+    
+    # Flag intercept rows
+    intercept_row <- grepl("\\(Intercept\\)", df$feature, fixed = TRUE)
+    df_intercept <- df[intercept_row, , drop = FALSE]
+    df_notintercept <- df[!intercept_row, , drop = FALSE]
+    
+    # Sort non‑intercepts by absolute raw value
+    if (nrow(df_notintercept) > 0) {
+      raw_vals_notint <- as.numeric(df_notintercept[[raw_col]])
+      df_notintercept <- df_notintercept[order(abs(raw_vals_notint), decreasing = TRUE), , drop = FALSE]
+    }
+    
+    # Sort intercepts (in case there are multiple)
+    if (nrow(df_intercept) > 0) {
+      raw_vals_int <- as.numeric(df_intercept[[raw_col]])
+      df_intercept <- df_intercept[order(abs(raw_vals_int), decreasing = TRUE), , drop = FALSE]
+      df <- rbind(df_intercept, df_notintercept)
+    } else {
+      df <- df_notintercept
+    }
+    
+    rownames(df) <- NULL
+    df
+  }
+  
   # --- Extract coefficients for glm / glmnet ---
+  # Coefficients for glmnet, glm, multinom with consistent schema and column order
   coef_table <- reactive({
     s <- lm_state()
     req(s, s$model)
@@ -3106,61 +3137,79 @@ server <- function(input, output, session) {
       if (is.null(coefs)) return(NULL)
       
       if (is.list(coefs)) {
-        # Multiclass case: list of matrices, one per class
+        # Multiclass glmnet: list of matrices, each matrix rows = predictors
         df_list <- lapply(names(coefs), function(cls) {
           mat <- as.matrix(coefs[[cls]])
           data.frame(
-            class = cls,
-            feature = rownames(mat),
-            coefficient = as.numeric(mat),
+            class = cls,                     # outcome category
+            feature = rownames(mat),         # predictor
+            ScaledCoefficient = as.numeric(mat),
             stringsAsFactors = FALSE
           )
         })
         df <- do.call(rbind, df_list)
-        df <- df[df$coefficient != 0, , drop = FALSE]
-        df <- df[order(df$class, -abs(df$coefficient)), ]
-        rownames(df) <- NULL
-        df
       } else {
-        # Binary case: single matrix
+        # Binary glmnet: single matrix, rows = predictors
         mat <- as.matrix(coefs)
         df <- data.frame(
           feature = rownames(mat),
-          coefficient = as.numeric(mat),
+          ScaledCoefficient = as.numeric(mat),
           stringsAsFactors = FALSE
         )
-        df <- df[df$coefficient != 0, , drop = FALSE]
-        df <- df[order(-abs(df$coefficient)), ]
-        rownames(df) <- NULL
-        df
       }
       
-    } else if (s$model$method %in% c("glm", "multinom")) {
-      # Multinomial logistic regression via nnet::multinom
-      coefs <- coef(s$model$finalModel)
-      if (is.matrix(coefs)) {
-        df <- as.data.frame(coefs)
-        df$feature <- rownames(coefs)
-        df <- tidyr::pivot_longer(df, -feature,
-                                  names_to = "class",
-                                  values_to = "coefficient")
-        df <- df[df$coefficient != 0, , drop = FALSE]
-        df <- df[order(df$class, -abs(df$coefficient)), ]
-        rownames(df) <- NULL
-        df
+      # Back-transform to unscaled coefficients if caret preProcess was used
+      if (!is.null(s$model$preProcess)) {
+        pp <- s$model$preProcess
+        sds <- pp$std
+        df$RawCoefficient <- df$ScaledCoefficient
+        for (feat in intersect(names(sds), df$feature)) {
+          idx <- df$feature == feat
+          df$RawCoefficient[idx] <- df$ScaledCoefficient[idx] / sds[feat]
+        }
       } else {
-        # Binary logistic regression
+        df$RawCoefficient <- df$ScaledCoefficient
+      }
+      
+      # Enforce column order
+      if ("class" %in% names(df)) {
+        df <- df[, c("class", "feature", "RawCoefficient", "ScaledCoefficient")]
+      } else {
+        df <- df[, c("feature", "RawCoefficient", "ScaledCoefficient")]
+      }
+      df <- order_features(df, "RawCoefficient")
+      rownames(df) <- NULL
+      df
+    } else if (s$model$method %in% c("glm", "multinom")) {
+      coefs <- coef(s$model$finalModel)
+      
+      if (is.matrix(coefs)) {
+        # Multiclass multinom: rows = outcome classes, columns = predictors
+        df <- as.data.frame(coefs)
+        df$class <- rownames(coefs)  # outcome categories from row names
+        
+        df_long <- tidyr::pivot_longer(
+          df,
+          cols = setdiff(names(df), "class"),
+          names_to = "feature",          # predictors from column names
+          values_to = "RawCoefficient"
+        )
+        
+        df_long$ScaledCoefficient <- df_long$RawCoefficient
+        df <- df_long[, c("class", "feature", "RawCoefficient", "ScaledCoefficient")]
+      } else {
+        # Binary logistic regression: named vector of coefficients (predictors)
         df <- data.frame(
           feature = names(coefs),
-          coefficient = unname(coefs),
+          RawCoefficient = unname(coefs),
           stringsAsFactors = FALSE
         )
-        df <- df[df$coefficient != 0, , drop = FALSE]
-        df <- df[order(-abs(df$coefficient)), ]
-        rownames(df) <- NULL
-        df
+        df$ScaledCoefficient <- df$RawCoefficient
+        df <- df[, c("feature", "RawCoefficient", "ScaledCoefficient")]
       }
-      
+      df <- order_features(df, "RawCoefficient")
+      rownames(df) <- NULL
+      df
     } else {
       NULL
     }
@@ -3172,11 +3221,26 @@ server <- function(input, output, session) {
     req(s, s$model)
     
     if (s$model$method == "rf") {
-      imp <- caret::varImp(s$model)$importance
-      imp$feature <- rownames(imp)
-      imp <- imp[order(-imp$Overall), , drop = FALSE]
-      rownames(imp) <- NULL
-      imp
+      imp_scaled <- caret::varImp(s$model, scale = TRUE)$importance
+      imp_scaled$feature <- rownames(imp_scaled)
+      colnames(imp_scaled)[1] <- "ScaledImportance"
+      
+      rf_model <- s$model$finalModel
+      imp_raw <- randomForest::importance(rf_model)
+      if ("%IncMSE" %in% colnames(imp_raw)) {
+        raw_vals <- imp_raw[, "%IncMSE"]
+      } else {
+        raw_vals <- imp_raw[, 1]
+      }
+      imp_raw_df <- data.frame(feature = rownames(imp_raw),
+                               RawImportance = raw_vals,
+                               stringsAsFactors = FALSE)
+      
+      df <- dplyr::left_join(imp_scaled, imp_raw_df, by = "feature")
+      df <- df[, c("feature", "RawImportance", "ScaledImportance")]
+      df <- order_features(df, "RawImportance")
+      rownames(df) <- NULL
+      df
     } else {
       NULL
     }
@@ -3242,7 +3306,7 @@ server <- function(input, output, session) {
       write.csv(perf_df, perf_file, row.names = FALSE)
       files <- c(files, perf_file)
       
-      # 3. Model Features (coefficients / importance)
+      # 3. Model Features (coefficients / importance with enforced column order)
       feat_file <- file.path(tmpdir, "model_features.csv")
       feat_df <- NULL
       if (s$model$method %in% c("glm", "glmnet", "multinom")) {
@@ -3250,7 +3314,16 @@ server <- function(input, output, session) {
       } else if (s$model$method == "rf") {
         feat_df <- rf_importance()
       }
+      
       if (!is.null(feat_df) && nrow(feat_df) > 0) {
+        # Enforce column order
+        if (all(c("class","feature","RawCoefficient","ScaledCoefficient") %in% names(feat_df))) {
+          feat_df <- feat_df[, c("class","feature","RawCoefficient","ScaledCoefficient")]
+        } else if (all(c("feature","RawCoefficient","ScaledCoefficient") %in% names(feat_df))) {
+          feat_df <- feat_df[, c("feature","RawCoefficient","ScaledCoefficient")]
+        } else if (all(c("feature","RawImportance","ScaledImportance") %in% names(feat_df))) {
+          feat_df <- feat_df[, c("feature","RawImportance","ScaledImportance")]
+        }
         write.csv(feat_df, feat_file, row.names = FALSE)
       } else {
         write.csv(data.frame(Message = "No feature importance available"),
