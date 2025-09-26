@@ -1349,8 +1349,8 @@ server <- function(input, output, session) {
     updatePickerInput(session, "cont_group_var", choices = c("", continuous_choices), selected = "")
   }, ignoreInit = TRUE)
   
-  observeEvent(rv$meta_cell, {
-    meta_cols <- sort(colnames(rv$meta_cell))
+  observeEvent(rv$meta_sample, {
+    meta_cols <- sort(colnames(rv$meta_sample))
     updatePickerInput(session, "model_outcome", choices = meta_cols)
     updatePickerInput(session, "model_predictors", choices = meta_cols)
     updatePickerInput(session, "model_covariates", choices = meta_cols)
@@ -1401,11 +1401,11 @@ server <- function(input, output, session) {
   
   # Metadata overview
   output$meta_overview <- renderTable({
-    req(rv$meta_cell)
+    req(rv$meta_sample)
     data.frame(
-      name = colnames(rv$meta_cell),
-      type = sapply(rv$meta_cell, function(x) class(x)[1]),
-      example = sapply(rv$meta_cell, function(x) paste(utils::head(unique(x), 3), collapse = ", "))
+      name = colnames(rv$meta_sample),
+      type = sapply(rv$meta_sample, function(x) class(x)[1]),
+      example = sapply(rv$meta_sample, function(x) paste(utils::head(unique(x), 3), collapse = ", "))
     )
   }, sanitize.text.function = function(x) x)
   
@@ -2287,8 +2287,8 @@ server <- function(input, output, session) {
   )
   
   # Populate Feature Selection dropdowns from same metadata source as other tabs
-  observeEvent(rv$meta_cell, {
-    meta_cols <- sort(colnames(rv$meta_cell))
+  observeEvent(rv$meta_sample, {
+    meta_cols <- sort(colnames(rv$meta_sample))
     updatePickerInput(session, "fs_outcome", choices = meta_cols)
     updatePickerInput(session, "fs_predictors", choices = meta_cols)
   }, ignoreInit = TRUE)
