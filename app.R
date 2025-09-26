@@ -28,6 +28,11 @@ suppressPackageStartupMessages({
     library(boot) # bootstrapping CIs for AUC
     library(rlang) # tidy evaluation for !!!syms
     library(randomForest)
+    library(gbm)
+    library(xgboost)
+    library(broom)
+    library(pdp)
+    library(iml)
   })
 })
 
@@ -931,6 +936,82 @@ ui <- navbarPage(
                textOutput("lm_cleared_msg")
              )
            )
+  ), 
+  tabPanel("Regression",
+           h4("Model Settings"),
+           fluidRow(
+             column(
+               3,
+               pickerInput("reg_outcome", "Continuous outcome variable", choices = NULL),
+               pickerInput("reg_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
+               conditionalPanel(
+                 condition = "input.reg_predictors.includes('leiden_cluster')",
+                 pickerInput("reg_leiden_subset", "Select clusters to include", choices = NULL, multiple = TRUE)
+               ),
+               radioButtons("reg_model_type", "Model type",
+                            choices = c("Linear Regression" = "lm",
+                                        "Elastic Net" = "glmnet",
+                                        "Random Forest Regression" = "rf",
+                                        "Gradient Boosting (GBM)" = "gbm",
+                                        "Extreme Gradient Boosting (XGBoost)" = "xgbTree")),
+               conditionalPanel(
+                 condition = "input.reg_model_type == 'glmnet'",
+                 sliderInput("reg_alpha", "Elastic Net alpha (0 = Ridge, 1 = Lasso)",
+                             min = 0, max = 1, value = 0.5, step = 0.05)
+               ),
+               radioButtons("reg_validation", "Validation strategy",
+                            choices = c("Train/Test split" = "split",
+                                        "k-fold CV" = "cv",
+                                        "Leave-One-Out" = "loo")),
+               conditionalPanel(
+                 condition = "input.reg_validation == 'split'",
+                 sliderInput("reg_train_frac", "Train fraction", min = 0.5, max = 0.95,
+                             value = 0.7, step = 0.05)
+               ),
+               conditionalPanel(
+                 condition = "input.reg_validation == 'cv'",
+                 numericInput("reg_k", "Number of folds", value = 5, min = 2, max = 20)
+               ),
+               actionButton("run_reg", "Run Regression Model"),
+               br(), br(),
+               conditionalPanel(
+                 condition = "output.hasRegResults",
+                 downloadButton("export_reg_zip", "Download All Results (ZIP)"),
+                 br(), br(),
+                 actionButton("reset_reg", "Clear Results")
+               )
+             ),
+             column(
+               9,
+               conditionalPanel(
+                 condition = "output.hasRegResults",
+                 fluidRow(
+                   column(
+                     width = 5,
+                     h4("Model Summary"),
+                     verbatimTextOutput("reg_summary"),
+                     h4("Performance Metrics"),
+                     tableOutput("reg_perf_table")
+                   ),
+                   column(
+                     width = 7,
+                     h4("Predicted vs Observed"),
+                     plotOutput("reg_pred_plot", height = "350px"),
+                     h4("Residual Diagnostics"),
+                     plotOutput("reg_resid_plot", height = "350px"),
+                     h4("Model Features"),
+                     tableOutput("reg_features"),
+                     h4("Tree-based Interpretability"),
+                     selectInput("reg_feature_pdp", "Select feature for Partial Dependence Plot",
+                                 choices = NULL),
+                     plotOutput("reg_pdp_plot", height = "350px"),
+                     plotOutput("reg_shap_plot", height = "350px")
+                   )
+                 )
+               ),
+               textOutput("reg_cleared_msg")
+             )
+           )
   )
 )
 
@@ -957,6 +1038,7 @@ server <- function(input, output, session) {
   cont_state <- reactiveVal(NULL)
   fs_state <- reactiveVal(NULL)
   lm_state <- reactiveVal(NULL)
+  reg_state <- reactiveVal(NULL)
   # rv$log <- reactiveVal(character())
   
   # Disable tabs at startup
@@ -1252,28 +1334,19 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
   
   # Auto-detect categorical vs continuous metadata
-  observeEvent(rv$meta_cell, {
-    meta_cols <- colnames(rv$meta_cell)
+  observeEvent(rv$meta_sample, {
+    meta_cols <- colnames(rv$meta_sample)
+    categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.character(x) || is.factor(x))])
+    continuous_choices  <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.numeric(x) || is.integer(x))])
     
-    categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x)
-      is.character(x) || is.factor(x)
-    )])
-    continuous_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x)
-      is.numeric(x) || is.integer(x)
-    )])
-    
-    updatePickerInput(session, "group_var",
-                      choices = c("", categorical_choices), selected = "")
-    updatePickerInput(session, "cont_var",
-                      choices = c("", continuous_choices), selected = "")
+    updatePickerInput(session, "group_var", choices = c("", categorical_choices), selected = "")
+    updatePickerInput(session, "cont_var",  choices = c("", continuous_choices),  selected = "")
   }, ignoreInit = TRUE)
   
-  observeEvent(rv$meta_cell, {
-    meta_cols <- colnames(rv$meta_cell)
-    continuous_choices <- sort(meta_cols[sapply(rv$meta_cell, is.numeric)])
-    updatePickerInput(session, "cont_group_var",
-                      choices = c("", continuous_choices),
-                      selected = "")
+  observeEvent(rv$meta_sample, {
+    meta_cols <- colnames(rv$meta_sample)
+    continuous_choices <- sort(meta_cols[sapply(rv$meta_sample, is.numeric)])
+    updatePickerInput(session, "cont_group_var", choices = c("", continuous_choices), selected = "")
   }, ignoreInit = TRUE)
   
   observeEvent(rv$meta_cell, {
@@ -1583,33 +1656,28 @@ server <- function(input, output, session) {
     },
     contentType = "text/csv"
   )
+  get_categorical_meta <- function(meta_df) {
+    cols <- colnames(meta_df)
+    sort(cols[sapply(meta_df, function(x) is.character(x) || is.factor(x))])
+  }
   
-  # Update cat_group_var choices when metadata arrives
-  observeEvent(rv$meta_cell, {
-    meta_cols <- colnames(rv$meta_cell)
-    categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))])
-    updatePickerInput(session, "cat_group_var",
-                      choices = c("", categorical_choices),
-                      selected = "")
-  }, ignoreInit = TRUE)
+  get_continuous_meta <- function(meta_df) {
+    cols <- colnames(meta_df)
+    sort(cols[sapply(meta_df, function(x) is.numeric(x) || is.integer(x))])
+  }
   
-  # If you also need group_var/cont_var (Testing tab) — keep the same pattern:
-  observeEvent(rv$meta_cell, {
-    meta_cols <- colnames(rv$meta_cell)
-    categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))])
-    continuous_choices  <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.numeric(x) || is.integer(x))])
-    updatePickerInput(session, "group_var", choices = c("", categorical_choices), selected = "")
-    updatePickerInput(session, "cont_var",  choices = c("", continuous_choices),  selected = "")
-  }, ignoreInit = TRUE)
+  observeEvent(rv$meta_sample, {
+    updatePickerInput(session, "group_var", choices = c("", get_categorical_meta(rv$meta_sample)), selected = "")
+    updatePickerInput(session, "cont_var",  choices = c("", get_continuous_meta(rv$meta_sample)),  selected = "")
+  })
   
-  # Continuous metadata picker for “Continuous” tab
-  observeEvent(rv$meta_cell, {
-    meta_cols <- colnames(rv$meta_cell)
-    continuous_choices <- sort(meta_cols[sapply(rv$meta_cell, is.numeric)])
-    updatePickerInput(session, "cont_group_var",
-                      choices = c("", continuous_choices),
-                      selected = "")
-  }, ignoreInit = TRUE)
+  observeEvent(rv$meta_sample, {
+    updatePickerInput(session, "cat_group_var", choices = c("", get_categorical_meta(rv$meta_sample)), selected = "")
+  })
+  
+  observeEvent(rv$meta_sample, {
+    updatePickerInput(session, "cont_group_var", choices = c("", get_continuous_meta(rv$meta_sample)), selected = "")
+  })
   
   # Helper to make safe input IDs from arbitrary group values
   sanitize_id <- function(x) {
@@ -1617,57 +1685,6 @@ server <- function(input, output, session) {
     x <- gsub("[^A-Za-z0-9_\\-]", "_", x)
     x
   }
-  
-  # Populate color pickers for the currently-selected categorical grouping
-  # This version will use the currently-selected metadata column (input$cat_group_var)
-  # even if the user has not yet clicked Generate plots. NA is excluded from the choices.
-  observeEvent(input$cat_populate_colors, {
-    req(rv$meta_cell)
-    
-    gv <- input$cat_group_var
-    if (is.null(gv) || !nzchar(gv) || !(gv %in% colnames(rv$meta_cell))) {
-      showNotification("No valid grouping variable selected for colors.", type = "error")
-      output$cat_color_pickers_ui <- renderUI(NULL)
-      rv$cat_colors <- NULL
-      return()
-    }
-    
-    # Always pull levels from the currently selected metadata column
-    levels_vec <- sort(unique(as.character(rv$meta_cell[[gv]])))
-    levels_vec <- levels_vec[!is.na(levels_vec)]
-    
-    if (length(levels_vec) == 0) {
-      showNotification("No non-missing group levels found to populate colors for.", type = "warning")
-      output$cat_color_pickers_ui <- renderUI(NULL)
-      rv$cat_colors <- NULL
-      return()
-    }
-    
-    # Default palette
-    default_pal <- viridis::viridis(length(levels_vec))
-    names(default_pal) <- levels_vec
-    
-    # Build UI inputs
-    ui_list <- lapply(seq_along(levels_vec), function(i) {
-      lv <- levels_vec[i]
-      input_id <- paste0("cat_color_", sanitize_id(lv))
-      colourpicker::colourInput(
-        inputId = input_id,
-        label = paste0("Color for ", lv),
-        value = default_pal[i],
-        showColour = "both"
-      )
-    })
-    
-    output$cat_color_pickers_ui <- renderUI({
-      tagList(
-        tags$div(style = "max-height: 300px; overflow-y: auto; padding-right: 6px;", ui_list)
-      )
-    })
-    
-    # Initialize rv$cat_colors
-    rv$cat_colors <- setNames(as.character(default_pal), levels_vec)
-  })
   
   # Observe any manual color changes and persist into rv$cat_colors
   observe({
@@ -1801,46 +1818,29 @@ server <- function(input, output, session) {
     gsub("[^A-Za-z0-9_\\-]", "_", x)
   }
   
-  # Populate color pickers when button is clicked
-  observeEvent(input$cat_populate_colors, {
-    req(rv$meta_sample)
-    
+  build_color_pickers_sample <- function(meta_df, group_var, plotted_df = NULL, input_prefix = "cat_color") {
+    # Prefer group levels from plotted_df to match exactly what’s on the plot
     levels_vec <- NULL
-    cp <- NULL
-    
-    # Try to use the last generated cat_plot_data (ensures exact plotting groups)
-    try({ cp <- cat_plot_data() }, silent = TRUE)
-    if (!is.null(cp) && is.list(cp) && !is.null(cp$data) && nrow(cp$data) > 0) {
-      group_col <- cp$group_var
-      if (!is.null(group_col) && nzchar(group_col) && group_col %in% colnames(cp$data)) {
-        levels_vec <- unique(as.character(cp$data[[group_col]]))
-      }
+    if (!is.null(plotted_df) && !is.null(group_var) && nzchar(group_var) && group_var %in% colnames(plotted_df)) {
+      levels_vec <- unique(as.character(plotted_df[[group_var]]))
     }
-    
-    # Fallback: use metadata column directly
     if (is.null(levels_vec) || length(levels_vec) == 0) {
-      gv <- input$cat_group_var
-      if (!is.null(gv) && nzchar(gv) && gv %in% colnames(rv$meta_sample)) {
-        levels_vec <- sort(unique(as.character(rv$meta_sample[[gv]])))
+      if (!is.null(group_var) && nzchar(group_var) && (group_var %in% colnames(meta_df))) {
+        levels_vec <- sort(unique(as.character(meta_df[[group_var]])))
+      } else {
+        return(list(ui = NULL, colors = NULL, error = "No valid grouping variable selected for colors."))
       }
     }
-    
     levels_vec <- levels_vec[!is.na(levels_vec)]
     if (length(levels_vec) == 0) {
-      showNotification("No non-missing group levels found to populate colors for.", type = "warning")
-      output$cat_color_pickers_ui <- renderUI(NULL)
-      rv$cat_colors <- NULL
-      return()
+      return(list(ui = NULL, colors = NULL, error = "No non-missing group levels found to populate colors for."))
     }
-    
-    # Default palette
     default_pal <- viridis::viridis(length(levels_vec))
     names(default_pal) <- levels_vec
     
-    # Build UI inputs
     ui_list <- lapply(seq_along(levels_vec), function(i) {
       lv <- levels_vec[i]
-      input_id <- paste0("cat_color_", sanitize_id(lv))
+      input_id <- paste0(input_prefix, "_", sanitize_id(lv))
       colourpicker::colourInput(
         inputId = input_id,
         label = paste0("Color for ", lv),
@@ -1849,14 +1849,31 @@ server <- function(input, output, session) {
       )
     })
     
-    output$cat_color_pickers_ui <- renderUI({
-      tagList(
-        tags$div(style = "max-height: 300px; overflow-y: auto; padding-right: 6px;", ui_list)
-      )
-    })
+    list(
+      ui = tagList(tags$div(style = "max-height: 300px; overflow-y: auto; padding-right: 6px;", ui_list)),
+      colors = setNames(as.character(default_pal), levels_vec),
+      error = NULL
+    )
+  }
+  
+  # Observer using sample-level metadata and plotted groups
+  observeEvent(input$cat_populate_colors, {
+    req(rv$meta_sample)
+    cp <- NULL
+    # Try to use last plotted data (cat_state) for exact levels
+    try({ cp <- cat_state() }, silent = TRUE)
+    plotted_df <- if (!is.null(cp) && is.list(cp) && !is.null(cp$data)) cp$data else NULL
+    group_var <- if (!is.null(cp)) cp$group_var else input$cat_group_var
     
-    # Initialize rv$cat_colors
-    rv$cat_colors <- setNames(as.character(default_pal), levels_vec)
+    res <- build_color_pickers_sample(rv$meta_sample, group_var, plotted_df, "cat_color")
+    if (!is.null(res$error)) {
+      showNotification(res$error, type = "error")
+      output$cat_color_pickers_ui <- renderUI(NULL)
+      rv$cat_colors <- NULL
+      return()
+    }
+    output$cat_color_pickers_ui <- renderUI(res$ui)
+    rv$cat_colors <- res$colors
   })
   
   # Observe manual color changes
@@ -3340,6 +3357,284 @@ server <- function(input, output, session) {
         pdf(roc_file); plot.new(); text(0.5, 0.5, "ROC plot not available"); dev.off()
       }
       files <- c(files, roc_file)
+      
+      # Bundle into zip
+      zip::zip(zipfile = file, files = files, mode = "cherry-pick")
+    },
+    contentType = "application/zip"
+  )
+  
+  # Populate Regression tab dropdowns from sample-level metadata
+  observe({
+    req(rv$meta_sample)
+    meta_cols <- colnames(rv$meta_sample)
+    
+    # Continuous outcomes: numeric or integer metadata
+    continuous_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.numeric(x) || is.integer(x))])
+    
+    # Predictors: all sample-level metadata columns (same as classification tab)
+    predictor_choices <- sort(meta_cols)
+    
+    updatePickerInput(session, "reg_outcome",
+                      choices = continuous_choices,
+                      selected = if (length(continuous_choices) > 0) continuous_choices[1])
+    
+    updatePickerInput(session, "reg_predictors",
+                      choices = predictor_choices,
+                      selected = NULL)
+  })
+  
+  observeEvent(input$run_reg, {
+    df <- dataset()
+    req(input$reg_outcome, input$reg_predictors)
+    
+    formula <- as.formula(paste(input$reg_outcome, "~",
+                                paste(input$reg_predictors, collapse = "+")))
+    
+    ctrl <- switch(input$reg_validation,
+                   "cv"   = trainControl(method = "cv", number = input$reg_k),
+                   "loo"  = trainControl(method = "LOOCV"),
+                   "split"= trainControl(method = "boot", number = 1)
+    )
+    
+    # Train model
+    model <- caret::train(formula, data = df,
+                          method = input$reg_model_type,
+                          trControl = ctrl,
+                          tuneGrid = if (input$reg_model_type == "glmnet")
+                            expand.grid(alpha = input$reg_alpha,
+                                        lambda = exp(seq(-5, 1, length = 50)))
+                          else NULL)
+    
+    preds <- predict(model, df)
+    obs <- df[[input$reg_outcome]]
+    
+    # Performance metrics
+    rmse <- yardstick::rmse_vec(obs, preds)
+    mae  <- yardstick::mae_vec(obs, preds)
+    rsq  <- yardstick::rsq_vec(obs, preds)
+    
+    perf <- data.frame(
+      Metric = c("RMSE", "MAE", "R-squared"),
+      Value  = c(rmse, mae, rsq)
+    )
+    
+    reg_state(list(
+      model = model,
+      preds = preds,
+      obs   = obs,
+      perf  = perf
+    ))
+  })
+  
+  # Outputs
+  output$hasRegResults <- reactive({ !is.null(reg_state()) })
+  outputOptions(output, "hasRegResults", suspendWhenHidden = FALSE)
+  
+  output$reg_summary <- renderPrint({
+    s <- reg_state(); req(s)
+    summary(s$model$finalModel)
+  })
+  
+  output$reg_perf_table <- renderTable({
+    s <- reg_state(); req(s)
+    s$perf
+  })
+  
+  output$reg_features <- renderTable({
+    s <- reg_state(); req(s)
+    method <- input$reg_model_type
+    if (method %in% c("lm", "glmnet")) {
+      df <- broom::tidy(s$model$finalModel)
+      df <- df[, c("term", "estimate")]
+      colnames(df) <- c("feature", "RawCoefficient")
+      df$ScaledCoefficient <- df$RawCoefficient
+      df <- order_features(df, "RawCoefficient")
+      df
+    } else if (method == "rf") {
+      imp <- caret::varImp(s$model)$importance
+      imp$feature <- rownames(imp)
+      colnames(imp)[1] <- "ScaledImportance"
+      rf_imp <- randomForest::importance(s$model$finalModel)
+      raw_vals <- if ("%IncMSE" %in% colnames(rf_imp)) rf_imp[, "%IncMSE"] else rf_imp[, 1]
+      imp$RawImportance <- raw_vals[match(imp$feature, rownames(rf_imp))]
+      imp <- imp[, c("feature", "RawImportance", "ScaledImportance")]
+      imp <- order_features(imp, "RawImportance")
+      imp
+    } else if (method %in% c("gbm", "xgbTree")) {
+      imp <- caret::varImp(s$model)$importance
+      imp$feature <- rownames(imp)
+      colnames(imp)[1] <- "ScaledImportance"
+      imp$RawImportance <- imp$ScaledImportance  # caret doesn’t expose raw easily
+      imp <- imp[, c("feature", "RawImportance", "ScaledImportance")]
+      imp <- order_features(imp, "RawImportance")
+      imp
+    }
+  })
+  
+  output$reg_pred_plot <- renderPlot({
+    s <- reg_state(); req(s)
+    df <- data.frame(obs = s$obs, preds = s$preds)
+    ggplot(df, aes(x = obs, y = preds)) +
+      geom_point(alpha = 0.6) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+      labs(x = "Observed", y = "Predicted") +
+      theme_minimal()
+  })
+  
+  output$reg_resid_plot <- renderPlot({
+    s <- reg_state(); req(s)
+    resid <- s$obs - s$preds
+    df <- data.frame(preds = s$preds, resid = resid)
+    ggplot(df, aes(x = preds, y = resid)) +
+      geom_point(alpha = 0.6) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      labs(x = "Predicted", y = "Residuals") +
+      theme_minimal()
+  })
+  
+  observeEvent(reg_state(), {
+    s <- reg_state(); req(s)
+    updateSelectInput(session, "reg_feature_pdp",
+                      choices = input$reg_predictors)
+  })
+  
+  output$reg_pdp_plot <- renderPlot({
+    s <- reg_state(); req(s)
+    method <- input$reg_model_type
+    if (method %in% c("rf", "gbm", "xgbTree")) {
+      feat <- input$reg_feature_pdp; req(feat)
+      pd <- pdp::partial(s$model, pred.var = feat, train = dataset())
+      autoplot(pd) + theme_minimal() +
+        labs(title = paste("Partial Dependence:", feat))
+    }
+  })
+  
+  output$reg_shap_plot <- renderPlot({
+    s <- reg_state(); req(s)
+    method <- input$reg_model_type
+    if (method %in% c("rf", "gbm", "xgbTree")) {
+      df <- dataset()
+      X <- df[, input$reg_predictors, drop = FALSE]
+      predictor <- iml::Predictor$new(s$model, data = X, y = df[[input$reg_outcome]])
+      shap <- iml::Shapley$new(predictor, x.interest = X[1, , drop = FALSE])
+      plot(shap)
+    }
+  })
+  
+  
+  output$export_reg_zip <- downloadHandler(
+    filename = function() {
+      model <- gsub("\\s+", "_", tolower(input$reg_model_type %||% "model"))
+      validation <- gsub("\\s+", "_", tolower(input$reg_validation %||% "validation"))
+      outcome <- gsub("\\s+", "_", tolower(input$reg_outcome %||% "outcome"))
+      paste0("regression_", model, "_", validation, "_", outcome, ".zip")
+    },
+    content = function(file) {
+      s <- reg_state(); req(s)
+      
+      tmpdir <- tempdir()
+      files <- c()
+      
+      # 1. Model Summary
+      summary_file <- file.path(tmpdir, "reg_summary.csv")
+      write.csv(broom::glance(s$model), summary_file, row.names = FALSE)
+      files <- c(files, summary_file)
+      
+      # 2. Performance Metrics
+      perf_file <- file.path(tmpdir, "reg_performance.csv")
+      write.csv(s$perf, perf_file, row.names = FALSE)
+      files <- c(files, perf_file)
+      
+      # 3. Model Features
+      feat_file <- file.path(tmpdir, "reg_features.csv")
+      feat_df <- NULL
+      method <- input$reg_model_type
+      if (method %in% c("lm", "glmnet")) {
+        df <- broom::tidy(s$model$finalModel)
+        df <- df[, c("term", "estimate")]
+        colnames(df) <- c("feature", "RawCoefficient")
+        df$ScaledCoefficient <- df$RawCoefficient
+        feat_df <- order_features(df, "RawCoefficient")
+      } else if (method == "rf") {
+        imp <- caret::varImp(s$model)$importance
+        imp$feature <- rownames(imp)
+        colnames(imp)[1] <- "ScaledImportance"
+        rf_imp <- randomForest::importance(s$model$finalModel)
+        raw_vals <- if ("%IncMSE" %in% colnames(rf_imp)) rf_imp[, "%IncMSE"] else rf_imp[, 1]
+        imp$RawImportance <- raw_vals[match(imp$feature, rownames(rf_imp))]
+        feat_df <- imp[, c("feature", "RawImportance", "ScaledImportance")]
+        feat_df <- order_features(feat_df, "RawImportance")
+      } else if (method %in% c("gbm", "xgbTree")) {
+        imp <- caret::varImp(s$model)$importance
+        imp$feature <- rownames(imp)
+        colnames(imp)[1] <- "ScaledImportance"
+        imp$RawImportance <- imp$ScaledImportance
+        feat_df <- imp[, c("feature", "RawImportance", "ScaledImportance")]
+        feat_df <- order_features(feat_df, "RawImportance")
+      }
+      
+      if (!is.null(feat_df) && nrow(feat_df) > 0) {
+        write.csv(feat_df, feat_file, row.names = FALSE)
+      } else {
+        write.csv(data.frame(Message = "No feature importance available"),
+                  feat_file, row.names = FALSE)
+      }
+      files <- c(files, feat_file)
+      
+      # 4. Predicted vs Observed plot
+      pred_plot_file <- file.path(tmpdir, "pred_vs_obs.pdf")
+      pdf(pred_plot_file)
+      df <- data.frame(obs = s$obs, preds = s$preds)
+      print(
+        ggplot(df, aes(x = obs, y = preds)) +
+          geom_point(alpha = 0.6) +
+          geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+          labs(x = "Observed", y = "Predicted") +
+          theme_minimal()
+      )
+      dev.off()
+      files <- c(files, pred_plot_file)
+      
+      # 5. Residual plot
+      resid_plot_file <- file.path(tmpdir, "residuals.pdf")
+      pdf(resid_plot_file)
+      resid <- s$obs - s$preds
+      df <- data.frame(preds = s$preds, resid = resid)
+      print(
+        ggplot(df, aes(x = preds, y = resid)) +
+          geom_point(alpha = 0.6) +
+          geom_hline(yintercept = 0, linetype = "dashed") +
+          labs(x = "Predicted", y = "Residuals") +
+          theme_minimal()
+      )
+      dev.off()
+      files <- c(files, resid_plot_file)
+      
+      # 6. Partial Dependence Plot (tree-based only)
+      if (method %in% c("rf", "gbm", "xgbTree")) {
+        pdp_file <- file.path(tmpdir, "partial_dependence.pdf")
+        pdf(pdp_file)
+        feat <- input$reg_feature_pdp
+        if (!is.null(feat) && feat %in% input$reg_predictors) {
+          pd <- pdp::partial(s$model, pred.var = feat, train = dataset())
+          print(autoplot(pd) + theme_minimal() +
+                  labs(title = paste("Partial Dependence:", feat)))
+        }
+        dev.off()
+        files <- c(files, pdp_file)
+        
+        # 7. SHAP Plot (example for first observation)
+        shap_file <- file.path(tmpdir, "shap_plot.pdf")
+        pdf(shap_file)
+        df <- dataset()
+        X <- df[, input$reg_predictors, drop = FALSE]
+        predictor <- iml::Predictor$new(s$model, data = X, y = df[[input$reg_outcome]])
+        shap <- iml::Shapley$new(predictor, x.interest = X[1, , drop = FALSE])
+        plot(shap)
+        dev.off()
+        files <- c(files, shap_file)
+      }
       
       # Bundle into zip
       zip::zip(zipfile = file, files = files, mode = "cherry-pick")
