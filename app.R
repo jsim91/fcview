@@ -3512,6 +3512,7 @@ server <- function(input, output, session) {
   output$reg_features <- renderTable({
     s <- reg_state(); req(s)
     method <- input$reg_model_type
+    
     if (method %in% c("lm", "glmnet")) {
       df <- broom::tidy(s$model$finalModel)
       df <- df[, c("term", "estimate")]
@@ -3521,19 +3522,20 @@ server <- function(input, output, session) {
       df <- df[, c("feature", "RawCoefficient", "ScaledCoefficient")]
       df <- order_features(df, "RawCoefficient")
       df
+      
     } else if (method == "rf") {
       imp <- caret::varImp(s$model)$importance
       imp$feature_safe <- rownames(imp)
       imp$feature <- s$safe_to_orig[imp$feature_safe] %||% imp$feature_safe
       colnames(imp)[1] <- "ScaledImportance"
       rf_imp <- randomForest::importance(s$model$finalModel)
-      # raw importance aligned by safe names
       raw_vals <- if ("%IncMSE" %in% colnames(rf_imp)) rf_imp[, "%IncMSE"] else rf_imp[, 1]
       imp$RawImportance <- raw_vals[match(imp$feature_safe, rownames(rf_imp))]
       imp <- imp[, c("feature", "RawImportance", "ScaledImportance")]
       imp <- order_features(imp, "RawImportance")
       imp
-    } else if (method %in% c("gbm", "xgbTree")) {
+      
+    } else if (method == "gbm") {
       imp <- caret::varImp(s$model)$importance
       imp$feature_safe <- rownames(imp)
       imp$feature <- s$safe_to_orig[imp$feature_safe] %||% imp$feature_safe
@@ -3542,6 +3544,14 @@ server <- function(input, output, session) {
       imp <- imp[, c("feature", "RawImportance", "ScaledImportance")]
       imp <- order_features(imp, "RawImportance")
       imp
+      
+    } else if (method == "xgbTree") {
+      # Use native xgboost importance to expose Gain, Cover, Frequency
+      imp <- xgboost::xgb.importance(model = s$model$finalModel)
+      imp$feature <- s$safe_to_orig[imp$Feature] %||% imp$Feature
+      feat_df <- imp[, c("feature", "Gain", "Cover", "Frequency")]
+      feat_df <- feat_df[order(-feat_df$Gain), ]
+      feat_df
     }
   })
   
