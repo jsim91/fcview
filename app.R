@@ -53,6 +53,26 @@ pct_clip <- function(x, p = c(0.01, 0.99)) {
 #   rv$log(new)
 # }
 
+# Assert that a given metadata frame is sample-level
+assert_sample_level <- function(meta_df, tab_name = "Unknown") {
+  if (is.null(meta_df)) {
+    showNotification(paste0("[", tab_name, "] metadata is NULL."), type = "error")
+    return(FALSE)
+  }
+  # Heuristic: sample-level metadata should have one row per patient_ID
+  if ("patient_ID" %in% colnames(meta_df)) {
+    dup_ids <- meta_df$patient_ID[duplicated(meta_df$patient_ID)]
+    if (length(dup_ids) > 0) {
+      showNotification(
+        paste0("[", tab_name, "] Warning: duplicate patient_IDs detected: ",
+               paste(unique(dup_ids), collapse = ", ")),
+        type = "warning", duration = 10
+      )
+    }
+  }
+  TRUE
+}
+
 resetResults <- function(resultReactive, cacheReactive = NULL) {
   resultReactive(NULL)
   if (!is.null(cacheReactive)) cacheReactive(NULL)
@@ -1494,6 +1514,7 @@ server <- function(input, output, session) {
   # Store results + adj_col name from the run
   run_tests <- eventReactive(input$run_test, {
     req(rv$meta_sample, rv$abundance_sample)
+    assert_sample_level(rv$meta_sample, "Testing")
     
     test_type_run   <- input$test_type
     p_adj_method_run <- input$p_adj_method
@@ -1702,6 +1723,7 @@ server <- function(input, output, session) {
   
   cat_plot_data <- eventReactive(input$generate_cat_plots, {
     req(rv$meta_sample, rv$abundance_sample)
+    assert_sample_level(rv$meta_sample, "Categorical")
     
     abund0 <- rv$abundance_sample
     if (is.null(abund0)) {
@@ -2067,6 +2089,7 @@ server <- function(input, output, session) {
   
   cont_plot_data <- eventReactive(input$generate_cont_plots, {
     req(rv$meta_sample, rv$abundance_sample)
+    assert_sample_level(rv$meta_sample, "Continuous")
     
     abund0 <- rv$abundance_sample
     if (is.null(abund0)) {
@@ -2300,6 +2323,7 @@ server <- function(input, output, session) {
   
   run_fs <- function() {
     req(rv$meta_sample, rv$abundance_sample, input$fs_outcome, input$fs_predictors)
+    assert_sample_level(rv$meta_sample, "Feature Selection")
     
     # Metadata predictors (exclude placeholder)
     pred_meta <- setdiff(intersect(input$fs_predictors, colnames(rv$meta_sample)), "leiden_cluster")
@@ -2708,6 +2732,7 @@ server <- function(input, output, session) {
   
   run_lm <- function() {
     req(rv$meta_sample, rv$abundance_sample, input$lm_outcome, input$lm_predictors)
+    assert_sample_level(rv$meta_sample, "Classification")
     
     meta_patient <- rv$meta_sample
     
