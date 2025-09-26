@@ -771,6 +771,7 @@ ui <- navbarPage(
                             selected = "draw"),
                br(), 
                actionButton("cat_populate_colors", "Populate colors for selected group variable"),
+               br(), 
                uiOutput("cat_color_pickers_ui"),
                br(), 
                actionButton("generate_cat_plots", "Generate plots"),
@@ -890,8 +891,8 @@ ui <- navbarPage(
                             choices = c("Train/Test split", "k-fold CV", "Leave-One-Out")),
                conditionalPanel(
                  condition = "input.lm_validation == 'Train/Test split'",
-                 sliderInput("lm_train_frac", "Train fraction",
-                             min = 0.5, max = 0.95, value = 0.7, step = 0.05)
+                 sliderInput("lm_train_frac", "Train fraction", min = 0.5, max = 0.95,
+                             value = 0.7, step = 0.05)
                ),
                conditionalPanel(
                  condition = "input.lm_validation == 'k-fold CV'",
@@ -901,7 +902,7 @@ ui <- navbarPage(
                br(), br(),
                conditionalPanel(
                  condition = "output.hasLMResults",
-                 downloadButton("export_lm_results", "Download Logistic Model Results"),
+                 downloadButton("export_lm_zip", "Download All Results (ZIP)"),
                  br(), br(),
                  actionButton("reset_lm", "Clear Results")
                )
@@ -921,7 +922,9 @@ ui <- navbarPage(
                    column(
                      width = 6,
                      h4("ROC Curve"),
-                     plotOutput("lm_roc_plot", height = "500px")
+                     plotOutput("lm_roc_plot", height = "500px"),
+                     h4("Model Features"),
+                     tableOutput("lm_features")
                    )
                  )
                ),
@@ -2897,8 +2900,49 @@ server <- function(input, output, session) {
   }
   
   observeEvent(input$run_lm, {
-    res <- run_lm() 
-    lm_state(res)
+    res <- run_lm()
+    req(res)
+    
+    preds <- res$preds
+    req(preds)
+    
+    n_classes <- nlevels(preds$obs)
+    roc_plot <- NULL
+    
+    if (n_classes == 2) {
+      # Binary ROC with pROC
+      classes <- levels(preds$obs)
+      positive <- classes[2]
+      roc_obj <- pROC::roc(
+        response = preds$obs,
+        predictor = preds[[paste0(".pred_", positive)]],
+        levels = rev(classes)
+      )
+      roc_plot <- ggplot2::ggplot(data.frame(
+        fpr = 1 - roc_obj$specificities,
+        tpr = roc_obj$sensitivities
+      ), ggplot2::aes(x = fpr, y = tpr)) +
+        ggplot2::geom_line(color = "blue", linewidth = 1) +
+        ggplot2::geom_abline(linetype = "dashed", color = "grey50") +
+        ggplot2::labs(title = sprintf("Binary ROC Curve (AUC = %.3f)", pROC::auc(roc_obj)),
+                      x = "False Positive Rate", y = "True Positive Rate") +
+        ggplot2::theme_minimal(base_size = 14)
+    } else {
+      # Multiclass ROC with yardstick
+      long_preds <- preds %>%
+        dplyr::select(obs, starts_with(".pred_"))
+      roc_curves <- yardstick::roc_curve(long_preds, truth = obs, dplyr::starts_with(".pred_"))
+      roc_plot <- ggplot2::ggplot(roc_curves,
+                                  ggplot2::aes(x = 1 - specificity, y = sensitivity, color = .level)) +
+        ggplot2::geom_path(linewidth = 1) +
+        ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+        ggplot2::labs(title = "Multiclass ROC Curves (yardstick)", color = "Class") +
+        ggplot2::theme_bw(base_size = 14)
+    }
+    
+    # Store everything in lm_state, including cached ROC plot
+    lm_state(c(res, list(roc_plot = roc_plot)))
+    
     output$lm_cleared_msg <- renderText(NULL)
   })
   
@@ -2909,40 +2953,15 @@ server <- function(input, output, session) {
   })
   
   output$lm_roc_plot <- renderPlot({
-    # res <- lm_results(); req(res)
-    res <- lm_state(); req(res)
-    preds <- res$preds; req(preds)
-    
-    n_classes <- nlevels(preds$obs)
-    
-    if (n_classes == 2) {
-      # Binary ROC with pROC
-      classes <- levels(preds$obs)
-      positive <- classes[2]
-      roc_obj <- pROC::roc(response = preds$obs,
-                           predictor = preds[[paste0(".pred_", positive)]],
-                           levels = rev(classes))
-      plot(roc_obj, main = "Binary ROC Curve", col = "blue", lwd = 2, print.auc = TRUE)
-      abline(a = 0, b = 1, lty = 2, col = "red")
-    } else {
-      # Multiclass ROC with yardstick (one-vs-rest curves per class)
-      long_preds <- preds %>%
-        dplyr::select(obs, starts_with(".pred_"))
-      
-      roc_curves <- yardstick::roc_curve(long_preds, truth = obs, dplyr::starts_with(".pred_"))
-      
-      ggplot2::ggplot(roc_curves, ggplot2::aes(x = 1 - specificity, y = sensitivity, color = .level)) +
-        ggplot2::geom_path(linewidth = 1) +
-        ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
-        ggplot2::labs(title = "Multiclass ROC Curves (yardstick)", color = "Class") +
-        ggplot2::theme_bw(base_size = 14)
-    }
+    s <- lm_state()
+    req(s, s$roc_plot)
+    s$roc_plot
   })
   
-  output$lm_perf_table <- renderTable({
-    # res <- lm_results(); req(res)
-    res <- lm_state(); req(res)
-    preds <- res$preds; req(preds)
+  build_perf_table <- function(res, rv) {
+    req(res, res$preds)
+    preds <- res$preds
+    req(preds)
     
     n_classes <- nlevels(preds$obs)
     
@@ -2975,7 +2994,6 @@ server <- function(input, output, session) {
     )
     
     if (n_classes == 2) {
-      # Binary AUC with pROC
       classes <- levels(preds$obs)
       positive <- classes[2]
       roc_obj <- pROC::roc(response = preds$obs,
@@ -2985,7 +3003,6 @@ server <- function(input, output, session) {
       perf_table <- rbind(perf_table,
                           data.frame(Metric = "AUC (pROC)", Value = round(auc_val, 3), stringsAsFactors = FALSE))
     } else {
-      # Multiclass AUCs with yardstick
       long_preds <- preds %>%
         dplyr::select(obs, starts_with(".pred_"))
       
@@ -3004,7 +3021,6 @@ server <- function(input, output, session) {
       )
     }
     
-    # Train/Test split info
     if (!is.null(res$split_info)) {
       train_summary <- paste(names(res$split_info$train_counts),
                              res$split_info$train_counts, collapse = "; ")
@@ -3018,7 +3034,6 @@ server <- function(input, output, session) {
       perf_table <- rbind(perf_table, extra_rows)
     }
     
-    # Sample filtering info
     det <- res$details
     extra_rows2 <- data.frame(
       Metric = c("Samples before filtering", "Samples after filtering", "Samples dropped"),
@@ -3034,6 +3049,11 @@ server <- function(input, output, session) {
     }
     
     perf_table
+  }
+  
+  output$lm_perf_table <- renderTable({
+    res <- lm_state(); req(res)
+    build_perf_table(res, rv)
   })
   
   output$lm_summary <- renderPrint({
@@ -3074,46 +3094,186 @@ server <- function(input, output, session) {
     cat("Null accuracy (baseline):", round(res$null_acc, 3), "\n")
   })
   
+  # --- Extract coefficients for glm / glmnet ---
+  coef_table <- reactive({
+    s <- lm_state()
+    req(s, s$model)
+    
+    if (s$model$method == "glmnet") {
+      coefs <- tryCatch({
+        coef(s$model$finalModel, s = s$model$bestTune$lambda)
+      }, error = function(e) NULL)
+      if (is.null(coefs)) return(NULL)
+      
+      if (is.list(coefs)) {
+        # Multiclass case: list of matrices, one per class
+        df_list <- lapply(names(coefs), function(cls) {
+          mat <- as.matrix(coefs[[cls]])
+          data.frame(
+            class = cls,
+            feature = rownames(mat),
+            coefficient = as.numeric(mat),
+            stringsAsFactors = FALSE
+          )
+        })
+        df <- do.call(rbind, df_list)
+        df <- df[df$coefficient != 0, , drop = FALSE]
+        df <- df[order(df$class, -abs(df$coefficient)), ]
+        rownames(df) <- NULL
+        df
+      } else {
+        # Binary case: single matrix
+        mat <- as.matrix(coefs)
+        df <- data.frame(
+          feature = rownames(mat),
+          coefficient = as.numeric(mat),
+          stringsAsFactors = FALSE
+        )
+        df <- df[df$coefficient != 0, , drop = FALSE]
+        df <- df[order(-abs(df$coefficient)), ]
+        rownames(df) <- NULL
+        df
+      }
+      
+    } else if (s$model$method %in% c("glm", "multinom")) {
+      # Multinomial logistic regression via nnet::multinom
+      coefs <- coef(s$model$finalModel)
+      if (is.matrix(coefs)) {
+        df <- as.data.frame(coefs)
+        df$feature <- rownames(coefs)
+        df <- tidyr::pivot_longer(df, -feature,
+                                  names_to = "class",
+                                  values_to = "coefficient")
+        df <- df[df$coefficient != 0, , drop = FALSE]
+        df <- df[order(df$class, -abs(df$coefficient)), ]
+        rownames(df) <- NULL
+        df
+      } else {
+        # Binary logistic regression
+        df <- data.frame(
+          feature = names(coefs),
+          coefficient = unname(coefs),
+          stringsAsFactors = FALSE
+        )
+        df <- df[df$coefficient != 0, , drop = FALSE]
+        df <- df[order(-abs(df$coefficient)), ]
+        rownames(df) <- NULL
+        df
+      }
+      
+    } else {
+      NULL
+    }
+  })
+  
+  # --- Extract variable importance for random forest ---
+  rf_importance <- reactive({
+    s <- lm_state()
+    req(s, s$model)
+    
+    if (s$model$method == "rf") {
+      imp <- caret::varImp(s$model)$importance
+      imp$feature <- rownames(imp)
+      imp <- imp[order(-imp$Overall), , drop = FALSE]
+      rownames(imp) <- NULL
+      imp
+    } else {
+      NULL
+    }
+  })
+  
+  output$lm_features <- renderTable({
+    s <- lm_state()
+    req(s, s$model)
+    
+    if (s$model$method %in% c("glm", "glmnet", "multinom")) {
+      coef_table()
+    } else if (s$model$method == "rf") {
+      rf_importance()
+    } else {
+      data.frame(Message = "Feature importance not available for this model type.")
+    }
+  }, digits = 3)
+  
   output$hasLMResults <- reactive({
     res <- lm_state()
     !is.null(res) && !is.null(res$preds) && nrow(res$preds) > 0
   })
   outputOptions(output, "hasLMResults", suspendWhenHidden = FALSE)
   
-  output$export_lm_results <- downloadHandler(
+  output$export_lm_zip <- downloadHandler(
     filename = function() {
-      # res <- lm_results(); req(res)
-      res <- lm_state(); req(res)
-      outcome <- input$lm_outcome %||% "outcome"
-      paste0("LogisticModel_results_with_outcome_", outcome, "_", Sys.Date(), ".csv")
+      model <- gsub("\\s+", "_", tolower(input$lm_model_type %||% "model"))
+      validation <- gsub("\\s+", "_", tolower(input$lm_validation %||% "validation"))
+      outcome <- gsub("\\s+", "_", tolower(input$lm_outcome %||% "outcome"))
+      paste0(model, "_", validation, "_", outcome, ".zip")
     },
     content = function(file) {
-      # res <- lm_results(); req(res)
-      res <- lm_state(); req(res)
-      preds <- res$preds; req(preds)
+      s <- lm_state()
+      req(s, s$model)
       
-      export_df <- preds
-      det <- res$details
-      meta_info <- data.frame(
-        Metric = c("Null Accuracy",
-                   "Samples before filtering",
-                   "Samples after filtering",
-                   "Samples dropped",
-                   "Dropped patient_IDs"),
-        Value = c(res$null_acc,
-                  det$samples_before,
-                  det$samples_after,
-                  det$samples_dropped,
-                  paste(det$dropped_ids, collapse = ", ")),
+      tmpdir <- tempdir()
+      files <- c()
+      
+      # 1. Model Summary (key-value CSV)
+      summary_file <- file.path(tmpdir, "model_summary.csv")
+      summary_kv <- data.frame(
+        Key = c("Model type", "Outcome variable", "Predictors",
+                "Validation strategy", "Null accuracy",
+                "Samples before filtering", "Samples after filtering", "Samples dropped"),
+        Value = c(input$lm_model_type,
+                  input$lm_outcome,
+                  paste(input$lm_predictors, collapse = "; "),
+                  input$lm_validation,
+                  sprintf("%.3f", s$null_acc %||% NA),
+                  s$details$samples_before %||% NA,
+                  s$details$samples_after %||% NA,
+                  s$details$samples_dropped %||% NA),
         stringsAsFactors = FALSE
       )
+      write.csv(summary_kv, summary_file, row.names = FALSE)
+      files <- c(files, summary_file)
       
-      utils::write.csv(meta_info, file, row.names = FALSE)
-      cat("\n", file = file, append = TRUE)
-      utils::write.csv(export_df, file, row.names = FALSE, append = TRUE)
+      # 2. Performance Metrics (exactly as in UI)
+      perf_file <- file.path(tmpdir, "performance_metrics.csv")
+      perf_df <- tryCatch({
+        build_perf_table(s, rv)
+      }, error = function(e) data.frame(Message = "Error extracting performance metrics"))
+      write.csv(perf_df, perf_file, row.names = FALSE)
+      files <- c(files, perf_file)
+      
+      # 3. Model Features (coefficients / importance)
+      feat_file <- file.path(tmpdir, "model_features.csv")
+      feat_df <- NULL
+      if (s$model$method %in% c("glm", "glmnet", "multinom")) {
+        feat_df <- coef_table()
+      } else if (s$model$method == "rf") {
+        feat_df <- rf_importance()
+      }
+      if (!is.null(feat_df) && nrow(feat_df) > 0) {
+        write.csv(feat_df, feat_file, row.names = FALSE)
+      } else {
+        write.csv(data.frame(Message = "No feature importance available"),
+                  feat_file, row.names = FALSE)
+      }
+      files <- c(files, feat_file)
+      
+      # 4. ROC Curve (PDF)
+      roc_file <- file.path(tmpdir, "roc_curve.pdf")
+      if (!is.null(s$roc_plot)) {
+        ggsave(roc_file, plot = s$roc_plot,
+               device = cairo_pdf, width = 6, height = 6, units = "in")
+      } else {
+        pdf(roc_file); plot.new(); text(0.5, 0.5, "ROC plot not available"); dev.off()
+      }
+      files <- c(files, roc_file)
+      
+      # Bundle into zip
+      zip::zip(zipfile = file, files = files, mode = "cherry-pick")
     },
-    contentType = "text/csv"
+    contentType = "application/zip"
   )
+  
 }
 
 shinyApp(ui, server)
