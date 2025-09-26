@@ -1007,14 +1007,14 @@ ui <- navbarPage(
                  condition = "output.hasRegResults",
                  fluidRow(
                    column(
-                     width = 5,
+                     width = 6,
                      h4("Model Summary"),
                      verbatimTextOutput("reg_summary"),
                      h4("Performance Metrics"),
                      tableOutput("reg_perf_table")
                    ),
                    column(
-                     width = 7,
+                     width = 6,
                      h4("Predicted vs Observed"),
                      plotOutput("reg_pred_plot", height = "350px"),
                      h4("Residual Diagnostics"),
@@ -1295,15 +1295,27 @@ server <- function(input, output, session) {
       categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.factor(x) || is.character(x))])
       predictor_choices <- sort(meta_cols)
       
+      # Feature Selection
       updatePickerInput(session, "fs_outcome", choices = categorical_choices, selected = NULL)
-      updatePickerInput(session, "fs_predictors", choices = c(predictor_choices, "leiden_cluster"), selected = NULL)
+      updatePickerInput(session, "fs_predictors", choices = unique(c(predictor_choices, "leiden_cluster")), selected = NULL)
       updatePickerInput(session, "fs_leiden_subset",
                         choices = if (!is.null(rv$abundance_sample)) colnames(rv$abundance_sample) else character(0),
                         selected = character(0))
       
+      # Classification
       updatePickerInput(session, "lm_outcome", choices = categorical_choices, selected = NULL)
-      updatePickerInput(session, "lm_predictors", choices = c(predictor_choices, "leiden_cluster"), selected = NULL)
+      updatePickerInput(session, "lm_predictors", choices = unique(c(predictor_choices, "leiden_cluster")), selected = NULL)
       updatePickerInput(session, "lm_leiden_subset",
+                        choices = if (!is.null(rv$abundance_sample)) colnames(rv$abundance_sample) else character(0),
+                        selected = character(0))
+      
+      # Regression
+      continuous_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.numeric(x) || is.integer(x))])
+      updatePickerInput(session, "reg_outcome",
+                        choices = continuous_choices,
+                        selected = if (length(continuous_choices) > 0) continuous_choices[1])
+      updatePickerInput(session, "reg_predictors", choices = unique(c(predictor_choices, "leiden_cluster")), selected = NULL)
+      updatePickerInput(session, "reg_leiden_subset",
                         choices = if (!is.null(rv$abundance_sample)) colnames(rv$abundance_sample) else character(0),
                         selected = character(0))
     }
@@ -1316,17 +1328,6 @@ server <- function(input, output, session) {
     if (!isTRUE(rv$data_ready) && !identical(input$main_tab, "Home")) {
       updateNavbarPage(session, "main_tab", selected = "Home")
     }
-  })
-  
-  get_leiden_clusters <- function() colnames(rv$clusters$abundance)
-  
-  # keep choices in sync with data
-  observe({
-    updatePickerInput(
-      session, "fs_leiden_subset",
-      choices = get_leiden_clusters(),
-      selected = NULL
-    )
   })
   
   # UI-facing flag for conditionalPanel (no nested reactive)
@@ -2313,7 +2314,7 @@ server <- function(input, output, session) {
   observeEvent(rv$meta_sample, {
     meta_cols <- sort(colnames(rv$meta_sample))
     updatePickerInput(session, "fs_outcome", choices = meta_cols)
-    updatePickerInput(session, "fs_predictors", choices = meta_cols)
+    updatePickerInput(session, "fs_predictors", choices = c(meta_cols, "leiden_cluster"))
   }, ignoreInit = TRUE)
   
   observeEvent(rv$clusters$abundance, {
@@ -2707,12 +2708,9 @@ server <- function(input, output, session) {
     meta_cols <- colnames(rv$meta_sample)
     categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.factor(x) || is.character(x))])
     predictor_choices <- sort(meta_cols)
-    if (!("leiden_cluster" %in% predictor_choices)) {
-      predictor_choices <- c(predictor_choices, "leiden_cluster")
-    }
     
     updatePickerInput(session, "lm_outcome", choices = categorical_choices, selected = NULL)
-    updatePickerInput(session, "lm_predictors", choices = predictor_choices, selected = NULL)
+    updatePickerInput(session, "lm_predictors", choices = c(predictor_choices, "leiden_cluster"), selected = NULL)
     updatePickerInput(session, "lm_leiden_subset",
                       choices = colnames(rv$abundance_sample),
                       selected = character(0))
@@ -2847,10 +2845,12 @@ server <- function(input, output, session) {
         probs <- predict(model, newdata = testMat, type = "prob")
         pred_class <- predict(model, newdata = testMat, type = "raw")
       } else {
-        model <- caret::train(
-          x = trainX, y = trainY,
-          method = method,
-          trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE)
+        suppressWarnings(
+          model <- caret::train(
+            x = trainX, y = trainY,
+            method = method,
+            trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE)
+          )
         )
         probs <- predict(model, newdata = testX, type = "prob")
         pred_class <- predict(model, newdata = testX, type = "raw")
@@ -2907,10 +2907,12 @@ server <- function(input, output, session) {
                                lambda = 10^seq(-3, 1, length = 20))
       )
     } else {
-      model <- caret::train(
-        x = X, y = y,
-        method = method,
-        trControl = ctrl
+      suppressWarnings(
+        model <- caret::train(
+          x = X, y = y,
+          method = method,
+          trControl = ctrl
+        )
       )
     }
     
@@ -3405,25 +3407,66 @@ server <- function(input, output, session) {
                       selected = if (length(continuous_choices) > 0) continuous_choices[1])
     
     updatePickerInput(session, "reg_predictors",
-                      choices = predictor_choices,
+                      choices = c(predictor_choices, "leiden_cluster"),
                       selected = NULL)
   })
   
   observeEvent(input$run_reg, {
-    df <- dataset()
-    req(input$reg_outcome, input$reg_predictors)
+    req(rv$meta_sample, rv$abundance_sample, input$reg_outcome, input$reg_predictors)
+    assert_sample_level(rv$meta_sample, "Regression")
     
-    formula <- as.formula(paste(input$reg_outcome, "~",
-                                paste(input$reg_predictors, collapse = "+")))
+    # --- Separate metadata vs cluster predictors (unchanged) ---
+    pred_meta <- setdiff(intersect(input$reg_predictors, colnames(rv$meta_sample)), "leiden_cluster")
+    all_clusters <- colnames(rv$abundance_sample)
+    if ("leiden_cluster" %in% input$reg_predictors) {
+      if (!is.null(input$reg_leiden_subset) && length(input$reg_leiden_subset) > 0) {
+        cluster_predictors <- intersect(input$reg_leiden_subset, all_clusters)
+      } else {
+        cluster_predictors <- all_clusters
+      }
+    } else {
+      cluster_predictors <- character(0)
+    }
+    predictors_final <- c(pred_meta, cluster_predictors)
+    if (length(predictors_final) == 0) {
+      showNotification("Select at least one predictor.", type = "error")
+      return(NULL)
+    }
     
+    # --- Subset before merge (keep original names) ---
+    meta_sub <- rv$meta_sample %>%
+      dplyr::select(patient_ID, !!input$reg_outcome, dplyr::all_of(pred_meta))
+    abund_sub <- rv$abundance_sample[, cluster_predictors, drop = FALSE]
+    
+    merged <- align_metadata_abundance(meta_sub, abund_sub, notify = showNotification)
+    model_df <- merged %>% dplyr::filter(!is.na(.data[[input$reg_outcome]]))
+    
+    # --- Build safe names and rename model_df columns used in modeling ---
+    orig_outcome <- input$reg_outcome
+    orig_preds   <- predictors_final
+    safe_outcome <- make.names(orig_outcome)
+    safe_preds   <- make.names(orig_preds, unique = TRUE)
+    
+    # map: safe -> original (for display), and original -> safe (for renaming)
+    safe_to_orig <- setNames(orig_preds, safe_preds)
+    orig_to_safe <- setNames(safe_preds, orig_preds)
+    
+    # rename columns in model_df for outcome + predictors to their safe names
+    colnames(model_df)[match(orig_outcome, colnames(model_df))] <- safe_outcome
+    for (i in seq_along(orig_preds)) {
+      j <- match(orig_preds[i], colnames(model_df))
+      if (!is.na(j)) colnames(model_df)[j] <- safe_preds[i]
+    }
+    
+    # --- Build formula using safe names (no backticks needed) ---
+    formula <- as.formula(paste0(safe_outcome, " ~ ", paste(safe_preds, collapse = " + ")))
+    
+    # --- Train model (unchanged logic) ---
     ctrl <- switch(input$reg_validation,
-                   "cv"   = trainControl(method = "cv", number = input$reg_k),
-                   "loo"  = trainControl(method = "LOOCV"),
-                   "split"= trainControl(method = "boot", number = 1)
-    )
-    
-    # Train model
-    model <- caret::train(formula, data = df,
+                   "cv"    = caret::trainControl(method = "cv", number = input$reg_k),
+                   "loo"   = caret::trainControl(method = "LOOCV"),
+                   "split" = caret::trainControl(method = "boot", number = 1))
+    model <- caret::train(formula, data = model_df,
                           method = input$reg_model_type,
                           trControl = ctrl,
                           tuneGrid = if (input$reg_model_type == "glmnet")
@@ -3431,24 +3474,24 @@ server <- function(input, output, session) {
                                         lambda = exp(seq(-5, 1, length = 50)))
                           else NULL)
     
-    preds <- predict(model, df)
-    obs <- df[[input$reg_outcome]]
+    preds <- predict(model, model_df)
+    obs   <- model_df[[safe_outcome]]
     
-    # Performance metrics
     rmse <- yardstick::rmse_vec(obs, preds)
     mae  <- yardstick::mae_vec(obs, preds)
     rsq  <- yardstick::rsq_vec(obs, preds)
+    perf <- data.frame(Metric = c("RMSE", "MAE", "R-squared"), Value = c(rmse, mae, rsq))
     
-    perf <- data.frame(
-      Metric = c("RMSE", "MAE", "R-squared"),
-      Value  = c(rmse, mae, rsq)
-    )
-    
+    # store training data and label map for downstream PDP/SHAP/exports
     reg_state(list(
       model = model,
       preds = preds,
       obs   = obs,
-      perf  = perf
+      perf  = perf,
+      data  = model_df,
+      safe_outcome = safe_outcome,
+      safe_preds   = safe_preds,
+      safe_to_orig = safe_to_orig
     ))
   })
   
@@ -3472,25 +3515,30 @@ server <- function(input, output, session) {
     if (method %in% c("lm", "glmnet")) {
       df <- broom::tidy(s$model$finalModel)
       df <- df[, c("term", "estimate")]
-      colnames(df) <- c("feature", "RawCoefficient")
+      colnames(df) <- c("feature_safe", "RawCoefficient")
+      df$feature <- s$safe_to_orig[df$feature_safe] %||% df$feature_safe
       df$ScaledCoefficient <- df$RawCoefficient
+      df <- df[, c("feature", "RawCoefficient", "ScaledCoefficient")]
       df <- order_features(df, "RawCoefficient")
       df
     } else if (method == "rf") {
       imp <- caret::varImp(s$model)$importance
-      imp$feature <- rownames(imp)
+      imp$feature_safe <- rownames(imp)
+      imp$feature <- s$safe_to_orig[imp$feature_safe] %||% imp$feature_safe
       colnames(imp)[1] <- "ScaledImportance"
       rf_imp <- randomForest::importance(s$model$finalModel)
+      # raw importance aligned by safe names
       raw_vals <- if ("%IncMSE" %in% colnames(rf_imp)) rf_imp[, "%IncMSE"] else rf_imp[, 1]
-      imp$RawImportance <- raw_vals[match(imp$feature, rownames(rf_imp))]
+      imp$RawImportance <- raw_vals[match(imp$feature_safe, rownames(rf_imp))]
       imp <- imp[, c("feature", "RawImportance", "ScaledImportance")]
       imp <- order_features(imp, "RawImportance")
       imp
     } else if (method %in% c("gbm", "xgbTree")) {
       imp <- caret::varImp(s$model)$importance
-      imp$feature <- rownames(imp)
+      imp$feature_safe <- rownames(imp)
+      imp$feature <- s$safe_to_orig[imp$feature_safe] %||% imp$feature_safe
       colnames(imp)[1] <- "ScaledImportance"
-      imp$RawImportance <- imp$ScaledImportance  # caret doesn’t expose raw easily
+      imp$RawImportance <- imp$ScaledImportance
       imp <- imp[, c("feature", "RawImportance", "ScaledImportance")]
       imp <- order_features(imp, "RawImportance")
       imp
@@ -3528,10 +3576,12 @@ server <- function(input, output, session) {
     s <- reg_state(); req(s)
     method <- input$reg_model_type
     if (method %in% c("rf", "gbm", "xgbTree")) {
-      feat <- input$reg_feature_pdp; req(feat)
-      pd <- pdp::partial(s$model, pred.var = feat, train = dataset())
-      autoplot(pd) + theme_minimal() +
-        labs(title = paste("Partial Dependence:", feat))
+      feat_orig <- input$reg_feature_pdp; req(feat_orig)
+      # map original -> safe
+      feat_safe <- names(s$safe_to_orig)[match(feat_orig, s$safe_to_orig)]
+      req(feat_safe %in% colnames(s$data))
+      pd <- pdp::partial(s$model, pred.var = feat_safe, train = s$data)
+      autoplot(pd) + theme_minimal() + labs(title = paste("Partial Dependence:", feat_orig))
     }
   })
   
@@ -3539,14 +3589,14 @@ server <- function(input, output, session) {
     s <- reg_state(); req(s)
     method <- input$reg_model_type
     if (method %in% c("rf", "gbm", "xgbTree")) {
-      df <- dataset()
-      X <- df[, input$reg_predictors, drop = FALSE]
-      predictor <- iml::Predictor$new(s$model, data = X, y = df[[input$reg_outcome]])
+      # subset using safe predictor names
+      X <- s$data[, s$safe_preds, drop = FALSE]
+      predictor <- iml::Predictor$new(s$model, data = X, y = s$data[[s$safe_outcome]])
+      # pick first row for example
       shap <- iml::Shapley$new(predictor, x.interest = X[1, , drop = FALSE])
       plot(shap)
     }
   })
-  
   
   output$export_reg_zip <- downloadHandler(
     filename = function() {
@@ -3578,21 +3628,25 @@ server <- function(input, output, session) {
       if (method %in% c("lm", "glmnet")) {
         df <- broom::tidy(s$model$finalModel)
         df <- df[, c("term", "estimate")]
-        colnames(df) <- c("feature", "RawCoefficient")
+        colnames(df) <- c("feature_safe", "RawCoefficient")
+        df$feature <- s$safe_to_orig[df$feature_safe] %||% df$feature_safe
         df$ScaledCoefficient <- df$RawCoefficient
-        feat_df <- order_features(df, "RawCoefficient")
+        feat_df <- order_features(df[, c("feature", "RawCoefficient", "ScaledCoefficient")],
+                                  "RawCoefficient")
       } else if (method == "rf") {
         imp <- caret::varImp(s$model)$importance
-        imp$feature <- rownames(imp)
+        imp$feature_safe <- rownames(imp)
+        imp$feature <- s$safe_to_orig[imp$feature_safe] %||% imp$feature_safe
         colnames(imp)[1] <- "ScaledImportance"
         rf_imp <- randomForest::importance(s$model$finalModel)
         raw_vals <- if ("%IncMSE" %in% colnames(rf_imp)) rf_imp[, "%IncMSE"] else rf_imp[, 1]
-        imp$RawImportance <- raw_vals[match(imp$feature, rownames(rf_imp))]
+        imp$RawImportance <- raw_vals[match(imp$feature_safe, rownames(rf_imp))]
         feat_df <- imp[, c("feature", "RawImportance", "ScaledImportance")]
         feat_df <- order_features(feat_df, "RawImportance")
       } else if (method %in% c("gbm", "xgbTree")) {
         imp <- caret::varImp(s$model)$importance
-        imp$feature <- rownames(imp)
+        imp$feature_safe <- rownames(imp)
+        imp$feature <- s$safe_to_orig[imp$feature_safe] %||% imp$feature_safe
         colnames(imp)[1] <- "ScaledImportance"
         imp$RawImportance <- imp$ScaledImportance
         feat_df <- imp[, c("feature", "RawImportance", "ScaledImportance")]
@@ -3640,11 +3694,12 @@ server <- function(input, output, session) {
       if (method %in% c("rf", "gbm", "xgbTree")) {
         pdp_file <- file.path(tmpdir, "partial_dependence.pdf")
         pdf(pdp_file)
-        feat <- input$reg_feature_pdp
-        if (!is.null(feat) && feat %in% input$reg_predictors) {
-          pd <- pdp::partial(s$model, pred.var = feat, train = dataset())
+        feat_orig <- input$reg_feature_pdp
+        if (!is.null(feat_orig) && feat_orig %in% names(s$safe_to_orig)) {
+          feat_safe <- names(s$safe_to_orig)[match(feat_orig, s$safe_to_orig)]
+          pd <- pdp::partial(s$model, pred.var = feat_safe, train = s$data)
           print(autoplot(pd) + theme_minimal() +
-                  labs(title = paste("Partial Dependence:", feat)))
+                  labs(title = paste("Partial Dependence:", feat_orig)))
         }
         dev.off()
         files <- c(files, pdp_file)
@@ -3652,9 +3707,8 @@ server <- function(input, output, session) {
         # 7. SHAP Plot (example for first observation)
         shap_file <- file.path(tmpdir, "shap_plot.pdf")
         pdf(shap_file)
-        df <- dataset()
-        X <- df[, input$reg_predictors, drop = FALSE]
-        predictor <- iml::Predictor$new(s$model, data = X, y = df[[input$reg_outcome]])
+        X <- s$data[, s$safe_preds, drop = FALSE]
+        predictor <- iml::Predictor$new(s$model, data = X, y = s$data[[s$safe_outcome]])
         shap <- iml::Shapley$new(predictor, x.interest = X[1, , drop = FALSE])
         plot(shap)
         dev.off()
