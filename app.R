@@ -139,7 +139,7 @@ plot_permutation_histogram <- function(perm_rsq, obs_rsq, obs_rmse, obs_mae, p_v
              label = metrics_text, hjust = 0, vjust = 1, size = 3.5) +
     labs(title = paste0("Permutation Test: R² Distribution (", model_name, ")"),
          x = "R² under null (permuted labels)", y = "Count") +
-    theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+    theme_bw(base_size = 16) + theme(plot.title = element_text(hjust = 0.5))
 }
 
 # feature importance helper
@@ -165,7 +165,7 @@ plot_feature_importance <- function(feat_imp_scaled,
     values_to = "Importance"
   )
   
-  ggplot(long, aes(x = Feature, y = Importance, fill = Type)) +
+  pl <- ggplot(long, aes(x = Feature, y = Importance, fill = Type)) +
     geom_col(position = position_dodge(width = 0.7)) +
     coord_flip() +
     scale_fill_manual(values = c("RawImportance" = "steelblue",
@@ -174,7 +174,9 @@ plot_feature_importance <- function(feat_imp_scaled,
     labs(title = paste0(model_label, " feature importance: raw vs scaled"),
          subtitle = paste("Ordered by:", order_label),
          x = "Feature", y = "Importance") +
-    theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+    theme_bw(base_size = 15) + theme(plot.title = element_text(hjust = 0.5))
+  nfeats <- unique(long$Feature)
+  return(list(pl, nfeats))
 }
 
 ## general purpose plot test predictions
@@ -208,14 +210,14 @@ plot_model_performance <- function(train_y, train_pred, test_y, test_pred,
   )
   
   p <- ggplot(df, aes(x = Actual, y = Predicted)) +
-    geom_point(shape = 21, fill = "grey40", color = "black", stroke = 0.2, size = 2, alpha = 0.7) +
-    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", linewidth = 0.8) +
-    geom_hline(yintercept = mean(test_y), color = "blue", linetype = "dotted", linewidth = 0.8) +
+    geom_point(shape = 21, fill = "grey40", color = "black", stroke = 0.2, size = 4, alpha = 0.7) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", linewidth = 0.9) +
+    geom_hline(yintercept = mean(test_y), color = "blue", linetype = "dotted", linewidth = 0.9) +
     annotate("text", x = -Inf, y = Inf, label = metrics_text,
-             hjust = -0.05, vjust = 1.05, size = 3.5) +
+             hjust = -0.05, vjust = 1.05, size = 6) +
     labs(title = paste0(model_name, ": Actual vs Predicted (Test Set)"),
          x = "Actual values", y = "Predicted values") +
-    theme_bw() +
+    theme_bw(base_size = 16) +
     theme(plot.title = element_text(hjust = 0.5))
   
   list(
@@ -508,7 +510,8 @@ xgb_permutation_eval <- function(data, outcome_col = "age",
     p1 <- plot_permutation_histogram(perm_rsq, obs_rsq, obs_rmse, obs_mae, p_val, "XGBoost")
     p2 <- plot_feature_importance(feat_imp_scaled, model_label = "XGBoost", order_label = order_by)
     diagnostics_plot <- plot_residual_diagnostics(y_true = test_y, y_pred = test_pred, model_name = "XGBoost")
-    combined_plot <- ggpubr::ggarrange(p1, p2, diagnostics_plot, ncol = 1, nrow = 3)
+    relheight <- p2[[2]]
+    combined_plot <- ggpubr::ggarrange(p1, p2[[1]], diagnostics_plot, ncol = 1, nrow = 3, heights = c(1,3,2))
     
     perf <- plot_model_performance(train_y, train_pred, test_y, test_pred, "XGBoost")
     
@@ -624,23 +627,23 @@ mlr_permutation_eval <- function(data, outcome_col = "age",
   validation <- match.arg(validation)
   set.seed(seed)
   
+  # Build design matrix
+  X <- model.matrix(~ . - 1, data = data[, setdiff(names(data), outcome_col), drop = FALSE])
+  storage.mode(X) <- "double"
+  y <- data[[outcome_col]]
+  
   if (validation == "train_test") {
-    split_obj <- make_train_test_split(data, outcome_col, p, seed)
-    train <- split_obj$train
-    test  <- split_obj$test
+    idx <- caret::createDataPartition(y, p = p, list = FALSE)
+    train_x <- X[idx, , drop = FALSE]
+    test_x  <- X[-idx, , drop = FALSE]
+    train_y <- y[idx]
+    test_y  <- y[-idx]
     
-    train_x <- sanitize_predictors(split_obj$train_x)
-    test_x  <- sanitize_predictors(split_obj$test_x)
-    colnames(test_x) <- colnames(train_x)
+    ctrl <- caret::trainControl(verboseIter = FALSE)
+    mlr_model <- caret::train(x = train_x, y = train_y, method = "lm", trControl = ctrl)
     
-    train_y <- split_obj$train_y
-    test_y  <- split_obj$test_y
-    
-    formula <- as.formula(paste(outcome_col, "~ ."))
-    mlr_model <- lm(formula, data = train)
-    
-    train_pred <- predict(mlr_model, train)
-    test_pred  <- predict(mlr_model, as.data.frame(test_x))
+    train_pred <- predict(mlr_model, newdata = train_x)
+    test_pred  <- predict(mlr_model, newdata = test_x)
     
     sst <- sum((test_y - mean(test_y))^2)
     sse <- sum((test_y - test_pred)^2)
@@ -648,35 +651,22 @@ mlr_permutation_eval <- function(data, outcome_col = "age",
     obs_rmse <- sqrt(mean((test_y - test_pred)^2))
     obs_mae  <- mean(abs(test_y - test_pred))
     
-    coefs <- coef(mlr_model)[-1]
-    feat_imp <- data.frame(
-      Feature = names(coefs),
-      Coefficient = as.numeric(coefs),
-      stringsAsFactors = FALSE
-    )
-    feat_imp_scaled <- scale_importance(
-      feat_imp,
-      data = train,
-      outcome_col = outcome_col
-    )
+    coefs <- coef(mlr_model$finalModel)[-1]
+    feat_imp <- data.frame(Feature = names(coefs), Coefficient = as.numeric(coefs))
+    feat_imp_scaled <- scale_importance(feat_imp,
+                                        data = data.frame(train_x, outcome = train_y),
+                                        outcome_col = "outcome")
     
-    perm_rsq <- numeric(n_perm)
-    for (i in seq_len(n_perm)) {
-      y_perm <- sample(train[[outcome_col]])
-      temp <- train
-      temp[[outcome_col]] <- y_perm
-      perm_model <- lm(formula, data = temp)
-      y_pred_perm <- predict(perm_model, as.data.frame(test_x))
+    # Permutation test
+    perm_rsq <- replicate(n_perm, {
+      y_perm <- sample(train_y)
+      perm_model <- caret::train(x = train_x, y = y_perm, method = "lm", trControl = ctrl)
+      y_pred_perm <- predict(perm_model, newdata = test_x)
       sst_perm <- sum((test_y - mean(test_y))^2)
       sse_perm <- sum((test_y - y_pred_perm)^2)
-      perm_rsq[i] <- 1 - sse_perm/sst_perm
-    }
+      1 - sse_perm/sst_perm
+    })
     p_val <- mean(perm_rsq >= obs_rsq)
-    
-    p1 <- plot_permutation_histogram(perm_rsq, obs_rsq, obs_rmse, obs_mae, p_val, "MLR")
-    p2 <- plot_feature_importance(feat_imp_scaled, model_label = "MLR", order_label = "RawImportance")
-    diagnostics_plot <- plot_residual_diagnostics(model = mlr_model, model_name = "MLR")
-    combined_plot <- ggarrange(p1, p2, diagnostics_plot, ncol = 1, nrow = 3)
     
     perf <- plot_model_performance(train_y, train_pred, test_y, test_pred, "MLR")
     
@@ -685,79 +675,55 @@ mlr_permutation_eval <- function(data, outcome_col = "age",
       feature_importance = feat_imp_scaled,
       permuted_rsq = perm_rsq,
       p_value = p_val,
-      model = mlr_model,
-      permutation_importance_diagnostics_plot = combined_plot,
+      model = mlr_model$finalModel,
+      permutation_importance_diagnostics_plot = NULL,
       performance_plot = perf$plot,
       train_r2 = perf$train_r2,
       test_r2 = perf$test_r2,
       rmse_test = perf$rmse_test,
       mae_test = perf$mae_test
     ))
-    
-  } else if (validation == "cv") {
-    folds <- createFolds(data[[outcome_col]], k = k, list = TRUE)
-    
-    all_preds <- numeric(nrow(data))
-    fold_metrics <- lapply(seq_along(folds), function(i) {
-      test_idx <- folds[[i]]
-      train_idx <- setdiff(seq_len(nrow(data)), test_idx)
-      
-      train_fold <- data[train_idx, ]
-      test_fold  <- data[test_idx, ]
-      
-      formula <- as.formula(paste(outcome_col, "~ ."))
-      mlr_model <- lm(formula, data = train_fold)
-      y_pred <- predict(mlr_model, test_fold)
-      all_preds[test_idx] <<- y_pred
-      
-      y_test <- test_fold[[outcome_col]]
-      sst <- sum((y_test - mean(y_test))^2)
-      sse <- sum((y_test - y_pred)^2)
-      r2  <- 1 - sse/sst
-      rmse <- sqrt(mean((y_test - y_pred)^2))
-      mae  <- mean(abs(y_test - y_pred))
-      
-      list(R2 = r2, RMSE = rmse, MAE = mae)
-    })
-    
-    mean_r2   <- mean(sapply(fold_metrics, `[[`, "R2"))
-    mean_rmse <- mean(sapply(fold_metrics, `[[`, "RMSE"))
-    mean_mae  <- mean(sapply(fold_metrics, `[[`, "MAE"))
-    
-    perf <- plot_model_performance(
-      train_y = data[[outcome_col]],
-      train_pred = rep(mean(data[[outcome_col]]), nrow(data)),
-      test_y = data[[outcome_col]],
-      test_pred = all_preds,
-      model_name = paste0("MLR (", k, "-fold CV)")
-    )
-    
-    final_model <- lm(as.formula(paste(outcome_col, "~ .")), data = data)
-    coefs <- coef(final_model)[-1]
-    feat_imp <- data.frame(
-      Feature = names(coefs),
-      Coefficient = as.numeric(coefs),
-      stringsAsFactors = FALSE
-    )
-    feat_imp_scaled <- scale_importance(
-      feat_imp,
-      data = data,
-      outcome_col = outcome_col
-    )
-    
-    p2 <- plot_feature_importance(feat_imp_scaled, model_label = "MLR", order_label = "RawImportance")
-    diagnostics_plot <- plot_residual_diagnostics(model = final_model, model_name = "MLR")
-    combined_plot <- ggarrange(p2, diagnostics_plot, ncol = 1, nrow = 2)
-    
-    return(list(
-      cv_metrics = list(mean_R2 = mean_r2, mean_RMSE = mean_rmse, mean_MAE = mean_mae),
-      fold_metrics = fold_metrics,
-      feature_importance = feat_imp_scaled,
-      permutation_importance_diagnostics_plot = combined_plot,
-      performance_plot = perf$plot,
-      model = final_model
-    ))
   }
+  
+  # CV branch (similar, but loop over folds)
+  folds <- caret::createFolds(y, k = k, list = TRUE)
+  all_preds <- numeric(length(y))
+  fold_metrics <- lapply(folds, function(test_idx) {
+    train_idx <- setdiff(seq_along(y), test_idx)
+    x_tr <- X[train_idx, , drop = FALSE]
+    y_tr <- y[train_idx]
+    x_te <- X[test_idx, , drop = FALSE]
+    y_te <- y[test_idx]
+    
+    model <- caret::train(x = x_tr, y = y_tr, method = "lm")
+    y_pred <- predict(model, newdata = x_te)
+    all_preds[test_idx] <<- y_pred
+    
+    sst <- sum((y_te - mean(y_te))^2)
+    sse <- sum((y_te - y_pred)^2)
+    list(R2 = 1 - sse/sst,
+         RMSE = sqrt(mean((y_te - y_pred)^2)),
+         MAE = mean(abs(y_te - y_pred)))
+  })
+  
+  mean_r2   <- mean(sapply(fold_metrics, `[[`, "R2"))
+  mean_rmse <- mean(sapply(fold_metrics, `[[`, "RMSE"))
+  mean_mae  <- mean(sapply(fold_metrics, `[[`, "MAE"))
+  
+  final_model <- caret::train(x = X, y = y, method = "lm")
+  coefs <- coef(final_model$finalModel)[-1]
+  feat_imp <- data.frame(Feature = names(coefs), Coefficient = as.numeric(coefs))
+  feat_imp_scaled <- scale_importance(feat_imp,
+                                      data = data.frame(X, outcome = y),
+                                      outcome_col = "outcome")
+  
+  return(list(
+    cv_metrics = list(mean_R2 = mean_r2, mean_RMSE = mean_rmse, mean_MAE = mean_mae),
+    fold_metrics = fold_metrics,
+    feature_importance = feat_imp_scaled,
+    performance_plot = NULL,
+    model = final_model$finalModel
+  ))
 }
 
 elasticnet_permutation_eval <- function(data, outcome_col = "age",
@@ -1171,25 +1137,19 @@ normalize_regression_result <- function(res, validation) {
 run_regression_model <- function(model_type, df, outcome, predictors,
                                  validation = "train_test", p = 0.7, k = 5,
                                  alpha = 0.5, n_perm = 100, seed = 123) {
-  # Drop NAs
   df <- df[, c(outcome, predictors), drop = FALSE]
   df <- na.omit(df)
   
-  # Build design matrix to sanitize predictor names
+  # Sanitize predictors
   X <- model.matrix(~ . - 1, data = df[, predictors, drop = FALSE])
   storage.mode(X) <- "double"
   y <- df[[outcome]]
   
-  # Keep mapping safe -> original for display
   safe_names <- colnames(X)
-  orig_names <- predictors
-  name_map <- setNames(orig_names, safe_names)
-  
-  # Rebuild df with safe names
+  name_map <- setNames(predictors, safe_names)
   df_safe <- data.frame(outcome = y, X, check.names = FALSE)
   names(df_safe)[1] <- outcome
   
-  # Dispatch to appropriate evaluator
   raw <- switch(model_type,
                 "xgbTree" = xgb_permutation_eval(df_safe, outcome_col = outcome,
                                                  validation = validation, p = p, k = k,
@@ -1206,9 +1166,7 @@ run_regression_model <- function(model_type, df, outcome, predictors,
                 stop("Unknown model type")
   )
   
-  # Attach name map so downstream outputs can restore original labels
   raw$name_map <- name_map
-  
   normalize_regression_result(raw, validation)
 }
 
@@ -1248,6 +1206,15 @@ align_metadata_abundance <- function(metadata, abundance, notify = NULL) {
   abund_df <- as.data.frame(abundance)
   abund_df$patient_ID <- patient_ids
   
+  print('dim metadata: ')
+  print(dim(metadata))
+  print('dim abund_df: ')
+  print(dim(abund_df))
+  print('head metadata: ')
+  print(head(metadata,2))
+  print('head abund_df: ')
+  print(head(abund_df,2))
+  
   # Duplicate checks
   if (anyDuplicated(metadata$patient_ID)) {
     msg <- "Duplicate patient_IDs found in metadata. Consider deduplicating with distinct()."
@@ -1259,14 +1226,14 @@ align_metadata_abundance <- function(metadata, abundance, notify = NULL) {
     warning(msg)
     if (!is.null(notify)) notify(msg, type = "warning")
   }
-  
+
   # Mismatch checks
   meta_ids <- unique(metadata$patient_ID)
   abund_ids <- unique(abund_df$patient_ID)
-  
+
   missing_in_abund <- setdiff(meta_ids, abund_ids)
   missing_in_meta  <- setdiff(abund_ids, meta_ids)
-  
+
   if (length(missing_in_abund) > 0) {
     msg <- paste("These patient_IDs are in metadata but not in abundance:",
                  paste(missing_in_abund, collapse = ", "))
@@ -1279,9 +1246,11 @@ align_metadata_abundance <- function(metadata, abundance, notify = NULL) {
     warning(msg)
     if (!is.null(notify)) notify(msg, type = "warning")
   }
-  
+
   # Merge with metadata (metadata is the anchor)
   merged <- dplyr::left_join(metadata, abund_df, by = "patient_ID")
+  print('head merged: ')
+  print(head(merged,5))
   
   return(merged)
 }
@@ -1304,10 +1273,10 @@ expand_predictors <- function(meta_sample, abundance_sample,
       stop("Abundance matrix not available, but leiden_cluster was selected.")
     }
     all_clusters <- colnames(abundance_sample)
-    if (!is.null(cluster_subset) && length(cluster_subset) > 0) {
-      cluster_predictors <- intersect(cluster_subset, all_clusters)
+    cluster_predictors <- if (!is.null(cluster_subset) && length(cluster_subset) > 0) {
+      intersect(cluster_subset, all_clusters)
     } else {
-      cluster_predictors <- all_clusters
+      all_clusters
     }
   }
   
@@ -1316,22 +1285,21 @@ expand_predictors <- function(meta_sample, abundance_sample,
     stop("Select at least one predictor.")
   }
   
-  # Subset before robust merge (base R, no tidy-eval)
+  # Subset metadata
   keep_cols <- unique(c("patient_ID", outcome, pred_meta))
   meta_sub <- meta_sample[, keep_cols, drop = FALSE]
   
-  abund_sub <- if (length(cluster_predictors)) {
-    abundance_sample[, cluster_predictors, drop = FALSE]
+  # If no cluster predictors, skip abundance merge
+  if (length(cluster_predictors) == 0) {
+    merged <- meta_sub
   } else {
-    NULL
+    abund_sub <- abundance_sample[, cluster_predictors, drop = FALSE]
+    merged <- align_metadata_abundance(metadata = meta_sub,
+                                       abundance = abund_sub,
+                                       notify = notify)
   }
   
-  # Use robust ID logic
-  merged <- align_metadata_abundance(metadata = meta_sub,
-                                     abundance = abund_sub %||% matrix(nrow = 0, ncol = 0),
-                                     notify = notify)
-  
-  # NA filter on outcome
+  # Filter NAs
   merged <- merged[!is.na(merged[[outcome]]), , drop = FALSE]
   
   # Defensive check
@@ -1341,38 +1309,57 @@ expand_predictors <- function(meta_sample, abundance_sample,
          paste(missing, collapse = ", "))
   }
   
-  # Mode-specific encoding
+  # Mode-specific encoding (unchanged from your current version)
   if (mode == "regression") {
     X <- merged[, predictors_final, drop = FALSE]
     
     if (isTRUE(encode_factors)) {
+      # Build design matrix (safe names)
       mm <- model.matrix(~ . - 1, data = X)
       storage.mode(mm) <- "double"
       colnames(mm) <- gsub("leiden_cluster", "leiden_cluster:", colnames(mm))
       
       # Build mapping safe → original
-      name_map <- setNames(colnames(X), colnames(mm))
+      # predictors_final is the actual expanded set (meta + cluster columns)
+      if (length(predictors_final) != ncol(mm)) {
+        # Defensive: if model.matrix expanded factors into multiple dummies,
+        # replicate the original predictor name across those new columns
+        expanded_map <- rep(predictors_final, times = sapply(X, function(col) {
+          if (is.factor(col) || is.character(col)) {
+            nlevels(as.factor(col))
+          } else {
+            1
+          }
+        }))
+        name_map <- setNames(expanded_map, colnames(mm))
+      } else {
+        name_map <- setNames(predictors_final, colnames(mm))
+      }
       
       merged_out <- data.frame(
         patient_ID = merged$patient_ID,
-        outcome = merged[[outcome]],
+        merged[[outcome]],
         mm,
         check.names = FALSE
       )
       names(merged_out)[2] <- outcome  # restore outcome column name
       
-      return(list(df = merged_out,
-                  predictors = colnames(mm),
-                  map = name_map))
+      return(list(
+        df = merged_out,
+        predictors = colnames(mm),
+        map = name_map
+      ))
     }
     
     # No encoding: assume numeric only
-    return(list(df = merged[, c("patient_ID", outcome, predictors_final), drop = FALSE],
-                predictors = predictors_final,
-                map = setNames(predictors_final, predictors_final)))
+    return(list(
+      df = merged[, c("patient_ID", outcome, predictors_final), drop = FALSE],
+      predictors = predictors_final,
+      map = setNames(predictors_final, predictors_final)
+    ))
   }
   
-  # Classification / FS: keep types, let downstream encode
+  # Classification / FS
   return(list(df = merged[, c("patient_ID", outcome, predictors_final), drop = FALSE],
               predictors = predictors_final,
               map = setNames(predictors_final, predictors_final)))
@@ -2260,17 +2247,17 @@ ui <- navbarPage(
                  fluidRow(
                    column(
                      width = 6,
-                     h4("Model Summary"),
-                     verbatimTextOutput("reg_summary"),
+                     # h4("Model Summary"),
+                     # verbatimTextOutput("reg_summary"),
                      h4("Performance Metrics"),
-                     tableOutput("reg_perf_table")
+                     tableOutput("reg_perf_table"), 
+                     h4("Residual Diagnostics"),
+                     plotOutput("reg_resid_plot", height = "700px")
                    ),
                    column(
                      width = 6,
                      h4("Predicted vs Observed"),
-                     plotOutput("reg_pred_plot", height = "350px"),
-                     h4("Residual Diagnostics"),
-                     plotOutput("reg_resid_plot", height = "350px"),
+                     plotOutput("reg_pred_plot", height = "375px"),
                      h4("Model Features"),
                      tableOutput("reg_features")
                      # Removed Tree-based Interpretability (PDP/SHAP) since not implemented
@@ -4712,11 +4699,11 @@ server <- function(input, output, session) {
     reg_state(reg_results())
   })
   
-  output$reg_summary <- renderPrint({
-    res <- reg_state()
-    if (is.null(res)) return("No results yet.")
-    res$metrics
-  })
+  # output$reg_summary <- renderPrint({
+  #   res <- reg_state()
+  #   if (is.null(res)) return("No results yet.")
+  #   res$metrics
+  # })
   
   output$reg_perf_table <- renderTable({
     res <- reg_state()
@@ -4739,9 +4726,12 @@ server <- function(input, output, session) {
   output$reg_features <- renderTable({
     res <- reg_state()
     req(res)
-    feats <- res$features
-    map_safe_to_original(feats, rv$reg_name_map)
-  })
+    
+    df <- res$feature_importance %||% data.frame()
+    df <- map_safe_to_original(df, res$name_map)
+    
+    df
+  }, sanitize.text.function = function(x) x)
   
   output$hasRegResults <- reactive({ !is.null(reg_state()) })
   outputOptions(output, "hasRegResults", suspendWhenHidden = FALSE)
@@ -4777,9 +4767,9 @@ server <- function(input, output, session) {
       files <- c()
       
       # 1. Model Summary
-      summary_file <- file.path(tmpdir, "reg_summary.csv")
-      write.csv(broom::glance(s$model), summary_file, row.names = FALSE)
-      files <- c(files, summary_file)
+      # summary_file <- file.path(tmpdir, "reg_summary.csv")
+      # write.csv(broom::glance(s$model), summary_file, row.names = FALSE)
+      # files <- c(files, summary_file)
       
       # 2. Performance Metrics
       perf_file <- file.path(tmpdir, "reg_performance.csv")
