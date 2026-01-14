@@ -74,15 +74,3 @@ Top-level structure
 | `Python` | character | Python version string |
 | `Rsession` | list | `sessionInfo()`-like structure |
 | `pip_list` | data.frame | pip packages / versions |
-
-Reference: exact `summary()` output
-
-```r
-# (paste original `summary(obj_small)` output here for complete reference)
-```
-
-Notes & recommendations
-- Use the top-level table for a quick overview and nested tables for each complex element (`cluster`, `umap`, `versions`, etc.).
-- Keep example values (lengths/types) to help users validate objects programmatically.
-- For very long example outputs, link to an `/examples` folder or include a collapsed `<details>` block.
-- If you want, I can insert a full `summary(obj_small)` output file into `/examples` and link to it from the README.
