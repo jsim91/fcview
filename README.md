@@ -10,3 +10,79 @@ The input object, saved in .RData format, should contain the following elements 
   - tsne (FCSimple::fcs_reduce_dimensions)
 
 Load time scales with object size. Consider subsampling obj$data and all element-wise matching list entries to reduce object weight. The app will use the stored abundance matrix in obj$leiden$abundance for statistical testing. Downsampling the object elements will make loading faster and will not impact the statistical testing results. Recommended downsample size: 300000 if nrow(obj$data)>300000.
+
+**Recommended Object Layout**
+
+This app expects a named list-like object (example: `obj_small`) with the following top-level elements.
+
+Top-level structure
+
+| Element | Type / Length | Description |
+| --- | --- | --- |
+| `data` | numeric (example length: 2292768) | Main measurement vector / matrix |
+| `source` | character (example length: 95532) | Source identifiers |
+| `run_date` | character (example length: 95532) | Run timestamps |
+| `cluster` | list | Clustering results (see below) |
+| `umap` | list | UMAP coordinates + settings (see below) |
+| `cluster_heatmap` | list | Heatmap tile data and related objects |
+| `versions` | list | R/Python/session info |
+| `metadata` | data.frame / list | Metadata mapped to events or samples |
+| `collection_instrument` | character | Instrument identifier |
+| `object_history` | character | Notes / provenance |
+
+`cluster` sub-structure
+
+| Element | Type / Length | Description |
+| --- | --- | --- |
+| `clusters` | factor (example length: 95532) | Cluster assignment per event |
+| `settings` | list (4) | Flags and `nClus` number |
+| `abundance` | numeric (example length: 5490) | Abundance vector |
+
+`cluster$settings` (example)
+
+| Name | Type | Meaning |
+| --- | --- | --- |
+| `compensate` | logical | Compensation applied? |
+| `transform` | logical | Transform applied? |
+| `silent` | logical | Suppress messages? |
+| `nClus` | numeric | Number of clusters |
+
+`umap` sub-structure
+
+| Element | Type / Length | Description |
+| --- | --- | --- |
+| `coordinates` | data.frame | X/Y (or multi-dim) coordinates |
+| `settings` | list (see below) | UMAP parameters |
+
+`umap$settings` (example keys)
+
+- `use_rep` (character)
+- `language` (character)
+- `init` (character)
+- `low_memory` (character)
+- `random_state` (numeric)
+- `num_neighbors` (numeric)
+- `min_dist` (numeric)
+- `transform_seed` (numeric)
+- `verbose` (character)
+
+`versions` (top-level view)
+
+| Element | Type | Description |
+| --- | --- | --- |
+| `R` | list | R system version info |
+| `Python` | character | Python version string |
+| `Rsession` | list | `sessionInfo()`-like structure |
+| `pip_list` | data.frame | pip packages / versions |
+
+Reference: exact `summary()` output
+
+```r
+# (paste original `summary(obj_small)` output here for complete reference)
+```
+
+Notes & recommendations
+- Use the top-level table for a quick overview and nested tables for each complex element (`cluster`, `umap`, `versions`, etc.).
+- Keep example values (lengths/types) to help users validate objects programmatically.
+- For very long example outputs, link to an `/examples` folder or include a collapsed `<details>` block.
+- If you want, I can insert a full `summary(obj_small)` output file into `/examples` and link to it from the README.
