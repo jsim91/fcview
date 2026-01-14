@@ -734,6 +734,33 @@ ui <- navbarPage(
                6,
                uiOutput("pairing_summary_ui")
              )
+           ),
+           hr(),
+           h3("Metadata Subsetting"),
+           helpText("Subset samples for testing/classification/regression based on metadata values. UMAP and tSNE tabs are not affected."),
+           checkboxInput("enable_subsetting", "Enable subsetting", value = FALSE),
+           conditionalPanel(
+             condition = "input.enable_subsetting",
+             fluidRow(
+               column(
+                 6,
+                 h4("Subsetting Rules"),
+                 uiOutput("subsetting_rules_ui"),
+                 br(),
+                 actionButton("add_subset_rule", "Add Rule", icon = icon("plus")),
+                 br(), br(),
+                 radioButtons("subset_logic", "Combine multiple rules using:",
+                             choices = c("Intersection (AND)" = "intersection", "Union (OR)" = "union"),
+                             selected = "intersection"),
+                 br(),
+                 actionButton("apply_subsetting", "Apply Subsetting", icon = icon("filter"), class = "btn-primary")
+               ),
+               column(
+                 6,
+                 h4("Preview"),
+                 uiOutput("subset_preview_ui")
+               )
+             )
            )
   ),
   
@@ -1069,7 +1096,12 @@ server <- function(input, output, session) {
     data_ready = FALSE,
     # Global settings for available features
     available_features = character(0),
-    all_meta_cols = character(0)
+    all_meta_cols = character(0),
+    # Subsetting
+    meta_sample_original = NULL,  # Original unfiltered metadata
+    subsetting_enabled = FALSE,
+    subset_rules = list(),  # List of subsetting rules
+    subset_summary = NULL  # Summary of subsetting results
   )
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
@@ -1342,6 +1374,8 @@ server <- function(input, output, session) {
       all_cols <- setdiff(colnames(rv$meta_sample), c("patient_ID", "source", "run_date"))
       rv$all_meta_cols <- all_cols
       rv$available_features <- all_cols  # All selected by default
+      # Store original metadata for subsetting
+      rv$meta_sample_original <- rv$meta_sample
     }
     
     session$sendCustomMessage("enableTabs", TRUE)
@@ -1385,11 +1419,18 @@ server <- function(input, output, session) {
     }
   })
   
-  # Update pairing_var choices when metadata loads
+  # Update pairing_var choices when metadata loads (preserve current selection)
   observeEvent(rv$meta_sample, {
     req(rv$meta_sample)
     all_cols <- colnames(rv$meta_sample)
-    updatePickerInput(session, "pairing_var", choices = c("", all_cols), selected = "")
+    current_selection <- input$pairing_var
+    
+    # Preserve selection if it's still valid, otherwise reset
+    if (!is.null(current_selection) && current_selection %in% all_cols) {
+      updatePickerInput(session, "pairing_var", choices = c("", all_cols), selected = current_selection)
+    } else {
+      updatePickerInput(session, "pairing_var", choices = c("", all_cols), selected = "")
+    }
   }, ignoreInit = TRUE)
   
   # Display pairing summary
@@ -1439,6 +1480,262 @@ server <- function(input, output, session) {
         tags$small(sprintf("Pairing by: %s", pairing_col))
       )
     }
+  })
+  
+  # ========== METADATA SUBSETTING ==========
+  
+  # Track active rule IDs (use unique IDs to preserve input values)
+  subset_rule_ids <- reactiveVal(integer(0))
+  subset_next_id <- reactiveVal(1)
+  
+  # Render subsetting rules UI
+  output$subsetting_rules_ui <- renderUI({
+    req(rv$meta_sample_original)
+    
+    rule_ids <- subset_rule_ids()
+    if (length(rule_ids) == 0) {
+      return(tags$p(style = "color: #999; font-style: italic;", "Click 'Add Rule' to create a subsetting rule."))
+    }
+    
+    meta_cols <- colnames(rv$meta_sample_original)
+    
+    rule_uis <- lapply(rule_ids, function(rule_id) {
+      ns_id <- paste0("rule_", rule_id)
+      
+      # Preserve existing column selection if it exists
+      current_col <- input[[paste0(ns_id, "_col")]]
+      if (is.null(current_col)) current_col <- meta_cols[1]
+      
+      tags$div(
+        id = paste0("rule_container_", rule_id),
+        style = "border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; border-radius: 4px; background-color: #f9f9f9;",
+        fluidRow(
+          column(
+            5,
+            selectInput(paste0(ns_id, "_col"), "Column", choices = meta_cols, selected = current_col)
+          ),
+          column(
+            6,
+            uiOutput(paste0(ns_id, "_values_ui"))
+          ),
+          column(
+            1,
+            br(),
+            actionButton(paste0("remove_rule_", rule_id), "", icon = icon("trash"), class = "btn-danger btn-sm",
+                        style = "margin-top: 5px;")
+          )
+        )
+      )
+    })
+    
+    tagList(rule_uis)
+  })
+  
+  # Dynamically create value pickers for each rule
+  observe({
+    req(rv$meta_sample_original)
+    rule_ids <- subset_rule_ids()
+    if (length(rule_ids) == 0) return()
+    
+    lapply(rule_ids, function(rule_id) {
+      ns_id <- paste0("rule_", rule_id)
+      col_input_id <- paste0(ns_id, "_col")
+      values_ui_id <- paste0(ns_id, "_values_ui")
+      values_input_id <- paste0(ns_id, "_values")
+      
+      # Only re-render when column changes (not when values change)
+      observeEvent(input[[col_input_id]], {
+        selected_col <- input[[col_input_id]]
+        if (is.null(selected_col) || !nzchar(selected_col)) {
+          output[[values_ui_id]] <- renderUI(NULL)
+          return()
+        }
+        
+        req(selected_col %in% colnames(rv$meta_sample_original))
+        unique_vals <- sort(unique(as.character(rv$meta_sample_original[[selected_col]])))
+        unique_vals <- unique_vals[!is.na(unique_vals)]
+        
+        # Use isolate to read current values without creating dependency
+        current_values <- isolate(input[[values_input_id]])
+        if (is.null(current_values)) {
+          # Default to all values if no prior selection
+          selected_vals <- unique_vals
+        } else {
+          # Keep existing selection (intersect to handle column changes)
+          selected_vals <- intersect(current_values, unique_vals)
+          if (length(selected_vals) == 0) selected_vals <- unique_vals
+        }
+        
+        output[[values_ui_id]] <- renderUI({
+          pickerInput(
+            values_input_id,
+            "Values to keep",
+            choices = unique_vals,
+            selected = selected_vals,
+            multiple = TRUE,
+            options = list(
+              `actions-box` = TRUE,
+              `selected-text-format` = "count > 3",
+              `deselect-all-text` = "Deselect All",
+              `select-all-text` = "Select All",
+              `none-selected-text` = "No values selected",
+              `live-search` = TRUE
+            )
+          )
+        })
+      }, ignoreNULL = TRUE, ignoreInit = FALSE)
+    })
+  })
+  
+  # Add rule button
+  observeEvent(input$add_subset_rule, {
+    new_id <- subset_next_id()
+    subset_rule_ids(c(subset_rule_ids(), new_id))
+    subset_next_id(new_id + 1)
+  })
+  
+  # Remove rule buttons (dynamic observers for each rule ID)
+  observe({
+    rule_ids <- subset_rule_ids()
+    if (length(rule_ids) == 0) return()
+    
+    lapply(rule_ids, function(rule_id) {
+      observeEvent(input[[paste0("remove_rule_", rule_id)]], {
+        # Remove this specific rule ID from the list
+        current_ids <- subset_rule_ids()
+        subset_rule_ids(setdiff(current_ids, rule_id))
+      }, ignoreInit = TRUE, ignoreNULL = TRUE, once = TRUE)
+    })
+  })
+  
+  # Apply subsetting
+  observeEvent(input$apply_subsetting, {
+    req(rv$meta_sample_original)
+    
+    if (!input$enable_subsetting) {
+      rv$meta_sample <- rv$meta_sample_original
+      rv$subsetting_enabled <- FALSE
+      rv$subset_summary <- NULL
+      showNotification("Subsetting disabled. All samples are now available.", type = "info")
+      return()
+    }
+    
+    rule_ids <- subset_rule_ids()
+    if (length(rule_ids) == 0) {
+      showNotification("No subsetting rules defined. Add at least one rule.", type = "warning")
+      return()
+    }
+    
+    # Collect all rules using rule IDs
+    rules_list <- lapply(rule_ids, function(rule_id) {
+      ns_id <- paste0("rule_", rule_id)
+      col <- input[[paste0(ns_id, "_col")]]
+      vals <- input[[paste0(ns_id, "_values")]]
+      list(column = col, values = vals)
+    })
+    
+    # Remove any invalid rules
+    rules_list <- Filter(function(r) !is.null(r$column) && !is.null(r$values) && length(r$values) > 0, rules_list)
+    
+    if (length(rules_list) == 0) {
+      showNotification("No valid subsetting rules. Please configure at least one rule.", type = "warning")
+      return()
+    }
+    
+    # Apply subsetting logic
+    meta_orig <- rv$meta_sample_original
+    n_before <- nrow(meta_orig)
+    
+    if (input$subset_logic == "intersection") {
+      # Intersection: keep rows that match ALL rules
+      keep_mask <- rep(TRUE, nrow(meta_orig))
+      for (rule in rules_list) {
+        col_vals <- as.character(meta_orig[[rule$column]])
+        keep_mask <- keep_mask & (col_vals %in% rule$values)
+      }
+      meta_filtered <- meta_orig[keep_mask, , drop = FALSE]
+    } else {
+      # Union: keep rows that match ANY rule
+      keep_mask <- rep(FALSE, nrow(meta_orig))
+      for (rule in rules_list) {
+        col_vals <- as.character(meta_orig[[rule$column]])
+        keep_mask <- keep_mask | (col_vals %in% rule$values)
+      }
+      meta_filtered <- meta_orig[keep_mask, , drop = FALSE]
+    }
+    
+    n_after <- nrow(meta_filtered)
+    n_excluded <- n_before - n_after
+    
+    if (n_after == 0) {
+      showNotification("Subsetting removed all samples. Please adjust your rules.", type = "error")
+      return()
+    }
+    
+    # Update reactive values
+    rv$meta_sample <- meta_filtered
+    rv$subsetting_enabled <- TRUE
+    rv$subset_rules <- rules_list
+    rv$subset_summary <- list(
+      n_before = n_before,
+      n_after = n_after,
+      n_excluded = n_excluded
+    )
+    
+    showNotification(
+      sprintf("Subsetting applied: %d samples included, %d excluded.", n_after, n_excluded),
+      type = "message",
+      duration = 5
+    )
+  })
+  
+  # Reset subsetting when disabled
+  observeEvent(input$enable_subsetting, {
+    if (!input$enable_subsetting && !is.null(rv$meta_sample_original)) {
+      rv$meta_sample <- rv$meta_sample_original
+      rv$subsetting_enabled <- FALSE
+      rv$subset_summary <- NULL
+      subset_rule_ids(integer(0))
+      subset_next_id(1)
+    }
+  })
+  
+  # Render subsetting preview
+  output$subset_preview_ui <- renderUI({
+    if (is.null(rv$subset_summary)) {
+      return(tags$div(
+        style = "color: #999; font-style: italic;",
+        "Configure rules and click 'Apply Subsetting' to see preview."
+      ))
+    }
+    
+    summ <- rv$subset_summary
+    
+    # Build preview table showing sample counts per column
+    preview_cols <- unique(sapply(rv$subset_rules, function(r) r$column))
+    preview_tables <- lapply(preview_cols, function(col) {
+      if (!col %in% colnames(rv$meta_sample)) return(NULL)
+      tbl <- table(rv$meta_sample[[col]], useNA = "ifany")
+      tags$div(
+        tags$strong(paste0(col, ":")),
+        tags$pre(
+          style = "background-color: #f5f5f5; padding: 5px; border-radius: 4px; font-size: 11px; max-height: 150px; overflow-y: auto;",
+          paste(capture.output(print(tbl)), collapse = "\n")
+        )
+      )
+    })
+    
+    tags$div(
+      tags$div(
+        style = "background-color: #dff0d8; border: 1px solid #d6e9c6; border-radius: 4px; padding: 10px; margin-bottom: 10px;",
+        tags$strong(style = "color: #3c763d;", "Subsetting Applied"),
+        tags$p(style = "margin: 5px 0;", sprintf("Samples before: %d", summ$n_before)),
+        tags$p(style = "margin: 5px 0;", sprintf("Samples after: %d", summ$n_after)),
+        tags$p(style = "margin: 5px 0;", sprintf("Samples excluded: %d", summ$n_excluded))
+      ),
+      tags$h5("Sample Distribution"),
+      tagList(preview_tables)
+    )
   })
   
   # Paired testing indicators for Categorical tab
@@ -1493,13 +1790,13 @@ server <- function(input, output, session) {
     # If pairing is enabled AND possible for selected variable, show paired tests
     if (!is.null(pairing_var) && nzchar(pairing_var) && can_pair) {
       radioButtons("test_type", "Test",
-                   choices = c("Wilcoxon (2-group)", "Pairwise Wilcoxon", "Friedman (multi-group paired)", "Spearman (continuous)"),
-                   selected = "Wilcoxon (2-group)")
+                   choices = c("Pairwise Wilcoxon", "Friedman (multi-group paired)", "Spearman (continuous)"),
+                   selected = "Pairwise Wilcoxon")
     } else {
       # Otherwise show unpaired tests
       radioButtons("test_type", "Test",
-                   choices = c("Wilcoxon (2-group)", "Pairwise Wilcoxon", "Kruskal–Wallis (multi-group unpaired)", "Spearman (continuous)"),
-                   selected = "Wilcoxon (2-group)")
+                   choices = c("Pairwise Wilcoxon", "Kruskal–Wallis (multi-group unpaired)", "Spearman (continuous)"),
+                   selected = "Pairwise Wilcoxon")
     }
   })
   
@@ -1511,13 +1808,13 @@ server <- function(input, output, session) {
     # If pairing is enabled AND possible for selected variable, show paired tests
     if (!is.null(pairing_var) && nzchar(pairing_var) && can_pair) {
       radioButtons("cat_test_type", "Test",
-                   choices = c("Wilcoxon (2-group)", "Pairwise Wilcoxon", "Friedman (multi-group paired)"),
-                   selected = "Wilcoxon (2-group)")
+                   choices = c("Pairwise Wilcoxon", "Friedman (multi-group paired)"),
+                   selected = "Pairwise Wilcoxon")
     } else {
       # Otherwise show unpaired tests
       radioButtons("cat_test_type", "Test",
-                   choices = c("Wilcoxon (2-group)", "Pairwise Wilcoxon", "Kruskal–Wallis (multi-group unpaired)"),
-                   selected = "Wilcoxon (2-group)")
+                   choices = c("Pairwise Wilcoxon", "Kruskal–Wallis (multi-group unpaired)"),
+                   selected = "Pairwise Wilcoxon")
     }
   })
   
@@ -2806,31 +3103,61 @@ server <- function(input, output, session) {
             ent_res$p
           }
           
-          # Format p-values
-          p_labels <- sapply(p_vals, function(x) {
-            if (is.na(x)) {
-              "ns"
-            } else if (x < 0.001) {
-              "***"
-            } else if (x < 0.01) {
-              "**"
-            } else if (x < 0.05) {
-              "*"
-            } else {
-              "ns"
-            }
-          })
-          
           # Get entity data
           ent_data <- abund_long_plot %>% dplyr::filter(entity == ent)
           y_max <- max(ent_data$freq, na.rm = TRUE)
           grp_levels_ordered <- sort(unique(as.character(ent_data[[group_var]])))
           
+          # Determine number of unique categories for this entity
+          n_categories <- length(unique(ent_data[[group_var]]))
+          
+          # Scale spacing and offset based on number of categories
+          # More categories = need more vertical space between brackets
+          # Use non-linear scaling: 2 and 4+ categories need more space
+          if (n_categories == 2) {
+            spacing_multiplier <- 0.12
+          } else if (n_categories == 3) {
+            spacing_multiplier <- 0.13
+          } else {
+            # 4+ categories: scale more aggressively
+            spacing_multiplier <- 0.13 + 0.07 * (n_categories - 3)
+          }
+          
+          # Text offset is consistently less than bracket spacing to avoid overlap
+          text_offset_multiplier <- spacing_multiplier * 0.55
+          
+          # Format p-values: use actual p-values for <3 categories, stars for >=3
+          if (n_categories < 3) {
+            p_labels <- sapply(p_vals, function(x) {
+              if (is.na(x)) {
+                "NA"
+              } else if (x < 0.001) {
+                formatC(x, format = "e", digits = 2)
+              } else {
+                as.character(signif(x, 3))
+              }
+            })
+          } else {
+            p_labels <- sapply(p_vals, function(x) {
+              if (is.na(x)) {
+                "ns"
+              } else if (x < 0.001) {
+                "***"
+              } else if (x < 0.01) {
+                "**"
+              } else if (x < 0.05) {
+                "*"
+              } else {
+                "ns"
+              }
+            })
+          }
+          
           # Build brackets and labels for all comparisons in this entity
           for (j in seq_along(comparisons_list)) {
             grp1 <- comparisons_list[[j]][1]
             grp2 <- comparisons_list[[j]][2]
-            y_pos <- y_max * (1.05 + 0.08 * (j - 1))
+            y_pos <- y_max * (1.05 + spacing_multiplier * (j - 1))
             label <- p_labels[j]
             
             x1 <- which(grp_levels_ordered == grp1)
@@ -2851,7 +3178,7 @@ server <- function(input, output, session) {
               all_labels[[length(all_labels) + 1]] <- data.frame(
                 entity = ent,
                 x = (x1 + x2) / 2,
-                y = y_pos + 0.01 * y_max,
+                y = y_pos + text_offset_multiplier * y_max,
                 label = label,
                 stringsAsFactors = FALSE
               )
@@ -2896,11 +3223,19 @@ server <- function(input, output, session) {
       }
     }
     
-    # Add caption explaining significance notation for pairwise tests
+    # Add caption explaining significance notation for pairwise tests (only if using stars)
     if (is_pairwise && "comparison" %in% names(res)) {
-      gg <- gg + ggplot2::labs(
-        caption = "Significance levels: *** p < 0.001, ** p < 0.01, * p < 0.05, ns = not significant"
-      ) + ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0.5))
+      # Check if any entity has >=3 categories (meaning stars are used)
+      use_stars <- any(sapply(unique(abund_long_plot$entity), function(ent) {
+        ent_data <- abund_long_plot %>% dplyr::filter(entity == ent)
+        length(unique(ent_data[[group_var]])) >= 3
+      }))
+      
+      if (use_stars) {
+        gg <- gg + ggplot2::labs(
+          caption = "Significance levels: *** p < 0.001, ** p < 0.01, * p < 0.05, ns = not significant"
+        ) + ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0.5))
+      }
     }
     
     # Cache for export
