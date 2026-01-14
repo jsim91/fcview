@@ -28,10 +28,12 @@ suppressPackageStartupMessages({
     library(boot) # bootstrapping CIs for AUC
     library(rlang) # tidy evaluation for !!!syms
     library(randomForest)
+    library(multiROC) # for multiclass ROC curves
+    library(zip) # for ZIP download handlers
   })
 })
 
-options(shiny.maxRequestSize = 100000 * 1024^2)
+options(shiny.maxRequestSize = 5000 * 1024^2)
 
 # ---- Helpers & validation ----
 `%||%` <- function(a, b) if (!is.null(a)) a else b
@@ -103,7 +105,7 @@ align_metadata_abundance <- function(metadata, abundance, notify = NULL) {
 }
 
 clean_dummy_names <- function(nms) {
-  gsub(pattern = 'leiden_cluster', replacement = 'leiden_cluster:', x = nms)
+  gsub(pattern = 'cluster', replacement = 'cluster:', x = nms)
 }
 
 spearman_test <- function(df, freq_col = "freq", cont_var) {
@@ -145,7 +147,7 @@ compute_multiROC <- function(preds) {
 
 # Validate minimal structure
 validateInput <- function(obj, id_col = NULL) {
-  required <- c("data", "source", "metadata", "leiden")
+  required <- c("data", "source", "metadata", "cluster")
   miss <- setdiff(required, names(obj))
   if (length(miss)) stop("Missing required elements: ", paste(miss, collapse = ", "))
   
@@ -154,8 +156,8 @@ validateInput <- function(obj, id_col = NULL) {
   
   if (length(obj$source) != n) stop("source length must equal nrow(data).")
   if (!is.data.frame(obj$metadata)) stop("metadata must be a data.frame.")
-  if (!is.list(obj$leiden) || is.null(obj$leiden$clusters)) stop("leiden must be a list with 'clusters'.")
-  if (length(obj$leiden$clusters) != n) stop("leiden$clusters length must equal nrow(data).")
+  if (!is.list(obj$cluster) || is.null(obj$cluster$clusters)) stop("cluster must be a list with 'clusters'.")
+  if (length(obj$cluster$clusters) != n) stop("cluster$clusters length must equal nrow(data).")
   
   # Optional elements: if present, check shape
   if ("umap" %in% names(obj)) {
@@ -180,7 +182,7 @@ validateInput <- function(obj, id_col = NULL) {
 # Presence checks
 hasUMAP <- function(obj) "umap" %in% names(obj) && !is.null(obj$umap$coordinates)
 hasTSNE <- function(obj) "tsne" %in% names(obj) && !is.null(obj$tsne$coordinates)
-hasHeatmap <- function(obj) "leiden_heatmap" %in% names(obj) && !is.null(obj$leiden_heatmap$heatmap_tile_data)
+hasHeatmap <- function(obj) "cluster_heatmap" %in% names(obj) && !is.null(obj$cluster_heatmap$heatmap_tile_data)
 hasRunDate <- function(obj) "run_date" %in% names(obj) && length(obj$run_date) == nrow(obj$data)
 hasClusterMapping <- function(obj) "cluster_mapping" %in% names(obj)
 
@@ -262,24 +264,24 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       
       req(!is.null(expr_val), !is.null(meta_val))
       
-      # Add leiden_cluster column as factor if missing
-      if (!"leiden_cluster" %in% colnames(meta_val) && !is.null(clusters_val$assignments)) {
-        meta_val$leiden_cluster <- factor(clusters_val$assignments)
+      # Add cluster column as factor if missing
+      if (!"cluster" %in% colnames(meta_val) && !is.null(clusters_val$assignments)) {
+        meta_val$cluster <- factor(clusters_val$assignments)
       }
       
       numeric_markers <- colnames(expr_val)
       meta_cols <- setdiff(colnames(meta_val), c(".cell"))
       
-      # Ensure leiden_cluster is present and comes right after markers
-      if (!"leiden_cluster" %in% meta_cols && "leiden_cluster" %in% colnames(meta_val)) {
-        meta_cols <- c("leiden_cluster", setdiff(meta_cols, "leiden_cluster"))
+      # Ensure cluster is present and comes right after markers
+      if (!"cluster" %in% meta_cols && "cluster" %in% colnames(meta_val)) {
+        meta_cols <- c("cluster", setdiff(meta_cols, "cluster"))
       }
       
-      # Sort metadata portion alphabetically (excluding leiden_cluster)
-      meta_cols_sorted <- sort(setdiff(meta_cols, "leiden_cluster"))
+      # Sort metadata portion alphabetically (excluding cluster)
+      meta_cols_sorted <- sort(setdiff(meta_cols, "cluster"))
       
-      # Final order: markers → leiden_cluster → sorted metadata
-      ordered_choices <- c(numeric_markers, "leiden_cluster", meta_cols_sorted)
+      # Final order: markers → cluster → sorted metadata
+      ordered_choices <- c(numeric_markers, "cluster", meta_cols_sorted)
       
       # Continuous and categorical choices from metadata
       cont_choices <- sort(meta_cols[sapply(meta_val[meta_cols], is.numeric)])
@@ -288,7 +290,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
       categorical_choices <- sort(c(factor_cols, char_cols))
       
       # Default unit_var
-      unit_default <- if ("PatientID" %in% meta_cols) "PatientID" else meta_cols[1]
+      unit_default <- if ("patient_ID" %in% meta_cols) "patient_ID" else meta_cols[1]
       
       updatePickerInput(session, "color_by",
                         choices = ordered_choices,
@@ -624,7 +626,7 @@ EmbeddingServer <- function(id, embedding_name, coords, expr, meta_cell, cluster
           pdf_height <- 8
         }
         
-        ggsave(file, plot = gg, device = cairo_pdf,
+        ggsave(file, plot = gg, device = if (capabilities("cairo")) cairo_pdf else pdf,
                width = pdf_width, height = pdf_height, units = "in")
       },
       contentType = "application/pdf"
@@ -700,6 +702,41 @@ ui <- navbarPage(
            )
   ),
   
+  tabPanel("Global Settings",
+           h3("Available Metadata Features"),
+           helpText("Select which metadata columns should be available throughout the app (both as predictors and outcomes). Changes take effect immediately."),
+           fluidRow(
+             column(
+               6,
+               h4("Available Features"),
+               uiOutput("features_checkboxes"),
+               br(),
+               actionButton("select_all_features", "Select All"),
+               actionButton("deselect_all_features", "Deselect All")
+             ),
+             column(
+               6,
+               h4("Current Selections"),
+               verbatimTextOutput("global_settings_summary")
+             )
+           ),
+           hr(),
+           h3("Paired Testing Settings"),
+           helpText("Select a metadata column to enable paired statistical tests. This column should identify matching samples/patients across conditions."),
+           fluidRow(
+             column(
+               6,
+               pickerInput("pairing_var", "Pairing variable", 
+                          choices = NULL, 
+                          options = list(`none-selected-text` = "None (unpaired tests)"))
+             ),
+             column(
+               6,
+               uiOutput("pairing_summary_ui")
+             )
+           )
+  ),
+  
   tabPanel("UMAP", EmbeddingUI("umap", title = "UMAP")),
   tabPanel("tSNE", EmbeddingUI("tsne", title = "tSNE")),
   
@@ -729,8 +766,8 @@ ui <- navbarPage(
                ),
                pickerInput("group_var", "Categorical metadata", choices = NULL, options = list(`none-selected-text` = "None")),
                pickerInput("cont_var", "Continuous metadata", choices = NULL, options = list(`none-selected-text` = "None")),
-               radioButtons("test_type", "Test",
-                            choices = c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)", "Spearman (continuous)")),
+               uiOutput("test_type_ui"),
+               uiOutput("paired_test_indicator_ui"),
                selectInput("p_adj_method", "P‑value adjustment method",
                            choices = c("BH", "bonferroni", "BY", "fdr"), selected = "BH"),
                actionButton("run_test", "Run tests"),
@@ -760,15 +797,15 @@ ui <- navbarPage(
                3,
                pickerInput("cat_entity", "Entity", choices = c("Clusters", "Celltypes"), selected = "Clusters"),
                pickerInput("cat_group_var", "Categorical metadata", choices = NULL, options = list(`none-selected-text` = "None")),
-               radioButtons("cat_test_type", "Test", choices = c("Wilcoxon (2-group)", "Kruskal–Wallis (multi-group)")),
+               uiOutput("cat_test_type_ui"),
+               uiOutput("paired_cat_indicator_ui"),
+               uiOutput("cat_pairing_check_ui"),
                selectInput("cat_p_adj_method", "P‑value adjustment method",
                            choices = c("BH", "bonferroni", "BY", "fdr"), selected = "BH"),
                checkboxInput("cat_use_adj_p", "Plot adjusted pvalues", value = TRUE),
                selectInput("cat_max_facets", "Facet columns", choices = 2:6, selected = 4),
                selectInput("cat_plot_type", "Plot type", choices = c("Boxplot" = "box", "Violin" = "violin"), selected = "box"),
-               radioButtons("cat_points", "Show data points",
-                            choices = c("Draw" = "draw", "Draw with jitter" = "jitter", "Do not draw" = "none"),
-                            selected = "draw"),
+               uiOutput("cat_points_ui"),
                br(), 
                actionButton("cat_populate_colors", "Populate colors for selected group variable"),
                br(), 
@@ -830,14 +867,14 @@ ui <- navbarPage(
            h4("Model Settings"),
            fluidRow(
              column(
-               3,
+               2,
                pickerInput("fs_method", "Method", 
                            choices = c("Ridge Regression", "Elastic Net", "Random Forest (Boruta)")),
                pickerInput("fs_outcome", "Outcome variable", choices = NULL),
                pickerInput("fs_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
                conditionalPanel(
-                 condition = "input.fs_predictors.includes('leiden_cluster')",
-                 pickerInput("fs_leiden_subset", "Select clusters to include",
+                 condition = "input.fs_predictors.includes('cluster')",
+                 pickerInput("fs_cluster_subset", "Select clusters to include",
                              choices = NULL, multiple = TRUE)
                ), 
                conditionalPanel(
@@ -855,30 +892,36 @@ ui <- navbarPage(
                )
              ),
              column(
-               9,
+               7,
                conditionalPanel(
                  condition = "output.hasFSResults",
                  h4("Summary Plot"),
                  plotOutput("fs_plot", height = "550px"),
-                 h4("Selected Features"),
-                 tableOutput("fs_results"), 
                  h4("Details"),
                  verbatimTextOutput("fs_summary")
                ),
                textOutput("fs_cleared_msg")
+             ),
+             column(
+               3,
+               conditionalPanel(
+                 condition = "output.hasFSResults",
+                 h4("Selected Features"),
+                 tableOutput("fs_results")
+               )
              )
            )
-  ), 
+  ),
   tabPanel("Classification",
            h4("Model Settings"),
            fluidRow(
              column(
-               3,
+               2,
                pickerInput("lm_outcome", "Outcome variable", choices = NULL),
                pickerInput("lm_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
                conditionalPanel(
-                 condition = "input.lm_predictors.includes('leiden_cluster')",
-                 pickerInput("lm_leiden_subset", "Select clusters to include", choices = NULL, multiple = TRUE)
+                 condition = "input.lm_predictors.includes('cluster')",
+                 pickerInput("lm_cluster_subset", "Select clusters to include", choices = NULL, multiple = TRUE)
                ),
                radioButtons("lm_model_type", "Model type",
                             choices = c("Logistic Regression", "Elastic Net", "Random Forest")),
@@ -908,16 +951,16 @@ ui <- navbarPage(
                )
              ),
              column(
-               9,
+               7,
                conditionalPanel(
                  condition = "output.hasLMResults",
+                 h4("ROC Curve"),
+                 plotOutput("lm_roc_plot", height = "500px"),
                  fluidRow(
                    column(
                      width = 5,
                      h4("Model Summary"),
-                     verbatimTextOutput("lm_summary"),
-                     h4("Performance Metrics"),
-                     tableOutput("lm_perf_table")
+                     verbatimTextOutput("lm_summary")
                    ),
                    column(
                      width = 7,
@@ -929,6 +972,83 @@ ui <- navbarPage(
                  )
                ),
                textOutput("lm_cleared_msg")
+             ),
+             column(
+               3,
+               conditionalPanel(
+                 condition = "output.hasLMResults",
+                 h4("Model Features"),
+                 tableOutput("lm_features")
+               )
+             )
+           )
+  ),
+  tabPanel("Regression",
+           h4("Model Settings"),
+           fluidRow(
+             column(
+               3,
+               pickerInput("reg_outcome", "Outcome variable (continuous)", choices = NULL),
+               pickerInput("reg_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
+               conditionalPanel(
+                 condition = "input.reg_predictors.includes('cluster')",
+                 pickerInput("reg_cluster_subset", "Select clusters to include", choices = NULL, multiple = TRUE)
+               ),
+               radioButtons("reg_model_type", "Model type",
+                            choices = c("Linear Regression", "Ridge Regression", "Elastic Net", "Random Forest")),
+               conditionalPanel(
+                 condition = "input.reg_model_type == 'Elastic Net'",
+                 sliderInput("reg_alpha", "Elastic Net alpha (0 = Ridge, 1 = Lasso)",
+                             min = 0, max = 1, value = 0.5, step = 0.05)
+               ),
+               radioButtons("reg_validation", "Validation strategy",
+                            choices = c("Train/Test split", "k-fold CV", "Leave-One-Out")),
+               conditionalPanel(
+                 condition = "input.reg_validation == 'Train/Test split'",
+                 sliderInput("reg_train_frac", "Train fraction", min = 0.5, max = 0.95,
+                             value = 0.7, step = 0.05)
+               ),
+               conditionalPanel(
+                 condition = "input.reg_validation == 'k-fold CV'",
+                 numericInput("reg_k", "Number of folds", value = 5, min = 2, max = 20)
+               ),
+               actionButton("run_reg", "Run Model"),
+               br(), br(),
+               conditionalPanel(
+                 condition = "output.hasRegResults",
+                 downloadButton("export_reg_zip", "Download All Results (ZIP)"),
+                 br(), br(),
+                 actionButton("reset_reg", "Clear Results")
+               )
+             ),
+             column(
+               3,
+               conditionalPanel(
+                 condition = "output.hasRegResults",
+                 h4("Model Summary"),
+                 verbatimTextOutput("reg_summary"),
+                 h4("Performance Metrics"),
+                 tableOutput("reg_perf_table")
+               ),
+               textOutput("reg_cleared_msg")
+             ),
+             column(
+               3,
+               conditionalPanel(
+                 condition = "output.hasRegResults",
+                 h4("Observed vs Predicted"),
+                 plotOutput("reg_obs_pred_plot", height = "400px"),
+                 h4("Residuals vs Fitted"),
+                 plotOutput("reg_residual_plot", height = "400px")
+               )
+             ),
+             column(
+               3,
+               conditionalPanel(
+                 condition = "output.hasRegResults",
+                 h4("Model Features"),
+                 tableOutput("reg_features")
+               )
              )
            )
   )
@@ -948,7 +1068,10 @@ server <- function(input, output, session) {
     cluster_heat = NULL,
     pop_size = NULL,
     rep_used = NULL,
-    data_ready = FALSE
+    data_ready = FALSE,
+    # Global settings for available features
+    available_features = character(0),
+    all_meta_cols = character(0)
   )
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
@@ -957,6 +1080,7 @@ server <- function(input, output, session) {
   cont_state <- reactiveVal(NULL)
   fs_state <- reactiveVal(NULL)
   lm_state <- reactiveVal(NULL)
+  reg_state <- reactiveVal(NULL)
   # rv$log <- reactiveVal(character())
   
   # Disable tabs at startup
@@ -983,7 +1107,7 @@ server <- function(input, output, session) {
     candidates <- ls(e)
     matches <- vapply(candidates, function(nm) {
       cand <- e[[nm]]
-      is.list(cand) && all(c("data", "source", "metadata", "leiden") %in% names(cand))
+      is.list(cand) && all(c("data", "source", "metadata", "cluster") %in% names(cand))
     }, logical(1))
     
     if (sum(matches) == 1) {
@@ -1019,8 +1143,8 @@ server <- function(input, output, session) {
       obj$data   <- obj$data[keep_idx, , drop = FALSE]
       obj$source <- obj$source[keep_idx]
       
-      if (!is.null(obj$leiden$clusters) && length(obj$leiden$clusters) == n_cells) {
-        obj$leiden$clusters <- obj$leiden$clusters[keep_idx]
+      if (!is.null(obj$cluster$clusters) && length(obj$cluster$clusters) == n_cells) {
+        obj$cluster$clusters <- obj$cluster$clusters[keep_idx]
       }
       if (!is.null(obj$umap$coordinates) && nrow(obj$umap$coordinates) == n_cells) {
         obj$umap$coordinates <- obj$umap$coordinates[keep_idx, , drop = FALSE]
@@ -1045,7 +1169,7 @@ server <- function(input, output, session) {
     # --- Build meta_cell (per-cell) with robust patient_ID mapping for UMAP/tSNE tabs ---
     meta_cell <- data.frame(
       source  = as.character(obj$source),
-      RunDate = if (!is.null(run_date)) run_date else NA
+      run_date = if (!is.null(run_date)) run_date else NA
     )
     
     # Prepare metadata IDs (character, unique, deduplicated rows)
@@ -1057,6 +1181,11 @@ server <- function(input, output, session) {
     
     metadata_unique <- obj$metadata %>%
       dplyr::distinct(patient_ID, .keep_all = TRUE)
+    
+    # Remove run_date from metadata if it exists to avoid .x/.y suffixes during join
+    if ("run_date" %in% colnames(metadata_unique)) {
+      metadata_unique <- metadata_unique %>% dplyr::select(-run_date)
+    }
     
     ids <- unique(metadata_unique$patient_ID)
     if (length(ids) == 0) {
@@ -1104,25 +1233,22 @@ server <- function(input, output, session) {
       print(utils::head(meta_cell$source[is.na(meta_cell$patient_ID)], 10))
     }
     
-    if (!("PatientID" %in% names(meta_cell))) {
-      meta_cell$PatientID <- meta_cell$patient_ID
+    # Convert run_date to factor if present
+    if ("run_date" %in% names(meta_cell)) {
+      meta_cell$run_date <- as.factor(meta_cell$run_date)
     }
     
-    if ("RunDate" %in% names(meta_cell)) {
-      meta_cell$RunDate <- as.factor(meta_cell$RunDate)
-    }
-    
-    # Add leiden_cluster factor if available
-    if (!"leiden_cluster" %in% names(meta_cell) &&
-        !is.null(obj$leiden$clusters) &&
-        length(obj$leiden$clusters) == nrow(obj$data)) {
-      meta_cell$leiden_cluster <- factor(obj$leiden$clusters,
-                                         levels = sort(unique(obj$leiden$clusters)))
+    # Add cluster factor if available
+    if (!"cluster" %in% names(meta_cell) &&
+        !is.null(obj$cluster$clusters) &&
+        length(obj$cluster$clusters) == nrow(obj$data)) {
+      meta_cell$cluster <- factor(obj$cluster$clusters,
+                                         levels = sort(unique(obj$cluster$clusters)))
     }
     
     clusters <- list(
-      assignments = obj$leiden$clusters,
-      settings    = obj$leiden$settings %||% list()
+      assignments = obj$cluster$clusters,
+      settings    = obj$cluster$settings %||% list()
     )
     cluster_map <- if (!is.null(obj$cluster_mapping)) obj$cluster_mapping else NULL
     
@@ -1131,18 +1257,18 @@ server <- function(input, output, session) {
     tSNE <- if (!is.null(obj$tsne)) list(coords = obj$tsne$coordinates,
                                          settings = obj$tsne$settings) else NULL
     
-    cluster_heat <- if (!is.null(obj$leiden_heatmap)) obj$leiden_heatmap$heatmap_tile_data else NULL
-    pop_size     <- if (!is.null(obj$leiden_heatmap)) obj$leiden_heatmap$population_size else NULL
-    rep_used     <- if (!is.null(obj$leiden_heatmap)) obj$leiden_heatmap$rep_used else NA
+    cluster_heat <- if (!is.null(obj$cluster_heatmap)) obj$cluster_heatmap$heatmap_tile_data else NULL
+    pop_size     <- if (!is.null(obj$cluster_heatmap)) obj$cluster_heatmap$population_size else NULL
+    rep_used     <- if (!is.null(obj$cluster_heatmap)) obj$cluster_heatmap$rep_used else NA
     
     # --- Add per-sample abundance matrix and canonical per-sample metadata for downstream tabs ---
-    if (!is.null(obj$leiden$abundance) && is.matrix(obj$leiden$abundance)) {
-      clusters$abundance <- obj$leiden$abundance
+    if (!is.null(obj$cluster$abundance) && is.matrix(obj$cluster$abundance)) {
+      clusters$abundance <- obj$cluster$abundance
       rv$abundance_sample <- clusters$abundance
       
       if (is.null(rownames(rv$abundance_sample)) || any(!nzchar(rownames(rv$abundance_sample)))) {
         showNotification(
-          "leiden$abundance has missing rownames; cannot map to metadata. Please set rownames to source strings.",
+          "cluster$abundance has missing rownames; cannot map to metadata. Please set rownames to source strings.",
           type = "error",
           duration = NULL
         )
@@ -1154,7 +1280,7 @@ server <- function(input, output, session) {
     } else {
       clusters$abundance <- NULL
       rv$abundance_sample <- NULL
-      showNotification("No leiden$abundance matrix found in upload; abundance-based tabs will be disabled.", type = "warning")
+      showNotification("No cluster$abundance matrix found in upload; abundance-based tabs will be disabled.", type = "warning")
     }
     
     # Canonical per-sample metadata (prefer direct sample-level object if provided)
@@ -1191,24 +1317,329 @@ server <- function(input, output, session) {
     if (!is.null(rv$meta_sample)) {
       meta_cols <- colnames(rv$meta_sample)
       categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.factor(x) || is.character(x))])
+      # Exclude cluster, patient_ID, run_date, and source from outcome choices
+      categorical_choices <- setdiff(categorical_choices, c("cluster", "patient_ID", "run_date", "source"))
       predictor_choices <- sort(meta_cols)
+      # Exclude patient_ID, source, and run_date from predictor choices
+      predictor_choices <- setdiff(predictor_choices, c("patient_ID", "source", "run_date"))
       
       updatePickerInput(session, "fs_outcome", choices = categorical_choices, selected = NULL)
-      updatePickerInput(session, "fs_predictors", choices = c(predictor_choices, "leiden_cluster"), selected = NULL)
-      updatePickerInput(session, "fs_leiden_subset",
+      updatePickerInput(session, "fs_predictors", choices = c(predictor_choices, "cluster"), selected = NULL)
+      updatePickerInput(session, "fs_cluster_subset",
                         choices = if (!is.null(rv$abundance_sample)) colnames(rv$abundance_sample) else character(0),
                         selected = character(0))
       
+      # categorical_choices already excludes cluster and patient_ID
       updatePickerInput(session, "lm_outcome", choices = categorical_choices, selected = NULL)
-      updatePickerInput(session, "lm_predictors", choices = c(predictor_choices, "leiden_cluster"), selected = NULL)
-      updatePickerInput(session, "lm_leiden_subset",
+      updatePickerInput(session, "lm_predictors", choices = c(predictor_choices, "cluster"), selected = NULL)
+      updatePickerInput(session, "lm_cluster_subset",
                         choices = if (!is.null(rv$abundance_sample)) colnames(rv$abundance_sample) else character(0),
                         selected = character(0))
     }
     
     rv$data_ready <- TRUE
+    
+    # Initialize global settings with all metadata columns
+    if (!is.null(rv$meta_sample)) {
+      all_cols <- setdiff(colnames(rv$meta_sample), c("patient_ID", "source", "run_date"))
+      rv$all_meta_cols <- all_cols
+      rv$available_features <- all_cols  # All selected by default
+    }
+    
     session$sendCustomMessage("enableTabs", TRUE)
   })
+  
+  # ========== GLOBAL SETTINGS TAB ==========
+  
+  # Render feature checkboxes
+  output$features_checkboxes <- renderUI({
+    req(rv$all_meta_cols)
+    cols <- sort(rv$all_meta_cols)
+    checkboxGroupInput(
+      "global_features",
+      NULL,
+      choices = cols,
+      selected = rv$available_features
+    )
+  })
+  
+  # Update available features when checkboxes change
+  observeEvent(input$global_features, {
+    rv$available_features <- input$global_features
+  }, ignoreInit = TRUE)
+  
+  # Select/Deselect all buttons
+  observeEvent(input$select_all_features, {
+    updateCheckboxGroupInput(session, "global_features", selected = rv$all_meta_cols)
+  })
+  
+  observeEvent(input$deselect_all_features, {
+    updateCheckboxGroupInput(session, "global_features", selected = character(0))
+  })
+  
+  # Summary output
+  output$global_settings_summary <- renderPrint({
+    cat("Features enabled:", length(rv$available_features), "/", length(rv$all_meta_cols), "\n\n")
+    
+    if (length(rv$available_features) > 0) {
+      cat("Available features:\n")
+      cat(paste("-", sort(rv$available_features), collapse = "\n"), "\n")
+    }
+  })
+  
+  # Update pairing_var choices when metadata loads
+  observeEvent(rv$meta_sample, {
+    req(rv$meta_sample)
+    all_cols <- colnames(rv$meta_sample)
+    updatePickerInput(session, "pairing_var", choices = c("", all_cols), selected = "")
+  }, ignoreInit = TRUE)
+  
+  # Display pairing summary
+  output$pairing_summary_ui <- renderUI({
+    pairing_col <- input$pairing_var
+    if (is.null(pairing_col) || !nzchar(pairing_col)) {
+      return(tags$div(
+        style = "margin-top: 20px;",
+        tags$strong("Status: "), 
+        tags$span(style = "color: #999;", "Unpaired tests will be used")
+      ))
+    }
+    
+    req(rv$meta_sample)
+    if (!(pairing_col %in% colnames(rv$meta_sample))) {
+      return(tags$div(
+        style = "margin-top: 20px;",
+        tags$strong("Status: "), 
+        tags$span(style = "color: #d9534f;", "Invalid column selected")
+      ))
+    }
+    
+    vals <- rv$meta_sample[[pairing_col]]
+    n_unique <- length(unique(vals[!is.na(vals)]))
+    tbl <- table(vals, useNA = "ifany")
+    
+    tags$div(
+      style = "margin-top: 20px;",
+      tags$strong(style = "color: #5bc0de;", "Status: Paired tests enabled"),
+      tags$p(style = "margin-top: 10px;", 
+             sprintf("Number of unique values: %d", n_unique)),
+      tags$pre(
+        style = "background-color: #f5f5f5; padding: 10px; border-radius: 4px; max-height: 200px; overflow-y: auto;",
+        paste(capture.output(print(tbl)), collapse = "\n")
+      )
+    )
+  })
+  
+  # Paired testing indicators for Testing tab
+  output$paired_test_indicator_ui <- renderUI({
+    pairing_col <- input$pairing_var
+    if (!is.null(pairing_col) && nzchar(pairing_col)) {
+      tags$div(
+        style = "background-color: #d9edf7; border: 1px solid #bce8f1; border-radius: 4px; padding: 10px; margin: 10px 0;",
+        tags$strong(style = "color: #31708f;", "\u2713 Paired testing enabled"),
+        tags$br(),
+        tags$small(sprintf("Pairing by: %s", pairing_col))
+      )
+    }
+  })
+  
+  # Paired testing indicators for Categorical tab
+  output$paired_cat_indicator_ui <- renderUI({
+    pairing_col <- input$pairing_var
+    if (!is.null(pairing_col) && nzchar(pairing_col)) {
+      tags$div(
+        style = "background-color: #d9edf7; border: 1px solid #bce8f1; border-radius: 4px; padding: 10px; margin: 10px 0;",
+        tags$strong(style = "color: #31708f;", "\u2713 Paired testing enabled"),
+        tags$br(),
+        tags$small(sprintf("Pairing by: %s", pairing_col))
+      )
+    }
+  })
+  
+  # Check if selected categorical variable in Testing tab can be paired
+  test_can_pair <- reactive({
+    pairing_var <- input$pairing_var
+    group_var <- input$group_var
+    
+    # If no pairing variable or no group variable, can't pair
+    if (is.null(pairing_var) || !nzchar(pairing_var) || is.null(group_var) || !nzchar(group_var)) {
+      return(FALSE)
+    }
+    
+    # Check if variables exist in data
+    if (!exists("rv") || is.null(rv$meta_sample)) return(FALSE)
+    if (!(pairing_var %in% colnames(rv$meta_sample)) || !(group_var %in% colnames(rv$meta_sample))) {
+      return(FALSE)
+    }
+    
+    # Check if any pairing values appear in multiple groups
+    df <- rv$meta_sample[, c(pairing_var, group_var)]
+    df <- df[complete.cases(df), ]
+    
+    if (nrow(df) < 2) return(FALSE)
+    
+    # For each unique pairing value, count how many different groups it appears in
+    pair_group_counts <- df %>%
+      dplyr::group_by(!!rlang::sym(pairing_var)) %>%
+      dplyr::summarise(n_groups = dplyr::n_distinct(!!rlang::sym(group_var)), .groups = "drop")
+    
+    # If any pairing value appears in 2+ groups, pairing is possible
+    any(pair_group_counts$n_groups >= 2)
+  })
+  
+  # Render test type options for Testing tab based on pairing feasibility
+  output$test_type_ui <- renderUI({
+    pairing_var <- input$pairing_var
+    can_pair <- test_can_pair()
+    
+    # If pairing is enabled AND possible for selected variable, show paired tests
+    if (!is.null(pairing_var) && nzchar(pairing_var) && can_pair) {
+      radioButtons("test_type", "Test",
+                   choices = c("Wilcoxon (2-group)", "Pairwise Wilcoxon", "Friedman (multi-group paired)", "Spearman (continuous)"),
+                   selected = "Wilcoxon (2-group)")
+    } else {
+      # Otherwise show unpaired tests
+      radioButtons("test_type", "Test",
+                   choices = c("Wilcoxon (2-group)", "Pairwise Wilcoxon", "Kruskal–Wallis (multi-group unpaired)", "Spearman (continuous)"),
+                   selected = "Wilcoxon (2-group)")
+    }
+  })
+  
+  # Render test type options for Categorical tab based on pairing feasibility
+  output$cat_test_type_ui <- renderUI({
+    pairing_var <- input$pairing_var
+    can_pair <- cat_can_pair()
+    
+    # If pairing is enabled AND possible for selected variable, show paired tests
+    if (!is.null(pairing_var) && nzchar(pairing_var) && can_pair) {
+      radioButtons("cat_test_type", "Test",
+                   choices = c("Wilcoxon (2-group)", "Pairwise Wilcoxon", "Friedman (multi-group paired)"),
+                   selected = "Wilcoxon (2-group)")
+    } else {
+      # Otherwise show unpaired tests
+      radioButtons("cat_test_type", "Test",
+                   choices = c("Wilcoxon (2-group)", "Pairwise Wilcoxon", "Kruskal–Wallis (multi-group unpaired)"),
+                   selected = "Wilcoxon (2-group)")
+    }
+  })
+  
+  # Check if selected categorical variable can be paired
+  cat_can_pair <- reactive({
+    pairing_var <- input$pairing_var
+    group_var <- input$cat_group_var
+    
+    # If no pairing variable or no group variable, can't pair
+    if (is.null(pairing_var) || !nzchar(pairing_var) || is.null(group_var) || !nzchar(group_var)) {
+      return(FALSE)
+    }
+    
+    # Check if variables exist in data
+    if (!exists("rv") || is.null(rv$meta_sample)) return(FALSE)
+    if (!(pairing_var %in% colnames(rv$meta_sample)) || !(group_var %in% colnames(rv$meta_sample))) {
+      return(FALSE)
+    }
+    
+    # Check if any pairing values appear in multiple groups
+    df <- rv$meta_sample[, c(pairing_var, group_var)]
+    df <- df[complete.cases(df), ]
+    
+    if (nrow(df) < 2) return(FALSE)
+    
+    # For each unique pairing value, count how many different groups it appears in
+    pair_group_counts <- df %>%
+      dplyr::group_by(!!rlang::sym(pairing_var)) %>%
+      dplyr::summarise(n_groups = dplyr::n_distinct(!!rlang::sym(group_var)), .groups = "drop")
+    
+    # If any pairing value appears in 2+ groups, pairing is possible
+    any(pair_group_counts$n_groups >= 2)
+  })
+  
+  # Display warning if pairing not possible for selected variable
+  output$cat_pairing_check_ui <- renderUI({
+    pairing_var <- input$pairing_var
+    group_var <- input$cat_group_var
+    
+    # Only show if pairing is enabled but not possible for this variable
+    if (!is.null(pairing_var) && nzchar(pairing_var) && !is.null(group_var) && nzchar(group_var)) {
+      can_pair <- cat_can_pair()
+      if (!can_pair) {
+        tags$div(
+          style = "background-color: #fcf8e3; border: 1px solid #faebcc; border-radius: 4px; padding: 8px; margin: 8px 0;",
+          tags$small(
+            style = "color: #8a6d3b;",
+            "\u26A0 Selected variable cannot be paired - unpaired test will be used"
+          )
+        )
+      }
+    }
+  })
+  
+  # Render cat_points UI based on whether pairing is possible
+  output$cat_points_ui <- renderUI({
+    pairing_var <- input$pairing_var
+    can_pair <- cat_can_pair()
+    
+    # Show "Draw with connection" only if pairing is enabled AND possible for selected variable
+    if (!is.null(pairing_var) && nzchar(pairing_var) && can_pair) {
+      radioButtons("cat_points", "Show data points",
+                   choices = c("Draw" = "draw", "Draw with jitter" = "jitter", "Draw with connection" = "connected", "Do not draw" = "none"),
+                   selected = "draw")
+    } else {
+      radioButtons("cat_points", "Show data points",
+                   choices = c("Draw" = "draw", "Draw with jitter" = "jitter", "Do not draw" = "none"),
+                   selected = "draw")
+    }
+  })
+  
+  # Update all dropdowns when global settings change
+  observeEvent(list(rv$available_features, rv$meta_sample), {
+    req(rv$meta_sample, rv$data_ready)
+    
+    meta_cols <- colnames(rv$meta_sample)
+    categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.factor(x) || is.character(x))])
+    continuous_choices <- sort(meta_cols[sapply(rv$meta_sample, is.numeric)])
+    
+    # Base exclusions
+    base_exclude_outcomes <- c("cluster", "patient_ID", "run_date", "source")
+    base_exclude_predictors <- c("patient_ID", "source", "run_date")
+    
+    # Apply base exclusions
+    categorical_choices <- setdiff(categorical_choices, base_exclude_outcomes)
+    continuous_choices <- setdiff(continuous_choices, base_exclude_outcomes)
+    predictor_choices <- setdiff(meta_cols, base_exclude_predictors)
+    
+    # Apply global settings filters
+    categorical_outcomes <- filter_by_global_settings(categorical_choices)
+    continuous_outcomes <- filter_by_global_settings(continuous_choices)
+    predictors <- filter_by_global_settings(predictor_choices)
+    
+    # Add cluster back to predictors if not already there
+    if (!("cluster" %in% predictors)) {
+      predictors <- c(predictors, "cluster")
+    }
+    
+    # Update Feature Selection
+    updatePickerInput(session, "fs_outcome", choices = categorical_outcomes)
+    updatePickerInput(session, "fs_predictors", choices = predictors)
+    
+    # Update Classification
+    updatePickerInput(session, "lm_outcome", choices = categorical_outcomes)
+    updatePickerInput(session, "lm_predictors", choices = predictors)
+    
+    # Update Regression
+    updatePickerInput(session, "reg_outcome", choices = continuous_outcomes)
+    updatePickerInput(session, "reg_predictors", choices = predictors)
+    
+    # Update Testing tab
+    updatePickerInput(session, "group_var", choices = c("", filter_by_global_settings(categorical_choices)))
+    updatePickerInput(session, "cont_var", choices = c("", filter_by_global_settings(continuous_choices)))
+    
+    # Update Categorical tab
+    updatePickerInput(session, "cat_group_var", choices = c("", filter_by_global_settings(categorical_choices)))
+    
+    # Update Continuous tab
+    updatePickerInput(session, "cont_group_var", choices = c("", filter_by_global_settings(continuous_choices)))
+  }, ignoreInit = TRUE, ignoreNULL = FALSE)
   
   observeEvent(input$main_tab, {
     if (!isTRUE(rv$data_ready) && !identical(input$main_tab, "Home")) {
@@ -1216,13 +1647,19 @@ server <- function(input, output, session) {
     }
   })
   
-  get_leiden_clusters <- function() colnames(rv$clusters$abundance)
+  get_cluster_clusters <- function() colnames(rv$clusters$abundance)
+  
+  # Helper function to filter choices based on global settings
+  filter_by_global_settings <- function(choices) {
+    if (length(rv$available_features) == 0) return(character(0))
+    intersect(choices, rv$available_features)
+  }
   
   # keep choices in sync with data
   observe({
     updatePickerInput(
-      session, "fs_leiden_subset",
-      choices = get_leiden_clusters(),
+      session, "fs_cluster_subset",
+      choices = get_cluster_clusters(),
       selected = NULL
     )
   })
@@ -1258,9 +1695,16 @@ server <- function(input, output, session) {
     categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x)
       is.character(x) || is.factor(x)
     )])
+    # Exclude cluster, patient_ID, run_date, and source from categorical outcome choices
+    categorical_choices <- setdiff(categorical_choices, c("cluster", "patient_ID", "run_date", "source"))
+    # Apply global settings filter
+    categorical_choices <- filter_by_global_settings(categorical_choices)
+    
     continuous_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x)
       is.numeric(x) || is.integer(x)
     )])
+    # Apply global settings filter
+    continuous_choices <- filter_by_global_settings(continuous_choices)
     
     updatePickerInput(session, "group_var",
                       choices = c("", categorical_choices), selected = "")
@@ -1271,6 +1715,8 @@ server <- function(input, output, session) {
   observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
     continuous_choices <- sort(meta_cols[sapply(rv$meta_cell, is.numeric)])
+    # Apply global settings filter
+    continuous_choices <- filter_by_global_settings(continuous_choices)
     updatePickerInput(session, "cont_group_var",
                       choices = c("", continuous_choices),
                       selected = "")
@@ -1427,6 +1873,7 @@ server <- function(input, output, session) {
     group_var_run   <- input$group_var
     cont_var_run    <- input$cont_var
     test_entity_run <- input$test_entity
+    pairing_var_run <- input$pairing_var
     
     abund0 <- rv$abundance_sample
     if (is.null(abund0)) {
@@ -1458,6 +1905,17 @@ server <- function(input, output, session) {
     abund_long <- merged %>%
       tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq")
     
+    # Determine if we're using paired tests - check both if pairing is enabled AND feasible
+    use_pairing <- FALSE
+    if (!is.null(pairing_var_run) && nzchar(pairing_var_run) && pairing_var_run %in% colnames(abund_long) &&
+        !is.null(group_var_run) && nzchar(group_var_run) && group_var_run %in% colnames(abund_long)) {
+      # Check if any pairing values appear in multiple groups (indicates pairing is possible)
+      pair_group_counts <- abund_long %>%
+        dplyr::group_by(!!rlang::sym(pairing_var_run)) %>%
+        dplyr::summarise(n_groups = dplyr::n_distinct(!!rlang::sym(group_var_run)), .groups = "drop")
+      use_pairing <- any(pair_group_counts$n_groups >= 2)
+    }
+    
     # Run tests per entity
     res <- abund_long %>%
       dplyr::group_by(entity) %>%
@@ -1471,13 +1929,159 @@ server <- function(input, output, session) {
           freq_ok <- .x$freq[ok]
           
           if (length(levels(g)) != 2) {
-            # Not exactly 2 groups after NA removal
             return(data.frame(test = "wilcox", p = NA, n = sum(ok)))
           }
           
-          wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
-          data.frame(test = "wilcox", n = sum(ok), p = wt$p.value)
-        } else if (test_type_run == "Kruskal–Wallis (multi-group)") {
+          if (use_pairing) {
+            # Paired Wilcoxon test
+            pair_var <- .x[[pairing_var_run]][ok]
+            df_test <- data.frame(freq = freq_ok, group = g, pair = pair_var)
+            df_test <- df_test[complete.cases(df_test), ]
+            
+            # Ensure each pair has exactly 2 observations
+            pair_counts <- table(df_test$pair)
+            valid_pairs <- names(pair_counts)[pair_counts == 2]
+            df_test <- df_test[df_test$pair %in% valid_pairs, ]
+            
+            if (nrow(df_test) < 4) {
+              return(data.frame(test = "wilcox_paired", p = NA, n = nrow(df_test)))
+            }
+            
+            # Reshape to wide format for paired test
+            df_wide <- tidyr::pivot_wider(df_test, names_from = group, values_from = freq, id_cols = pair)
+            if (ncol(df_wide) != 3) {
+              return(data.frame(test = "wilcox_paired", p = NA, n = nrow(df_test)))
+            }
+            
+            x1 <- df_wide[[2]]
+            x2 <- df_wide[[3]]
+            wt <- suppressWarnings(wilcox.test(x1, x2, paired = TRUE))
+            data.frame(test = "wilcox_paired", n = length(valid_pairs), p = wt$p.value)
+          } else {
+            # Unpaired Wilcoxon test
+            wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
+            data.frame(test = "wilcox", n = sum(ok), p = wt$p.value)
+          }
+        } else if (test_type_run == "Pairwise Wilcoxon") {
+          if (!nzchar(group_var_run)) return(data.frame(test = "pairwise_wilcox", comparison = NA, p = NA, n = NA))
+          
+          g_raw <- .x[[group_var_run]]
+          ok <- !is.na(g_raw)
+          g <- droplevels(factor(g_raw[ok]))
+          freq_ok <- .x$freq[ok]
+          
+          if (length(levels(g)) < 2) {
+            return(data.frame(test = "pairwise_wilcox", comparison = NA, p = NA, n = sum(ok)))
+          }
+          
+          grp_levels <- levels(g)
+          comparisons <- combn(grp_levels, 2, simplify = FALSE)
+          
+          pairwise_results <- lapply(comparisons, function(pair) {
+            grp1 <- pair[1]
+            grp2 <- pair[2]
+            idx1 <- which(g == grp1)
+            idx2 <- which(g == grp2)
+            
+            if (use_pairing) {
+              # Paired pairwise test
+              pair_var <- .x[[pairing_var_run]][ok]
+              df_test <- data.frame(
+                freq = freq_ok[c(idx1, idx2)],
+                group = g[c(idx1, idx2)],
+                pair = pair_var[c(idx1, idx2)]
+              )
+              df_test <- df_test[complete.cases(df_test), ]
+              
+              pair_counts <- table(df_test$pair)
+              valid_pairs <- names(pair_counts)[pair_counts == 2]
+              df_test <- df_test[df_test$pair %in% valid_pairs, ]
+              
+              if (nrow(df_test) < 4) {
+                return(data.frame(
+                  test = "pairwise_wilcox_paired",
+                  comparison = paste(grp1, "vs", grp2),
+                  p = NA,
+                  n = nrow(df_test)
+                ))
+              }
+              
+              df_wide <- tidyr::pivot_wider(df_test, names_from = group, values_from = freq, id_cols = pair)
+              if (ncol(df_wide) != 3) {
+                return(data.frame(
+                  test = "pairwise_wilcox_paired",
+                  comparison = paste(grp1, "vs", grp2),
+                  p = NA,
+                  n = nrow(df_test)
+                ))
+              }
+              
+              x1 <- df_wide[[2]]
+              x2 <- df_wide[[3]]
+              wt <- suppressWarnings(wilcox.test(x1, x2, paired = TRUE))
+              data.frame(
+                test = "pairwise_wilcox_paired",
+                comparison = paste(grp1, "vs", grp2),
+                p = wt$p.value,
+                n = length(valid_pairs)
+              )
+            } else {
+              # Unpaired pairwise test
+              freq1 <- freq_ok[idx1]
+              freq2 <- freq_ok[idx2]
+              wt <- suppressWarnings(wilcox.test(freq1, freq2))
+              data.frame(
+                test = "pairwise_wilcox",
+                comparison = paste(grp1, "vs", grp2),
+                p = wt$p.value,
+                n = length(idx1) + length(idx2)
+              )
+            }
+          })
+          
+          do.call(rbind, pairwise_results)
+        } else if (test_type_run == "Friedman (multi-group paired)") {
+          # Friedman test for paired multi-group comparisons
+          if (!use_pairing || !nzchar(group_var_run)) {
+            return(data.frame(test = "friedman", p = NA, n = NA))
+          }
+          
+          g_raw <- .x[[group_var_run]]
+          ok <- !is.na(g_raw)
+          g <- droplevels(factor(g_raw[ok]))
+          freq_ok <- .x$freq[ok]
+          
+          if (length(levels(g)) < 3) {
+            return(data.frame(test = "friedman", p = NA, n = sum(ok)))
+          }
+          
+          pair_var <- .x[[pairing_var_run]][ok]
+          df_test <- data.frame(freq = freq_ok, group = g, pair = pair_var)
+          df_test <- df_test[complete.cases(df_test), ]
+          
+          # Check that each pair has observations in all groups
+          pair_group_counts <- table(df_test$pair, df_test$group)
+          # Keep only pairs that have exactly 1 observation per group
+          valid_pairs <- rownames(pair_group_counts)[apply(pair_group_counts, 1, function(x) all(x == 1))]
+          
+          if (length(valid_pairs) < 3) {
+            return(data.frame(test = "friedman", p = NA, n = length(valid_pairs)))
+          }
+          
+          df_test <- df_test[df_test$pair %in% valid_pairs, ]
+          
+          # Reshape to wide format for Friedman test
+          df_wide <- tidyr::pivot_wider(df_test, names_from = group, values_from = freq, id_cols = pair)
+          if (ncol(df_wide) < 4) {
+            return(data.frame(test = "friedman", p = NA, n = length(valid_pairs)))
+          }
+          
+          # Friedman test requires a matrix with subjects as rows and treatments as columns
+          mat <- as.matrix(df_wide[, -1])  # Remove pair column
+          
+          ft <- suppressWarnings(friedman.test(mat))
+          data.frame(test = "friedman", n = length(valid_pairs), p = ft$p.value)
+        } else if (test_type_run == "Kruskal–Wallis (multi-group unpaired)") {
           if (!nzchar(group_var_run)) {
             return(data.frame(test = "kruskal", p = NA, n = nrow(.x)))
           }
@@ -1488,7 +2092,6 @@ server <- function(input, output, session) {
           freq_ok <- .x$freq[ok]
           
           if (length(levels(g)) < 2) {
-            # Not enough groups with data
             return(data.frame(test = "kruskal", p = NA, n = sum(ok)))
           }
           
@@ -1556,7 +2159,16 @@ server <- function(input, output, session) {
     num_cols <- intersect(c("p", adj_col), names(df_display))
     for (col in num_cols) {
       if (is.numeric(df_display[[col]])) {
-        df_display[[col]] <- formatC(df_display[[col]], format = "f", digits = 3)
+        # Use scientific notation for very small p-values
+        df_display[[col]] <- sapply(df_display[[col]], function(x) {
+          if (is.na(x)) {
+            return(NA_character_)
+          } else if (x < 0.001) {
+            formatC(x, format = "e", digits = 2)
+          } else {
+            formatC(x, format = "f", digits = 3)
+          }
+        })
       }
     }
     if ("rho" %in% names(df_display) && is.numeric(df_display$rho)) {
@@ -1588,6 +2200,10 @@ server <- function(input, output, session) {
   observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
     categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))])
+    # Exclude cluster, patient_ID, run_date, and source from categorical outcome choices
+    categorical_choices <- setdiff(categorical_choices, c("cluster", "patient_ID", "run_date", "source"))
+    # Apply global settings filter
+    categorical_choices <- filter_by_global_settings(categorical_choices)
     updatePickerInput(session, "cat_group_var",
                       choices = c("", categorical_choices),
                       selected = "")
@@ -1597,7 +2213,13 @@ server <- function(input, output, session) {
   observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
     categorical_choices <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.character(x) || is.factor(x))])
+    # Exclude cluster, patient_ID, run_date, and source from categorical outcome choices
+    categorical_choices <- setdiff(categorical_choices, c("cluster", "patient_ID", "run_date", "source"))
+    # Apply global settings filter
+    categorical_choices <- filter_by_global_settings(categorical_choices)
     continuous_choices  <- sort(meta_cols[sapply(rv$meta_cell, function(x) is.numeric(x) || is.integer(x))])
+    # Apply global settings filter
+    continuous_choices <- filter_by_global_settings(continuous_choices)
     updatePickerInput(session, "group_var", choices = c("", categorical_choices), selected = "")
     updatePickerInput(session, "cont_var",  choices = c("", continuous_choices),  selected = "")
   }, ignoreInit = TRUE)
@@ -1606,6 +2228,8 @@ server <- function(input, output, session) {
   observeEvent(rv$meta_cell, {
     meta_cols <- colnames(rv$meta_cell)
     continuous_choices <- sort(meta_cols[sapply(rv$meta_cell, is.numeric)])
+    # Apply global settings filter
+    continuous_choices <- filter_by_global_settings(continuous_choices)
     updatePickerInput(session, "cont_group_var",
                       choices = c("", continuous_choices),
                       selected = "")
@@ -1713,9 +2337,17 @@ server <- function(input, output, session) {
     
     # Long format and clean
     abund_long <- merged %>%
-      tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq") %>%
-      dplyr::mutate(entity = gsub(pattern = "\\n", replacement = " ", x = entity)) %>%
-      dplyr::filter(!is.na(freq))
+      tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq")
+    
+    # Filter NA frequencies first (before any other operations)
+    abund_long <- abund_long[!is.na(abund_long$freq), ]
+    
+    # Clean entity names once (more efficient than gsub on every row)
+    if (any(grepl("\n", abund_long$entity, fixed = TRUE))) {
+      entity_levels <- unique(abund_long$entity)
+      entity_clean <- gsub("\n", " ", entity_levels, fixed = TRUE)
+      abund_long$entity <- factor(abund_long$entity, levels = entity_levels, labels = entity_clean)
+    }
     
     # Capture plot-type and point-mode at Generate time
     plot_type_selected <- input$cat_plot_type %||% "box"
@@ -1724,6 +2356,18 @@ server <- function(input, output, session) {
     # Run test per entity
     test_type <- input$cat_test_type
     group_var <- input$cat_group_var
+    pairing_var <- input$pairing_var
+    
+    # Check if pairing is both enabled AND feasible for this categorical variable
+    use_pairing <- FALSE
+    if (!is.null(pairing_var) && nzchar(pairing_var) && pairing_var %in% colnames(abund_long) &&
+        !is.null(group_var) && nzchar(group_var) && group_var %in% colnames(abund_long)) {
+      # Check if any pairing values appear in multiple groups (indicates pairing is possible)
+      pair_group_counts <- abund_long %>%
+        dplyr::group_by(!!rlang::sym(pairing_var)) %>%
+        dplyr::summarise(n_groups = dplyr::n_distinct(!!rlang::sym(group_var)), .groups = "drop")
+      use_pairing <- any(pair_group_counts$n_groups >= 2)
+    }
     
     if (is.null(group_var) || !nzchar(group_var)) {
       res <- abund_long %>%
@@ -1739,10 +2383,129 @@ server <- function(input, output, session) {
           g <- droplevels(factor(g_raw[ok_rows]))
           freq_ok <- .x$freq[ok_rows]
           if (length(unique(g)) < 2) return(data.frame(p = NA_real_))
+          
           if (test_type == "Wilcoxon (2-group)" && length(unique(g)) == 2) {
-            wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
-            data.frame(p = wt$p.value)
-          } else if (test_type == "Kruskal–Wallis (multi-group)") {
+            if (use_pairing) {
+              # Paired Wilcoxon
+              pair_var <- .x[[pairing_var]][ok_rows]
+              df_test <- data.frame(freq = freq_ok, group = g, pair = pair_var)
+              df_test <- df_test[complete.cases(df_test), ]
+              
+              pair_counts <- table(df_test$pair)
+              valid_pairs <- names(pair_counts)[pair_counts == 2]
+              df_test <- df_test[df_test$pair %in% valid_pairs, ]
+              
+              if (nrow(df_test) < 4) return(data.frame(p = NA_real_))
+              
+              df_wide <- tidyr::pivot_wider(df_test, names_from = group, values_from = freq, id_cols = pair)
+              if (ncol(df_wide) != 3) return(data.frame(p = NA_real_))
+              
+              x1 <- df_wide[[2]]
+              x2 <- df_wide[[3]]
+              wt <- suppressWarnings(wilcox.test(x1, x2, paired = TRUE))
+              data.frame(p = wt$p.value)
+            } else {
+              # Unpaired Wilcoxon
+              wt <- suppressWarnings(wilcox.test(freq_ok ~ g))
+              data.frame(p = wt$p.value)
+            }
+          } else if (test_type == "Pairwise Wilcoxon") {
+            # Pairwise comparisons for all group combinations
+            grp_levels <- levels(g)
+            if (length(grp_levels) < 2) return(data.frame(comparison = NA_character_, p = NA_real_))
+            
+            comparisons <- combn(grp_levels, 2, simplify = FALSE)
+            
+            pairwise_results <- lapply(comparisons, function(pair) {
+              grp1 <- pair[1]
+              grp2 <- pair[2]
+              idx1 <- which(g == grp1)
+              idx2 <- which(g == grp2)
+              
+              if (use_pairing) {
+                # Paired pairwise test
+                pair_var <- .x[[pairing_var]][ok_rows]
+                df_test <- data.frame(
+                  freq = freq_ok[c(idx1, idx2)],
+                  group = g[c(idx1, idx2)],
+                  pair = pair_var[c(idx1, idx2)]
+                )
+                df_test <- df_test[complete.cases(df_test), ]
+                
+                pair_counts <- table(df_test$pair)
+                valid_pairs <- names(pair_counts)[pair_counts == 2]
+                df_test <- df_test[df_test$pair %in% valid_pairs, ]
+                
+                if (nrow(df_test) < 4) {
+                  return(data.frame(
+                    comparison = paste(grp1, "vs", grp2),
+                    p = NA_real_
+                  ))
+                }
+                
+                df_wide <- tidyr::pivot_wider(df_test, names_from = group, values_from = freq, id_cols = pair)
+                if (ncol(df_wide) != 3) {
+                  return(data.frame(
+                    comparison = paste(grp1, "vs", grp2),
+                    p = NA_real_
+                  ))
+                }
+                
+                x1 <- df_wide[[2]]
+                x2 <- df_wide[[3]]
+                wt <- suppressWarnings(wilcox.test(x1, x2, paired = TRUE))
+                data.frame(
+                  comparison = paste(grp1, "vs", grp2),
+                  p = wt$p.value
+                )
+              } else {
+                # Unpaired pairwise test
+                freq1 <- freq_ok[idx1]
+                freq2 <- freq_ok[idx2]
+                wt <- suppressWarnings(wilcox.test(freq1, freq2))
+                data.frame(
+                  comparison = paste(grp1, "vs", grp2),
+                  p = wt$p.value
+                )
+              }
+            })
+            
+            # Return all pairwise comparisons
+            do.call(rbind, pairwise_results)
+          } else if (test_type == "Friedman (multi-group paired)") {
+            # Friedman test for paired multi-group comparisons
+            if (!use_pairing) {
+              return(data.frame(p = NA_real_))
+            }
+            
+            grp_levels <- levels(g)
+            if (length(grp_levels) < 3) return(data.frame(p = NA_real_))
+            
+            pair_var <- .x[[pairing_var]][ok_rows]
+            df_test <- data.frame(freq = freq_ok, group = g, pair = pair_var)
+            df_test <- df_test[complete.cases(df_test), ]
+            
+            # Check that each pair has observations in all groups
+            pair_group_counts <- table(df_test$pair, df_test$group)
+            # Keep only pairs that have exactly 1 observation per group
+            valid_pairs <- rownames(pair_group_counts)[apply(pair_group_counts, 1, function(x) all(x == 1))]
+            
+            if (length(valid_pairs) < 3) {
+              return(data.frame(p = NA_real_))
+            }
+            
+            df_test <- df_test[df_test$pair %in% valid_pairs, ]
+            
+            # Reshape to wide format for Friedman test
+            df_wide <- tidyr::pivot_wider(df_test, names_from = group, values_from = freq, id_cols = pair)
+            if (ncol(df_wide) < 4) return(data.frame(p = NA_real_))  # Need pair column + at least 3 group columns
+            
+            # Friedman test requires a matrix with subjects as rows and treatments as columns
+            mat <- as.matrix(df_wide[, -1])  # Remove pair column
+            
+            ft <- suppressWarnings(friedman.test(mat))
+            data.frame(p = ft$p.value)
+          } else if (test_type == "Kruskal–Wallis (multi-group unpaired)") {
             kw <- kruskal.test(freq_ok ~ as.factor(g))
             data.frame(p = kw$p.value)
           } else {
@@ -1769,15 +2532,23 @@ server <- function(input, output, session) {
       data = abund_long,
       results = res,
       group_var = input$cat_group_var,
+      test_type = test_type,
+      pairing_var = pairing_var,
+      use_pairing = use_pairing,  # Whether pairing is feasible for this categorical variable
       use_adj_p = input$cat_use_adj_p,
       facet_cols = as.numeric(input$cat_max_facets),
       plot_type = plot_type_selected,
-      point_mode = point_mode_selected
+      point_mode = point_mode_selected,
+      colors = if (!is.null(rv$cat_colors)) rv$cat_colors else NULL
     )
   })
   
   observeEvent(input$generate_cat_plots, {
     cp <- cat_plot_data()     # your existing eventReactive
+    # Capture current colors at the moment Generate is clicked
+    if (!is.null(rv$cat_colors)) {
+      cp$colors <- rv$cat_colors
+    }
     cat_state(cp)
     output$cat_cleared_msg <- renderText(NULL)
   })
@@ -1794,12 +2565,6 @@ server <- function(input, output, session) {
     !is.null(cp) && !is.null(cp$data) && nrow(cp$data) > 0
   })
   outputOptions(output, "hasCatResults", suspendWhenHidden = FALSE)
-  
-  # Helper to sanitize IDs for input names
-  sanitize_id <- function(x) {
-    x <- as.character(x)
-    gsub("[^A-Za-z0-9_\\-]", "_", x)
-  }
   
   # Populate color pickers when button is clicked
   observeEvent(input$cat_populate_colors, {
@@ -1885,6 +2650,7 @@ server <- function(input, output, session) {
     abund_long <- cp$data
     res <- cp$results
     group_var <- cp$group_var
+    test_type <- cp$test_type
     use_adj_p <- cp$use_adj_p
     facet_cols <- cp$facet_cols
     plot_type <- cp$plot_type %||% input$cat_plot_type %||% "box"
@@ -1904,14 +2670,35 @@ server <- function(input, output, session) {
       return(invisible(NULL))
     }
     
+    # Determine if we're doing pairwise comparisons
+    is_pairwise <- !is.null(test_type) && test_type == "Pairwise Wilcoxon"
+    
     # Prepare p-value annotation dataframe
-    p_df <- res %>%
-      dplyr::mutate(
-        p_to_show = if (isTRUE(use_adj_p) && "padj" %in% names(res)) padj else p,
-        label = paste0("p = ", signif(p_to_show, 3)),
-        x = length(unique(abund_long_plot[[group_var]])) / 2 + 0.5,
-        y = tapply(abund_long_plot$freq, abund_long_plot$entity, max, na.rm = TRUE)[entity] * 1.15
-      )
+    if (is_pairwise && "comparison" %in% names(res)) {
+      # For pairwise comparisons, adjust p-values across all comparisons
+      if (use_adj_p && nrow(res) > 0) {
+        res$padj <- p.adjust(res$p, method = input$cat_p_adj_method)
+      }
+      # We'll use ggpubr for pairwise annotations
+      p_df <- NULL
+    } else {
+      # Single p-value per entity
+      p_df <- res %>%
+        dplyr::mutate(
+          p_to_show = if (isTRUE(use_adj_p) && "padj" %in% names(res)) padj else p,
+          label = paste0("p = ", sapply(p_to_show, function(x) {
+            if (is.na(x)) {
+              NA_character_
+            } else if (x < 0.001) {
+              formatC(x, format = "e", digits = 2)
+            } else {
+              as.character(signif(x, 3))
+            }
+          })),
+          x = length(unique(abund_long_plot[[group_var]])) / 2 + 0.5,
+          y = tapply(abund_long_plot$freq, abund_long_plot$entity, max, na.rm = TRUE)[entity] * 1.15
+        )
+    }
     
     # Determine group levels present in plotting data
     grp_levels <- unique(as.character(abund_long_plot[[group_var]]))
@@ -1920,24 +2707,22 @@ server <- function(input, output, session) {
       return(invisible(NULL))
     }
     
-    # Resolve manual colors non-reactively (isolate => changing pickers won't auto-trigger replot)
-    colors_named <- isolate({
-      if (!is.null(rv$cat_colors) && length(rv$cat_colors) > 0) {
-        matched <- rv$cat_colors[names(rv$cat_colors) %in% grp_levels]
-        missing_lvls <- setdiff(grp_levels, names(matched))
-        if (length(missing_lvls) > 0) {
-          filler <- viridis::viridis(length(missing_lvls))
-          names(filler) <- missing_lvls
-          matched <- c(matched, as.character(filler))
-        }
-        cols_ord <- as.character(matched[grp_levels])
-        names(cols_ord) <- grp_levels
-        cols_ord
-      } else {
-        pal <- viridis::viridis(length(grp_levels))
-        setNames(as.character(pal), grp_levels)
+    # Use stored colors from cat_state if available, otherwise generate defaults
+    colors_named <- if (!is.null(cp$colors) && length(cp$colors) > 0) {
+      matched <- cp$colors[names(cp$colors) %in% grp_levels]
+      missing_lvls <- setdiff(grp_levels, names(matched))
+      if (length(missing_lvls) > 0) {
+        filler <- viridis::viridis(length(missing_lvls))
+        names(filler) <- missing_lvls
+        matched <- c(matched, as.character(filler))
       }
-    })
+      cols_ord <- as.character(matched[grp_levels])
+      names(cols_ord) <- grp_levels
+      cols_ord
+    } else {
+      pal <- viridis::viridis(length(grp_levels))
+      setNames(as.character(pal), grp_levels)
+    }
     
     # Build ggplot
     gg <- ggplot2::ggplot(abund_long_plot, ggplot2::aes(x = .data[[group_var]], y = freq))
@@ -1960,13 +2745,33 @@ server <- function(input, output, session) {
         ggplot2::aes(fill = .data[[group_var]]),
         width = 0.15, height = 0, pch = 21, size = 2.6, stroke = 0.3, color = "black", alpha = 0.9
       )
+    } else if (identical(point_mode, "connected")) {
+      # Draw points without jitter and add lines connecting paired samples
+      # Only draw connections if pairing is actually feasible for this categorical variable
+      use_pairing <- cp$use_pairing %||% FALSE
+      pairing_var <- cp$pairing_var
+      
+      if (use_pairing && !is.null(pairing_var) && nzchar(pairing_var) && pairing_var %in% colnames(abund_long_plot)) {
+        # Add connecting lines first (so they appear behind points)
+        gg <- gg + ggplot2::geom_line(
+          ggplot2::aes(group = .data[[pairing_var]]),
+          color = "black",
+          linewidth = 0.3,
+          alpha = 0.6
+        )
+      }
+      # Add points without jitter
+      gg <- gg + ggplot2::geom_point(
+        ggplot2::aes(fill = .data[[group_var]]),
+        pch = 21, size = 2.6, stroke = 0.3, color = "black", alpha = 0.9
+      )
     } else {
       # none -> no point layer
     }
     
     gg <- gg +
       ggplot2::facet_wrap(~entity, ncol = facet_cols, scales = "free_y") +
-      ggplot2::scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+      ggplot2::scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
       ggplot2::theme_bw(base_size = 18) +
       ggplot2::labs(x = group_var, y = "Frequency") +
       ggplot2::theme(
@@ -1977,8 +2782,111 @@ server <- function(input, output, session) {
     # Apply manual fill scale; points use black border so no color scale required for border
     gg <- gg + ggplot2::scale_fill_manual(values = colors_named)
     
-    # Add p-value text annotations (filter to plotted entities)
-    if (!is.null(p_df) && nrow(p_df) > 0) {
+    # Add p-value annotations
+    if (is_pairwise && "comparison" %in% names(res)) {
+      # Build ALL bracket and label data at once (much faster than adding layers in loops)
+      all_brackets <- list()
+      all_labels <- list()
+      
+      for (ent in unique(abund_long_plot$entity)) {
+        ent_res <- res %>% dplyr::filter(entity == ent)
+        if (nrow(ent_res) == 0) next
+        
+        # Build comparison list for this entity
+        comparisons_list <- lapply(1:nrow(ent_res), function(i) {
+          comp_str <- ent_res$comparison[i]
+          groups <- strsplit(comp_str, " vs ")[[1]]
+          if (length(groups) == 2) groups else NULL
+        })
+        comparisons_list <- Filter(Negate(is.null), comparisons_list)
+        
+        if (length(comparisons_list) > 0) {
+          # Get p-values to display
+          p_vals <- if (use_adj_p && "padj" %in% names(ent_res)) {
+            ent_res$padj
+          } else {
+            ent_res$p
+          }
+          
+          # Format p-values
+          p_labels <- sapply(p_vals, function(x) {
+            if (is.na(x)) {
+              "ns"
+            } else if (x < 0.001) {
+              "***"
+            } else if (x < 0.01) {
+              "**"
+            } else if (x < 0.05) {
+              "*"
+            } else {
+              "ns"
+            }
+          })
+          
+          # Get entity data
+          ent_data <- abund_long_plot %>% dplyr::filter(entity == ent)
+          y_max <- max(ent_data$freq, na.rm = TRUE)
+          grp_levels_ordered <- sort(unique(as.character(ent_data[[group_var]])))
+          
+          # Build brackets and labels for all comparisons in this entity
+          for (j in seq_along(comparisons_list)) {
+            grp1 <- comparisons_list[[j]][1]
+            grp2 <- comparisons_list[[j]][2]
+            y_pos <- y_max * (1.05 + 0.08 * (j - 1))
+            label <- p_labels[j]
+            
+            x1 <- which(grp_levels_ordered == grp1)
+            x2 <- which(grp_levels_ordered == grp2)
+            
+            if (length(x1) > 0 && length(x2) > 0) {
+              # Collect bracket segments
+              all_brackets[[length(all_brackets) + 1]] <- data.frame(
+                entity = ent,
+                x = c(x1, x1, x2, x2),
+                xend = c(x1, x2, x2, x2),
+                y = c(y_pos - 0.02 * y_max, y_pos, y_pos, y_pos - 0.02 * y_max),
+                yend = c(y_pos, y_pos, y_pos, y_pos - 0.02 * y_max),
+                stringsAsFactors = FALSE
+              )
+              
+              # Collect labels
+              all_labels[[length(all_labels) + 1]] <- data.frame(
+                entity = ent,
+                x = (x1 + x2) / 2,
+                y = y_pos + 0.01 * y_max,
+                label = label,
+                stringsAsFactors = FALSE
+              )
+            }
+          }
+        }
+      }
+      
+      # Add all brackets as a single layer
+      if (length(all_brackets) > 0) {
+        bracket_data_all <- do.call(rbind, all_brackets)
+        gg <- gg + ggplot2::geom_segment(
+          data = bracket_data_all,
+          ggplot2::aes(x = x, xend = xend, y = y, yend = yend),
+          inherit.aes = FALSE,
+          color = "black",
+          linewidth = 0.5
+        )
+      }
+      
+      # Add all labels as a single layer
+      if (length(all_labels) > 0) {
+        label_data_all <- do.call(rbind, all_labels)
+        gg <- gg + ggplot2::geom_text(
+          data = label_data_all,
+          ggplot2::aes(x = x, y = y, label = label),
+          inherit.aes = FALSE,
+          size = 4.5,
+          fontface = "bold"
+        )
+      }
+    } else if (!is.null(p_df) && nrow(p_df) > 0) {
+      # Single p-value text annotations (filter to plotted entities)
       p_df_plot <- p_df %>% dplyr::filter(entity %in% unique(abund_long_plot$entity))
       if (nrow(p_df_plot) > 0) {
         gg <- gg + ggplot2::geom_text(
@@ -1990,6 +2898,13 @@ server <- function(input, output, session) {
       }
     }
     
+    # Add caption explaining significance notation for pairwise tests
+    if (is_pairwise && "comparison" %in% names(res)) {
+      gg <- gg + ggplot2::labs(
+        caption = "Significance levels: *** p < 0.001, ** p < 0.01, * p < 0.05, ns = not significant"
+      ) + ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0.5))
+    }
+    
     # Cache for export
     cat_plot_cache(gg)
     
@@ -1997,21 +2912,29 @@ server <- function(input, output, session) {
   },
   height = function() {
     gg <- cat_plot_cache()
-    cp <- cat_plot_data()
+    cp <- cat_state()
     if (is.null(gg) || is.null(cp)) return(400)
     n_facets <- length(unique(gg$data$entity))
     ncol_facets <- cp$facet_cols
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
     nrow_facets <- ceiling(n_facets / ncol_facets)
-    200 * nrow_facets
+    
+    # Increase height for pairwise comparisons to accommodate brackets
+    is_pairwise <- !is.null(cp$test_type) && cp$test_type == "Pairwise Wilcoxon"
+    base_height <- if (is_pairwise) 250 else 200
+    base_height * nrow_facets
   },
   width = function() {
     gg <- cat_plot_cache()
-    cp <- cat_plot_data()
+    cp <- cat_state()
     if (is.null(gg) || is.null(cp)) return(400)
     ncol_facets <- cp$facet_cols
     if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
-    225 * ncol_facets
+    
+    # Increase width for pairwise comparisons to accommodate annotations
+    is_pairwise <- !is.null(cp$test_type) && cp$test_type == "Pairwise Wilcoxon"
+    base_width <- if (is_pairwise) 280 else 225
+    base_width * ncol_facets
   })
   
   observeEvent(input$cat_group_var, {
@@ -2043,7 +2966,8 @@ server <- function(input, output, session) {
       if (!is.finite(nrow_facets) || nrow_facets < 1) nrow_facets <- 1
       pdf_width <- 4 * ncol_facets
       pdf_height <- 3 * nrow_facets
-      ggsave(file, plot = gg, device = cairo_pdf, width = pdf_width, height = pdf_height, units = "in")
+      ggsave(file, plot = gg, device = if (capabilities("cairo")) cairo_pdf else pdf, 
+             width = pdf_width, height = pdf_height, units = "in")
     },
     contentType = "application/pdf"
   )
@@ -2264,7 +3188,7 @@ server <- function(input, output, session) {
       if (!is.finite(nrow_facets) || nrow_facets < 1) nrow_facets <- 1
       pdf_width <- 4 * ncol_facets
       pdf_height <- 3 * nrow_facets
-      ggsave(file, plot = gg, device = cairo_pdf, width = pdf_width, height = pdf_height, units = "in")
+      ggsave(file, plot = gg, device = if (capabilities("cairo")) cairo_pdf else pdf, width = pdf_width, height = pdf_height, units = "in")
     },
     contentType = "application/pdf"
   )
@@ -2272,26 +3196,30 @@ server <- function(input, output, session) {
   # Populate Feature Selection dropdowns from same metadata source as other tabs
   observeEvent(rv$meta_cell, {
     meta_cols <- sort(colnames(rv$meta_cell))
-    updatePickerInput(session, "fs_outcome", choices = meta_cols)
-    updatePickerInput(session, "fs_predictors", choices = meta_cols)
+    # Exclude cluster, patient_ID, run_date, and source from outcome choices
+    outcome_choices <- setdiff(meta_cols, c("cluster", "patient_ID", "run_date", "source"))
+    # Exclude patient_ID, source, and run_date from predictor choices
+    predictor_choices <- setdiff(meta_cols, c("patient_ID", "source", "run_date"))
+    updatePickerInput(session, "fs_outcome", choices = outcome_choices)
+    updatePickerInput(session, "fs_predictors", choices = predictor_choices)
   }, ignoreInit = TRUE)
   
   observeEvent(rv$clusters$abundance, {
     cluster_names <- colnames(rv$clusters$abundance)
-    updatePickerInput(session, "fs_leiden_subset", choices = cluster_names)
+    updatePickerInput(session, "fs_cluster_subset", choices = cluster_names)
   })
   
   run_fs <- function() {
     req(rv$meta_sample, rv$abundance_sample, input$fs_outcome, input$fs_predictors)
     
     # Metadata predictors (exclude placeholder)
-    pred_meta <- setdiff(intersect(input$fs_predictors, colnames(rv$meta_sample)), "leiden_cluster")
+    pred_meta <- setdiff(intersect(input$fs_predictors, colnames(rv$meta_sample)), "cluster")
     
     # Cluster predictors
     all_clusters <- colnames(rv$abundance_sample)
-    if ("leiden_cluster" %in% input$fs_predictors) {
-      if (!is.null(input$fs_leiden_subset) && length(input$fs_leiden_subset) > 0) {
-        cluster_predictors <- intersect(input$fs_leiden_subset, all_clusters)
+    if ("cluster" %in% input$fs_predictors) {
+      if (!is.null(input$fs_cluster_subset) && length(input$fs_cluster_subset) > 0) {
+        cluster_predictors <- intersect(input$fs_cluster_subset, all_clusters)
       } else {
         cluster_predictors <- all_clusters
       }
@@ -2343,7 +3271,7 @@ server <- function(input, output, session) {
     set.seed(seed_val)
     
     clean_dummy_names <- function(nms) {
-      gsub(pattern = "leiden_cluster", replacement = "leiden_cluster:", x = nms)
+      gsub(pattern = "cluster", replacement = "cluster:", x = nms)
     }
     
     # --- Boruta branch ---
@@ -2356,9 +3284,9 @@ server <- function(input, output, session) {
         X_boruta <- as.data.frame(X_boruta)
         
         if (is.factor(y)) {
-          bor <- Boruta::Boruta(x = X_boruta, y = y, doTrace = 0, maxRuns = boruta_maxruns)
+          bor <- Boruta::Boruta(x = X_boruta, y = y, doTrace = 2, maxRuns = boruta_maxruns)
         } else {
-          bor <- Boruta::Boruta(x = X_boruta, y = as.numeric(y), doTrace = 0, maxRuns = boruta_maxruns)
+          bor <- Boruta::Boruta(x = X_boruta, y = as.numeric(y), doTrace = 2, maxRuns = boruta_maxruns)
         }
         imp <- Boruta::attStats(bor)
         imp$meanImp[!is.finite(imp$meanImp)] <- 0
@@ -2665,14 +3593,40 @@ server <- function(input, output, session) {
     
     meta_cols <- colnames(rv$meta_sample)
     categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.factor(x) || is.character(x))])
+    # Exclude cluster, patient_ID, run_date, and source from outcome choices
+    categorical_choices <- setdiff(categorical_choices, c("cluster", "patient_ID", "run_date", "source"))
     predictor_choices <- sort(meta_cols)
-    if (!("leiden_cluster" %in% predictor_choices)) {
-      predictor_choices <- c(predictor_choices, "leiden_cluster")
+    # Exclude patient_ID, source, and run_date from predictor choices
+    predictor_choices <- setdiff(predictor_choices, c("patient_ID", "source", "run_date"))
+    if (!("cluster" %in% predictor_choices)) {
+      predictor_choices <- c(predictor_choices, "cluster")
     }
     
     updatePickerInput(session, "lm_outcome", choices = categorical_choices, selected = NULL)
     updatePickerInput(session, "lm_predictors", choices = predictor_choices, selected = NULL)
-    updatePickerInput(session, "lm_leiden_subset",
+    updatePickerInput(session, "lm_cluster_subset",
+                      choices = colnames(rv$abundance_sample),
+                      selected = character(0))
+  }, ignoreInit = TRUE)
+  
+  # Initialize Regression dropdowns
+  observeEvent(list(rv$meta_sample, rv$abundance_sample), {
+    req(rv$meta_sample, rv$abundance_sample)
+    
+    meta_cols <- colnames(rv$meta_sample)
+    continuous_choices <- sort(meta_cols[sapply(rv$meta_sample, is.numeric)])
+    # Exclude patient_ID, source, run_date, and cluster from continuous outcome choices
+    continuous_choices <- setdiff(continuous_choices, c("patient_ID", "source", "run_date", "cluster"))
+    predictor_choices <- sort(meta_cols)
+    # Exclude patient_ID, source, and run_date from predictor choices
+    predictor_choices <- setdiff(predictor_choices, c("patient_ID", "source", "run_date"))
+    if (!("cluster" %in% predictor_choices)) {
+      predictor_choices <- c(predictor_choices, "cluster")
+    }
+    
+    updatePickerInput(session, "reg_outcome", choices = continuous_choices, selected = NULL)
+    updatePickerInput(session, "reg_predictors", choices = predictor_choices, selected = NULL)
+    updatePickerInput(session, "reg_cluster_subset",
                       choices = colnames(rv$abundance_sample),
                       selected = character(0))
   }, ignoreInit = TRUE)
@@ -2714,11 +3668,11 @@ server <- function(input, output, session) {
     }
     
     # Predictors
-    pred_meta <- setdiff(intersect(input$lm_predictors, colnames(rv$meta_sample)), "leiden_cluster")
+    pred_meta <- setdiff(intersect(input$lm_predictors, colnames(rv$meta_sample)), "cluster")
     all_clusters <- colnames(rv$abundance_sample)
-    if ("leiden_cluster" %in% input$lm_predictors) {
-      if (!is.null(input$lm_leiden_subset) && length(input$lm_leiden_subset) > 0) {
-        cluster_predictors <- intersect(input$lm_leiden_subset, all_clusters)
+    if ("cluster" %in% input$lm_predictors) {
+      if (!is.null(input$lm_cluster_subset) && length(input$lm_cluster_subset) > 0) {
+        cluster_predictors <- intersect(input$lm_cluster_subset, all_clusters)
       } else {
         cluster_predictors <- all_clusters
       }
@@ -2808,7 +3762,8 @@ server <- function(input, output, session) {
         model <- caret::train(
           x = trainX, y = trainY,
           method = method,
-          trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE)
+          trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE),
+          verbose = if (method == "rf") TRUE else FALSE
         )
         probs <- predict(model, newdata = testX, type = "prob")
         pred_class <- predict(model, newdata = testX, type = "raw")
@@ -2868,7 +3823,8 @@ server <- function(input, output, session) {
       model <- caret::train(
         x = X, y = y,
         method = method,
-        trControl = ctrl
+        trControl = ctrl,
+        verbose = if (method == "rf") TRUE else FALSE
       )
     }
     
@@ -2937,7 +3893,8 @@ server <- function(input, output, session) {
         ggplot2::geom_path(linewidth = 1) +
         ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
         ggplot2::labs(title = "Multiclass ROC Curves (yardstick)", color = "Class") +
-        ggplot2::theme_bw(base_size = 14)
+        ggplot2::theme_bw(base_size = 14) +
+        ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
     }
     
     # Store everything in lm_state, including cached ROC plot
@@ -2985,11 +3942,20 @@ server <- function(input, output, session) {
     majority_safe <- names(which.max(table(obs)))
     majority_orig <- rv$lm_label_map[[majority_safe]]
     
+    # Format binomial p-value with scientific notation if < 0.001
+    binom_p_formatted <- if (is.na(binom_p)) {
+      NA_character_
+    } else if (binom_p < 0.001) {
+      formatC(binom_p, format = "e", digits = 2)
+    } else {
+      as.character(signif(binom_p, 3))
+    }
+    
     perf_table <- data.frame(
       Metric = c("Null Accuracy (most frequent class)", "Model Accuracy", "Binomial p-value vs Null"),
       Value  = c(paste0(round(res$null_acc, 3), " (", majority_orig, ")"),
                  round(model_acc, 3),
-                 signif(binom_p, 3)),
+                 binom_p_formatted),
       stringsAsFactors = FALSE
     )
     
