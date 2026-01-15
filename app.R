@@ -1586,32 +1586,84 @@ server <- function(input, output, session) {
               radioButtons(
                 operator_input_id,
                 "Filter type",
-                choices = c("Above or equal (>=)" = "above", "Below or equal (<=)" = "below"),
+                choices = c(
+                  "Above or equal (>=)" = "above", 
+                  "Below or equal (<=)" = "below",
+                  "Range (internal)" = "range_internal",
+                  "Range (external)" = "range_external"
+                ),
                 selected = current_operator,
-                inline = TRUE
+                inline = FALSE
               ),
               fluidRow(
                 column(6, actionButton(mean_btn_id, "Mean", class = "btn-sm btn-default", style = "width: 100%;")),
                 column(6, actionButton(median_btn_id, "Median", class = "btn-sm btn-default", style = "width: 100%;"))
               ),
+              uiOutput(paste0(ns_id, "_slider_ui"))
+            )
+          })
+          
+          # Render appropriate slider based on operator selection
+          output[[paste0(ns_id, "_slider_ui")]] <- renderUI({
+            req(input[[operator_input_id]])
+            operator <- input[[operator_input_id]]
+            
+            if (operator %in% c("range_internal", "range_external")) {
+              # Range slider with two handles
+              current_range <- isolate(input[[slider_input_id]])
+              if (is.null(current_range) || length(current_range) != 2) {
+                # Default to quartiles for initial range
+                current_range <- quantile(col_data, probs = c(0.25, 0.75), na.rm = TRUE)
+              }
+              sliderInput(
+                slider_input_id,
+                "Value range",
+                min = col_range[1],
+                max = col_range[2],
+                value = current_range,
+                step = step_size
+              )
+            } else {
+              # Single-value slider
+              current_val <- isolate(input[[slider_input_id]])
+              if (is.null(current_val) || length(current_val) != 1) {
+                current_val <- col_median
+              } else if (length(current_val) > 1) {
+                # If switching from range to single, use the midpoint
+                current_val <- mean(current_val)
+              }
               sliderInput(
                 slider_input_id,
                 "Threshold value",
                 min = col_range[1],
                 max = col_range[2],
-                value = current_slider,
+                value = current_val,
                 step = step_size
               )
-            )
+            }
           })
           
           # Add observers for mean/median buttons
           observeEvent(input[[mean_btn_id]], {
-            updateSliderInput(session, slider_input_id, value = col_mean)
+            operator <- input[[operator_input_id]]
+            if (!is.null(operator) && operator %in% c("range_internal", "range_external")) {
+              # For range, center around mean
+              margin <- (col_range[2] - col_range[1]) * 0.25
+              updateSliderInput(session, slider_input_id, value = c(col_mean - margin, col_mean + margin))
+            } else {
+              updateSliderInput(session, slider_input_id, value = col_mean)
+            }
           }, ignoreInit = TRUE)
           
           observeEvent(input[[median_btn_id]], {
-            updateSliderInput(session, slider_input_id, value = col_median)
+            operator <- input[[operator_input_id]]
+            if (!is.null(operator) && operator %in% c("range_internal", "range_external")) {
+              # For range, center around median
+              margin <- (col_range[2] - col_range[1]) * 0.25
+              updateSliderInput(session, slider_input_id, value = c(col_median - margin, col_median + margin))
+            } else {
+              updateSliderInput(session, slider_input_id, value = col_median)
+            }
           }, ignoreInit = TRUE)
           
         } else {
@@ -1707,7 +1759,20 @@ server <- function(input, output, session) {
           # Numeric rule
           operator <- input[[paste0(ns_id, "_operator")]]
           threshold <- input[[paste0(ns_id, "_slider")]]
-          list(column = col, type = "numeric", operator = operator, threshold = threshold)
+          
+          # Handle range operators
+          if (!is.null(operator) && operator %in% c("range_internal", "range_external")) {
+            # threshold should be a vector of length 2 for ranges
+            if (!is.null(threshold) && length(threshold) == 2) {
+              list(column = col, type = "numeric", operator = operator, 
+                   threshold_min = threshold[1], threshold_max = threshold[2])
+            } else {
+              NULL  # Invalid range rule
+            }
+          } else {
+            # Single threshold for above/below
+            list(column = col, type = "numeric", operator = operator, threshold = threshold)
+          }
         } else {
           # Categorical rule
           vals <- input[[paste0(ns_id, "_values")]]
@@ -1724,7 +1789,13 @@ server <- function(input, output, session) {
       if (r$type == "categorical") {
         !is.null(r$values) && length(r$values) > 0
       } else if (r$type == "numeric") {
-        !is.null(r$operator) && !is.null(r$threshold)
+        if (!is.null(r$operator) && r$operator %in% c("range_internal", "range_external")) {
+          # Range rule validation
+          !is.null(r$threshold_min) && !is.null(r$threshold_max)
+        } else {
+          # Single threshold rule validation
+          !is.null(r$operator) && !is.null(r$threshold)
+        }
       } else {
         FALSE
       }
@@ -1749,8 +1820,14 @@ server <- function(input, output, session) {
           col_vals <- meta_orig[[rule$column]]
           if (rule$operator == "above") {
             keep_mask <- keep_mask & (col_vals >= rule$threshold | is.na(col_vals))
-          } else {
+          } else if (rule$operator == "below") {
             keep_mask <- keep_mask & (col_vals <= rule$threshold | is.na(col_vals))
+          } else if (rule$operator == "range_internal") {
+            # Keep values within range (inclusive)
+            keep_mask <- keep_mask & ((col_vals >= rule$threshold_min & col_vals <= rule$threshold_max) | is.na(col_vals))
+          } else if (rule$operator == "range_external") {
+            # Keep values outside range (inclusive of boundaries)
+            keep_mask <- keep_mask & ((col_vals <= rule$threshold_min | col_vals >= rule$threshold_max) | is.na(col_vals))
           }
         }
       }
@@ -1766,8 +1843,14 @@ server <- function(input, output, session) {
           col_vals <- meta_orig[[rule$column]]
           if (rule$operator == "above") {
             keep_mask <- keep_mask | (col_vals >= rule$threshold & !is.na(col_vals))
-          } else {
+          } else if (rule$operator == "below") {
             keep_mask <- keep_mask | (col_vals <= rule$threshold & !is.na(col_vals))
+          } else if (rule$operator == "range_internal") {
+            # Keep values within range (inclusive)
+            keep_mask <- keep_mask | ((col_vals >= rule$threshold_min & col_vals <= rule$threshold_max) & !is.na(col_vals))
+          } else if (rule$operator == "range_external") {
+            # Keep values outside range (inclusive of boundaries)
+            keep_mask <- keep_mask | ((col_vals <= rule$threshold_min | col_vals >= rule$threshold_max) & !is.na(col_vals))
           }
         }
       }
