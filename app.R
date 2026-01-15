@@ -703,16 +703,18 @@ ui <- navbarPage(
   ),
   
   tabPanel("Global Settings",
-           h3("Available Metadata Features"),
-           helpText("Select which metadata columns should be available throughout the app (both as predictors and outcomes). Changes take effect immediately."),
+           h3("Available Metadata Features & Type Coercion"),
+           helpText("Select which metadata columns should be available throughout the app. Use the dropdown next to each feature to coerce its type. Changes take effect immediately."),
            fluidRow(
              column(
                6,
-               h4("Available Features"),
+               h4("Available Features & Types"),
+               helpText("Left: Select feature | Right: Choose type coercion"),
                uiOutput("features_checkboxes"),
                br(),
                actionButton("select_all_features", "Select All"),
-               actionButton("deselect_all_features", "Deselect All")
+               actionButton("deselect_all_features", "Deselect All"),
+               actionButton("reset_all_types", "Reset All Types", icon = icon("undo"))
              ),
              column(
                6,
@@ -1104,6 +1106,9 @@ server <- function(input, output, session) {
     # Global settings for available features
     available_features = character(0),
     all_meta_cols = character(0),
+    # Type coercion
+    meta_cached = NULL,  # Cached original metadata with original types
+    type_coercions = list(),  # Named list: col_name -> coercion_type
     # Subsetting
     meta_sample_original = NULL,  # Original unfiltered metadata
     subsetting_enabled = FALSE,
@@ -1384,37 +1389,248 @@ server <- function(input, output, session) {
       rv$available_features <- all_cols  # All selected by default
       # Store original metadata for subsetting
       rv$meta_sample_original <- rv$meta_sample
+      # Cache original metadata with original types for type coercion
+      rv$meta_cached <- rv$meta_sample
+      # Initialize type coercions as empty (no coercions applied)
+      rv$type_coercions <- setNames(rep(list(""), length(all_cols)), all_cols)
     }
     
     session$sendCustomMessage("enableTabs", TRUE)
   })
   
+  # ========== TYPE COERCION HELPERS ==========
+  
+  # Function to validate which coercion paths are valid for a given column
+  validate_coercions <- function(col_data) {
+    valid_types <- character(0)
+    
+    # Always allow character
+    valid_types <- c(valid_types, "character")
+    
+    # Always allow factor
+    valid_types <- c(valid_types, "factor")
+    
+    # Test numeric by level (factor -> numeric using levels)
+    if (is.factor(col_data)) {
+      tryCatch({
+        test <- as.numeric(col_data)
+        if (!all(is.na(test))) valid_types <- c(valid_types, "numeric by level")
+      }, error = function(e) {}, warning = function(w) {})
+    }
+    
+    # Test numeric by character (convert to char first, then numeric)
+    tryCatch({
+      test <- suppressWarnings(as.numeric(as.character(col_data)))
+      if (!all(is.na(test))) valid_types <- c(valid_types, "numeric by character")
+    }, error = function(e) {}, warning = function(w) {})
+    
+    # Test integer by level (factor -> integer using levels)
+    if (is.factor(col_data)) {
+      tryCatch({
+        test <- as.integer(col_data)
+        if (!all(is.na(test))) valid_types <- c(valid_types, "integer by level")
+      }, error = function(e) {}, warning = function(w) {})
+    }
+    
+    # Test integer by character (convert to char first, then integer)
+    tryCatch({
+      test <- suppressWarnings(as.integer(as.character(col_data)))
+      if (!all(is.na(test))) valid_types <- c(valid_types, "integer by character")
+    }, error = function(e) {}, warning = function(w) {})
+    
+    return(valid_types)
+  }
+  
+  # Function to apply coercion based on type string
+  apply_coercion <- function(col_data, coercion_type) {
+    if (coercion_type == "" || is.null(coercion_type)) {
+      return(col_data)
+    }
+    
+    result <- switch(
+      coercion_type,
+      "character" = as.character(col_data),
+      "factor" = as.factor(col_data),
+      "numeric by level" = as.numeric(col_data),  # Works for factors
+      "numeric by character" = suppressWarnings(as.numeric(as.character(col_data))),
+      "integer by level" = as.integer(col_data),  # Works for factors
+      "integer by character" = suppressWarnings(as.integer(as.character(col_data))),
+      col_data  # Default: no change
+    )
+    
+    return(result)
+  }
+  
   # ========== GLOBAL SETTINGS TAB ==========
   
-  # Render feature checkboxes
+  # Render feature checkboxes with type coercion dropdowns
   output$features_checkboxes <- renderUI({
-    req(rv$all_meta_cols)
+    req(rv$all_meta_cols, rv$meta_cached)
     cols <- sort(rv$all_meta_cols)
-    checkboxGroupInput(
-      "global_features",
-      NULL,
-      choices = cols,
-      selected = rv$available_features
-    )
+    
+    # Create a row for each feature with checkbox and type dropdown
+    feature_rows <- lapply(cols, function(col) {
+      # Get valid coercion types for this column
+      valid_types <- validate_coercions(rv$meta_cached[[col]])
+      
+      # Choices: blank (no coercion) + valid types
+      type_choices <- c("(no coercion)" = "", valid_types)
+      
+      # Current selection
+      current_type <- rv$type_coercions[[col]]
+      if (is.null(current_type)) current_type <- ""
+      
+      # Check if this feature is currently selected (default to TRUE - all selected)
+      is_selected <- if (length(rv$available_features) == 0) TRUE else (col %in% rv$available_features)
+      
+      div(
+        style = "display: flex; align-items: center; margin-bottom: 5px;",
+        div(
+          style = "width: 200px;",
+          checkboxInput(
+            paste0("feat_", gsub("[^A-Za-z0-9]", "_", col)),
+            col,
+            value = is_selected
+          )
+        ),
+        div(
+          style = "width: 250px;",
+          selectInput(
+            paste0("type_", gsub("[^A-Za-z0-9]", "_", col)),
+            NULL,
+            choices = type_choices,
+            selected = current_type,
+            width = "100%"
+          )
+        )
+      )
+    })
+    
+    tagList(feature_rows)
   })
   
   # Update available features when checkboxes change
-  observeEvent(input$global_features, {
-    rv$available_features <- input$global_features
-  }, ignoreInit = TRUE)
+  observe({
+    req(rv$all_meta_cols)
+    cols <- rv$all_meta_cols
+    
+    selected_features <- character(0)
+    for (col in cols) {
+      input_id <- paste0("feat_", gsub("[^A-Za-z0-9]", "_", col))
+      if (isTRUE(input[[input_id]])) {
+        selected_features <- c(selected_features, col)
+      }
+    }
+    
+    rv$available_features <- selected_features
+  })
   
+  # Track if any type coercion has changed (to trigger resets)
+  type_coercion_changed <- reactiveVal(FALSE)
+  
+  # Update type coercions when dropdowns change
+  observe({
+    req(rv$all_meta_cols, rv$meta_cached)
+    cols <- rv$all_meta_cols
+    
+    coercion_changed <- FALSE
+    for (col in cols) {
+      input_id <- paste0("type_", gsub("[^A-Za-z0-9]", "_", col))
+      coercion_type <- input[[input_id]]
+      
+      if (!is.null(coercion_type)) {
+        # Check if this is a real change (not initialization)
+        old_coercion <- rv$type_coercions[[col]]
+        if (!is.null(old_coercion) && old_coercion != coercion_type) {
+          coercion_changed <- TRUE
+        }
+        rv$type_coercions[[col]] <- coercion_type
+      }
+    }
+    
+    # Signal that a coercion changed (only if data is ready and it's a real change)
+    if (coercion_changed && isTRUE(rv$data_ready)) {
+      type_coercion_changed(TRUE)
+    }
+  })
+
   # Select/Deselect all buttons
   observeEvent(input$select_all_features, {
-    updateCheckboxGroupInput(session, "global_features", selected = rv$all_meta_cols)
+    req(rv$all_meta_cols)
+    cols <- rv$all_meta_cols
+    for (col in cols) {
+      input_id <- paste0("feat_", gsub("[^A-Za-z0-9]", "_", col))
+      updateCheckboxInput(session, input_id, value = TRUE)
+    }
   })
   
   observeEvent(input$deselect_all_features, {
-    updateCheckboxGroupInput(session, "global_features", selected = character(0))
+    req(rv$all_meta_cols)
+    cols <- rv$all_meta_cols
+    for (col in cols) {
+      input_id <- paste0("feat_", gsub("[^A-Za-z0-9]", "_", col))
+      updateCheckboxInput(session, input_id, value = FALSE)
+    }
+  })
+  
+  # Reset all type coercions to original (blank)
+  observeEvent(input$reset_all_types, {
+    req(rv$all_meta_cols)
+    cols <- rv$all_meta_cols
+    for (col in cols) {
+      input_id <- paste0("type_", gsub("[^A-Za-z0-9]", "_", col))
+      updateSelectInput(session, input_id, selected = "")
+      rv$type_coercions[[col]] <- ""
+    }
+  })
+  
+  # Apply type coercions to metadata reactively
+  observe({
+    req(rv$meta_cached, rv$type_coercions, rv$all_meta_cols)
+    
+    # Start with cached original metadata
+    meta_coerced <- rv$meta_cached
+    
+    # Apply coercions to each column
+    for (col in rv$all_meta_cols) {
+      if (col %in% names(meta_coerced)) {
+        coercion_type <- rv$type_coercions[[col]]
+        if (!is.null(coercion_type) && nzchar(coercion_type)) {
+          meta_coerced[[col]] <- apply_coercion(rv$meta_cached[[col]], coercion_type)
+        }
+      }
+    }
+    
+    # Update meta_sample_original with coerced types (before subsetting)
+    rv$meta_sample_original <- meta_coerced
+    
+    # Always update meta_sample with coerced data
+    rv$meta_sample <- meta_coerced
+    
+    # If a coercion changed, reset pairing and subsetting for safety
+    if (isTRUE(type_coercion_changed())) {
+      # Reset pairing variable
+      updatePickerInput(session, "pairing_var", selected = "")
+      
+      # Reset subsetting
+      rv$subsetting_enabled <- FALSE
+      rv$subset_rules <- list()
+      rv$subset_summary <- NULL
+      rv$subset_id <- "000000000"
+      subset_rule_ids(integer(0))
+      subset_next_id(1)
+      updateCheckboxInput(session, "enable_subsetting", value = FALSE)
+      
+      # Show notification
+      showNotification(
+        "Type coercion applied. Pairing variable and subsetting have been reset for safety.",
+        type = "warning",
+        duration = 6
+      )
+      
+      # Reset the flag
+      type_coercion_changed(FALSE)
+    }
   })
   
   # Summary output
@@ -2294,7 +2510,7 @@ server <- function(input, output, session) {
     data.frame(
       name = colnames(rv$meta_cell),
       type = sapply(rv$meta_cell, function(x) class(x)[1]),
-      example = sapply(rv$meta_cell, function(x) paste(utils::head(unique(x), 3), collapse = ", "))
+      example = sapply(rv$meta_cell, function(x) paste(utils::head(unique(x), 6), collapse = ", "))
     )
   }, sanitize.text.function = function(x) x)
   
@@ -4076,10 +4292,24 @@ server <- function(input, output, session) {
     coef_list <- list()
     for (r in seq_len(reps)) {
       set.seed(seed_val + r - 1)
-      cvfit <- glmnet::cv.glmnet(
-        x = Xmat, y = y, family = family,
-        alpha = alpha_val, nfolds = nfolds_val
-      )
+      
+      # Wrap model fitting in tryCatch to handle errors gracefully
+      cvfit <- tryCatch({
+        glmnet::cv.glmnet(
+          x = Xmat, y = y, family = family,
+          alpha = alpha_val, nfolds = nfolds_val
+        )
+      }, error = function(e) {
+        err_msg <- conditionMessage(e)
+        if (grepl("one multinomial or binomial class has 1 or 0 observations", err_msg, ignore.case = TRUE)) {
+          stop("Insufficient observations in one or more outcome classes. Ensure each class has at least 8 samples, or consider using a different outcome variable or predictor set.", call. = FALSE)
+        } else if (grepl("fewer than 8", err_msg, ignore.case = TRUE)) {
+          stop("One or more outcome classes have fewer than 8 observations, which is insufficient for reliable model fitting. Consider grouping rare classes or using a different outcome variable.", call. = FALSE)
+        } else {
+          stop(paste0("Model fitting failed: ", err_msg), call. = FALSE)
+        }
+      })
+      
       coef_obj <- coef(cvfit, s = "lambda.min")
       if (family == "multinomial") {
         coef_df <- do.call(rbind, lapply(names(coef_obj), function(cls) {
@@ -4141,6 +4371,14 @@ server <- function(input, output, session) {
   output$fs_plot <- renderPlot({
     # res <- run_fs(); req(res)
     res <- fs_state(); req(res)
+    
+    # Check for error
+    if (!is.null(res$error) && isTRUE(res$error)) {
+      plot.new()
+      text(0.5, 0.5, paste("Error:", res$message), col = "red", cex = 1.2)
+      return()
+    }
+    
     tol <- res$tolerance
     
     if (identical(res$method, "Boruta")) {
@@ -4209,6 +4447,12 @@ server <- function(input, output, session) {
   output$fs_results <- renderTable({
     # res <- run_fs(); req(res)
     res <- fs_state(); req(res)
+    
+    # Check for error
+    if (!is.null(res$error) && isTRUE(res$error)) {
+      return(data.frame(Error = res$message))
+    }
+    
     df <- res$results
     tol <- res$tolerance
     
@@ -4237,6 +4481,19 @@ server <- function(input, output, session) {
   output$fs_summary <- renderPrint({
     # res <- run_fs(); req(res)
     res <- fs_state(); req(res)
+    
+    # Check for error
+    if (!is.null(res$error) && isTRUE(res$error)) {
+      cat("Feature Selection Error:\n\n")
+      cat(res$message, "\n\n")
+      cat("Suggestions:\n")
+      cat("- Ensure each outcome class has at least 8 samples\n")
+      cat("- Try a different outcome variable\n")
+      cat("- Consider combining rare outcome classes\n")
+      cat("- Use fewer predictors or select different predictors\n")
+      return()
+    }
+    
     det <- res$details %||% list(samples_before = NA,
                                  samples_after = NA,
                                  samples_dropped = NA,
@@ -4369,8 +4626,20 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$run_fs, {
-    res <- run_fs()     # your existing eventReactive or function
-    fs_state(res)
+    result <- tryCatch({
+      run_fs()
+    }, error = function(e) {
+      # Return error object instead of crashing
+      list(error = TRUE, message = conditionMessage(e))
+    })
+    
+    if (!is.null(result) && isTRUE(result$error)) {
+      # Display error in the output area
+      fs_state(result)
+      showNotification(paste("Feature Selection failed:", result$message), type = "error", duration = 10)
+    } else {
+      fs_state(result)
+    }
     output$fs_cleared_msg <- renderText(NULL)
   })
   
@@ -4480,22 +4749,37 @@ server <- function(input, output, session) {
         storage.mode(trainMat) <- "double"
         storage.mode(testMat)  <- "double"
         alpha_val <- input$lm_alpha %||% 0.5
-        model <- caret::train(
-          x = trainMat, y = trainY,
-          method = "glmnet",
-          trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE),
-          tuneGrid = expand.grid(alpha = alpha_val,
-                                 lambda = 10^seq(-3, 1, length = 20))
-        )
+        model <- tryCatch({
+          caret::train(
+            x = trainMat, y = trainY,
+            method = "glmnet",
+            trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE),
+            tuneGrid = expand.grid(alpha = alpha_val,
+                                   lambda = 10^seq(-3, 1, length = 20))
+          )
+        }, error = function(e) {
+          err_msg <- conditionMessage(e)
+          if (grepl("one multinomial or binomial class has 1 or 0 observations", err_msg, ignore.case = TRUE)) {
+            stop("Insufficient observations in one or more outcome classes. Ensure each class has at least 8 samples.", call. = FALSE)
+          } else if (grepl("fewer than 8", err_msg, ignore.case = TRUE)) {
+            stop("One or more outcome classes have fewer than 8 observations. Consider grouping rare classes or using a different outcome variable.", call. = FALSE)
+          } else {
+            stop(paste0("Model training failed: ", err_msg), call. = FALSE)
+          }
+        })
         probs <- predict(model, newdata = testMat, type = "prob")
         pred_class <- predict(model, newdata = testMat, type = "raw")
       } else {
-        model <- caret::train(
-          x = trainX, y = trainY,
-          method = method,
-          trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE),
-          verbose = if (method == "rf") TRUE else FALSE
-        )
+        model <- tryCatch({
+          caret::train(
+            x = trainX, y = trainY,
+            method = method,
+            trControl = caret::trainControl(classProbs = TRUE, verboseIter = TRUE),
+            verbose = if (method == "rf") TRUE else FALSE
+          )
+        }, error = function(e) {
+          stop(paste0("Model training failed: ", conditionMessage(e)), call. = FALSE)
+        })
         probs <- predict(model, newdata = testX, type = "prob")
         pred_class <- predict(model, newdata = testX, type = "raw")
       }
@@ -4587,7 +4871,19 @@ server <- function(input, output, session) {
   }
   
   observeEvent(input$run_lm, {
-    res <- run_lm()
+    result <- tryCatch({
+      run_lm()
+    }, error = function(e) {
+      list(error = TRUE, message = conditionMessage(e))
+    })
+    
+    if (!is.null(result) && isTRUE(result$error)) {
+      lm_state(result)
+      showNotification(paste("Classification failed:", result$message), type = "error", duration = 10)
+      return()
+    }
+    
+    res <- result
     req(res)
     
     preds <- res$preds
@@ -4643,7 +4939,16 @@ server <- function(input, output, session) {
   
   output$lm_roc_plot <- renderPlot({
     s <- lm_state()
-    req(s, s$roc_plot)
+    req(s)
+    
+    # Check for error
+    if (!is.null(s$error) && isTRUE(s$error)) {
+      plot.new()
+      text(0.5, 0.5, paste("Error:", s$message), col = "red", cex = 1.2)
+      return()
+    }
+    
+    req(s$roc_plot)
     s$roc_plot
   })
   
@@ -4757,6 +5062,19 @@ server <- function(input, output, session) {
   output$lm_summary <- renderPrint({
     # res <- lm_results(); req(res)
     res <- lm_state(); req(res)
+    
+    # Check for error
+    if (!is.null(res$error) && isTRUE(res$error)) {
+      cat("Classification Error:\n\n")
+      cat(res$message, "\n\n")
+      cat("Suggestions:\n")
+      cat("- Ensure each outcome class has at least 8 samples\n")
+      cat("- Try a different outcome variable\n")
+      cat("- Consider combining rare outcome classes\n")
+      cat("- Use fewer or different predictors\n")
+      return()
+    }
+    
     det <- res$details %||% list(samples_before = NA,
                                  samples_after = NA,
                                  samples_dropped = NA,
@@ -5151,28 +5469,40 @@ server <- function(input, output, session) {
         storage.mode(trainMat) <- "double"
         storage.mode(testMat)  <- "double"
         alpha_val <- if (input$reg_model_type == "Ridge Regression") 0 else (input$reg_alpha %||% 0.5)
-        model <- caret::train(
-          x = trainMat, y = trainY,
-          method = "glmnet",
-          trControl = caret::trainControl(verboseIter = TRUE),
-          tuneGrid = expand.grid(alpha = alpha_val,
-                                 lambda = 10^seq(-3, 1, length = 20))
-        )
+        model <- tryCatch({
+          caret::train(
+            x = trainMat, y = trainY,
+            method = "glmnet",
+            trControl = caret::trainControl(verboseIter = TRUE),
+            tuneGrid = expand.grid(alpha = alpha_val,
+                                   lambda = 10^seq(-3, 1, length = 20))
+          )
+        }, error = function(e) {
+          stop(paste0("Regression model training failed: ", conditionMessage(e)), call. = FALSE)
+        })
         preds <- predict(model, newdata = testMat)
       } else if (method == "rf") {
-        model <- caret::train(
-          x = trainX, y = trainY,
-          method = method,
-          trControl = caret::trainControl(verboseIter = TRUE),
-          verbose = TRUE
-        )
+        model <- tryCatch({
+          caret::train(
+            x = trainX, y = trainY,
+            method = method,
+            trControl = caret::trainControl(verboseIter = TRUE),
+            verbose = TRUE
+          )
+        }, error = function(e) {
+          stop(paste0("Regression model training failed: ", conditionMessage(e)), call. = FALSE)
+        })
         preds <- predict(model, newdata = testX)
       } else {
-        model <- caret::train(
-          x = trainX, y = trainY,
-          method = method,
-          trControl = caret::trainControl(verboseIter = TRUE)
-        )
+        model <- tryCatch({
+          caret::train(
+            x = trainX, y = trainY,
+            method = method,
+            trControl = caret::trainControl(verboseIter = TRUE)
+          )
+        }, error = function(e) {
+          stop(paste0("Regression model training failed: ", conditionMessage(e)), call. = FALSE)
+        })
         preds <- predict(model, newdata = testX)
       }
       
@@ -5245,7 +5575,19 @@ server <- function(input, output, session) {
   }
   
   observeEvent(input$run_reg, {
-    res <- run_reg()
+    result <- tryCatch({
+      run_reg()
+    }, error = function(e) {
+      list(error = TRUE, message = conditionMessage(e))
+    })
+    
+    if (!is.null(result) && isTRUE(result$error)) {
+      reg_state(result)
+      showNotification(paste("Regression failed:", result$message), type = "error", duration = 10)
+      return()
+    }
+    
+    res <- result
     req(res)
     
     preds <- res$preds
@@ -5281,13 +5623,31 @@ server <- function(input, output, session) {
   
   output$reg_obs_pred_plot <- renderPlot({
     s <- reg_state()
-    req(s, s$obs_pred_plot)
+    req(s)
+    
+    # Check for error
+    if (!is.null(s$error) && isTRUE(s$error)) {
+      plot.new()
+      text(0.5, 0.5, paste("Error:", s$message), col = "red", cex = 1.2)
+      return()
+    }
+    
+    req(s$obs_pred_plot)
     s$obs_pred_plot
   })
   
   output$reg_residual_plot <- renderPlot({
     s <- reg_state()
-    req(s, s$residual_plot)
+    req(s)
+    
+    # Check for error
+    if (!is.null(s$error) && isTRUE(s$error)) {
+      plot.new()
+      text(0.5, 0.5, paste("Error:", s$message), col = "red", cex = 1.2)
+      return()
+    }
+    
+    req(s$residual_plot)
     s$residual_plot
   })
   
@@ -5354,6 +5714,18 @@ server <- function(input, output, session) {
   
   output$reg_summary <- renderPrint({
     res <- reg_state(); req(res)
+    
+    # Check for error
+    if (!is.null(res$error) && isTRUE(res$error)) {
+      cat("Regression Error:\n\n")
+      cat(res$message, "\n\n")
+      cat("Suggestions:\n")
+      cat("- Check that your outcome variable has sufficient variation\n")
+      cat("- Ensure you have enough samples for model fitting\n")
+      cat("- Try a different model type or predictor set\n")
+      return()
+    }
+    
     det <- res$details %||% list(samples_before = NA,
                                  samples_after = NA,
                                  samples_dropped = NA,
