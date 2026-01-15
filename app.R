@@ -753,7 +753,12 @@ ui <- navbarPage(
                              choices = c("Intersection (AND)" = "intersection", "Union (OR)" = "union"),
                              selected = "intersection"),
                  br(),
-                 actionButton("apply_subsetting", "Apply Subsetting", icon = icon("filter"), class = "btn-primary")
+                 actionButton("apply_subsetting", "Apply Subsetting", icon = icon("filter"), class = "btn-primary"),
+                 br(), br(),
+                 conditionalPanel(
+                   condition = "output.hasSubset",
+                   downloadButton("export_subset_meta", "Export Subset Metadata")
+                 )
                ),
                column(
                  6,
@@ -800,7 +805,7 @@ ui <- navbarPage(
                actionButton("run_test", "Run tests"),
                br(), br(),
                conditionalPanel(
-                 condition = "output.hasResults",
+                 condition = "output.hasValidResults",
                  downloadButton("export_results", "Export results as CSV"),
                  br(), br(),
                  actionButton("reset_test", "Clear Results")
@@ -811,6 +816,7 @@ ui <- navbarPage(
                conditionalPanel(
                  condition = "output.hasResults",
                  h4("Test Results"),
+                 uiOutput("test_error_msg"),
                  tableOutput("test_table")
                ), 
                textOutput("test_cleared_msg")
@@ -841,7 +847,7 @@ ui <- navbarPage(
                actionButton("generate_cat_plots", "Generate plots"),
                br(), br(),
                conditionalPanel(
-                 condition = "output.hasCatResults",
+                 condition = "output.hasValidCatResults",
                  downloadButton("export_cat_pdf", "Export boxplots as PDF"),
                  br(), br(),
                  actionButton("reset_cat", "Clear Results")
@@ -852,6 +858,7 @@ ui <- navbarPage(
                conditionalPanel(
                  condition = "output.hasCatResults",
                  h4("Categorical Plots"),
+                 uiOutput("cat_error_msg"),
                  plotOutput("categorical_plot")
                ), 
                textOutput("cat_cleared_msg")
@@ -1101,7 +1108,8 @@ server <- function(input, output, session) {
     meta_sample_original = NULL,  # Original unfiltered metadata
     subsetting_enabled = FALSE,
     subset_rules = list(),  # List of subsetting rules
-    subset_summary = NULL  # Summary of subsetting results
+    subset_summary = NULL,  # Summary of subsetting results
+    subset_id = "000000000"  # Unique ID for current subset - "000000000" means no subsetting applied
   )
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
@@ -1552,37 +1560,94 @@ server <- function(input, output, session) {
         }
         
         req(selected_col %in% colnames(rv$meta_sample_original))
-        unique_vals <- sort(unique(as.character(rv$meta_sample_original[[selected_col]])))
-        unique_vals <- unique_vals[!is.na(unique_vals)]
+        col_data <- rv$meta_sample_original[[selected_col]]
         
-        # Use isolate to read current values without creating dependency
-        current_values <- isolate(input[[values_input_id]])
-        if (is.null(current_values)) {
-          # Default to all values if no prior selection
-          selected_vals <- unique_vals
-        } else {
-          # Keep existing selection (intersect to handle column changes)
-          selected_vals <- intersect(current_values, unique_vals)
-          if (length(selected_vals) == 0) selected_vals <- unique_vals
-        }
-        
-        output[[values_ui_id]] <- renderUI({
-          pickerInput(
-            values_input_id,
-            "Values to keep",
-            choices = unique_vals,
-            selected = selected_vals,
-            multiple = TRUE,
-            options = list(
-              `actions-box` = TRUE,
-              `selected-text-format` = "count > 3",
-              `deselect-all-text` = "Deselect All",
-              `select-all-text` = "Select All",
-              `none-selected-text` = "No values selected",
-              `live-search` = TRUE
+        # Check if column is numeric
+        if (is.numeric(col_data)) {
+          # Numeric column: show operator + slider
+          col_range <- range(col_data, na.rm = TRUE)
+          col_mean <- mean(col_data, na.rm = TRUE)
+          col_median <- median(col_data, na.rm = TRUE)
+          step_size <- (col_range[2] - col_range[1]) / 100
+          
+          # Preserve existing selections if available
+          current_operator <- isolate(input[[paste0(ns_id, "_operator")]])
+          current_slider <- isolate(input[[paste0(ns_id, "_slider")]])
+          if (is.null(current_operator)) current_operator <- "above"
+          if (is.null(current_slider)) current_slider <- col_median
+          
+          operator_input_id <- paste0(ns_id, "_operator")
+          slider_input_id <- paste0(ns_id, "_slider")
+          mean_btn_id <- paste0(ns_id, "_mean_btn")
+          median_btn_id <- paste0(ns_id, "_median_btn")
+          
+          output[[values_ui_id]] <- renderUI({
+            tagList(
+              radioButtons(
+                operator_input_id,
+                "Filter type",
+                choices = c("Above or equal (>=)" = "above", "Below or equal (<=)" = "below"),
+                selected = current_operator,
+                inline = TRUE
+              ),
+              fluidRow(
+                column(6, actionButton(mean_btn_id, "Mean", class = "btn-sm btn-default", style = "width: 100%;")),
+                column(6, actionButton(median_btn_id, "Median", class = "btn-sm btn-default", style = "width: 100%;"))
+              ),
+              sliderInput(
+                slider_input_id,
+                "Threshold value",
+                min = col_range[1],
+                max = col_range[2],
+                value = current_slider,
+                step = step_size
+              )
             )
-          )
-        })
+          })
+          
+          # Add observers for mean/median buttons
+          observeEvent(input[[mean_btn_id]], {
+            updateSliderInput(session, slider_input_id, value = col_mean)
+          }, ignoreInit = TRUE)
+          
+          observeEvent(input[[median_btn_id]], {
+            updateSliderInput(session, slider_input_id, value = col_median)
+          }, ignoreInit = TRUE)
+          
+        } else {
+          # Categorical column: show pickerInput
+          unique_vals <- sort(unique(as.character(col_data)))
+          unique_vals <- unique_vals[!is.na(unique_vals)]
+          
+          # Use isolate to read current values without creating dependency
+          current_values <- isolate(input[[values_input_id]])
+          if (is.null(current_values)) {
+            # Default to all values if no prior selection
+            selected_vals <- unique_vals
+          } else {
+            # Keep existing selection (intersect to handle column changes)
+            selected_vals <- intersect(current_values, unique_vals)
+            if (length(selected_vals) == 0) selected_vals <- unique_vals
+          }
+          
+          output[[values_ui_id]] <- renderUI({
+            pickerInput(
+              values_input_id,
+              "Values to keep",
+              choices = unique_vals,
+              selected = selected_vals,
+              multiple = TRUE,
+              options = list(
+                `actions-box` = TRUE,
+                `selected-text-format` = "count > 3",
+                `deselect-all-text` = "Deselect All",
+                `select-all-text` = "Select All",
+                `none-selected-text` = "No values selected",
+                `live-search` = TRUE
+              )
+            )
+          })
+        }
       }, ignoreNULL = TRUE, ignoreInit = FALSE)
     })
   })
@@ -1626,16 +1691,44 @@ server <- function(input, output, session) {
       return()
     }
     
+    # Get original metadata early for rule collection
+    meta_orig <- rv$meta_sample_original
+    
     # Collect all rules using rule IDs
     rules_list <- lapply(rule_ids, function(rule_id) {
       ns_id <- paste0("rule_", rule_id)
       col <- input[[paste0(ns_id, "_col")]]
-      vals <- input[[paste0(ns_id, "_values")]]
-      list(column = col, values = vals)
+      
+      # Check if column is numeric or categorical
+      if (!is.null(col) && col %in% colnames(meta_orig)) {
+        col_data <- meta_orig[[col]]
+        
+        if (is.numeric(col_data)) {
+          # Numeric rule
+          operator <- input[[paste0(ns_id, "_operator")]]
+          threshold <- input[[paste0(ns_id, "_slider")]]
+          list(column = col, type = "numeric", operator = operator, threshold = threshold)
+        } else {
+          # Categorical rule
+          vals <- input[[paste0(ns_id, "_values")]]
+          list(column = col, type = "categorical", values = vals)
+        }
+      } else {
+        NULL
+      }
     })
     
     # Remove any invalid rules
-    rules_list <- Filter(function(r) !is.null(r$column) && !is.null(r$values) && length(r$values) > 0, rules_list)
+    rules_list <- Filter(function(r) {
+      if (is.null(r) || is.null(r$column)) return(FALSE)
+      if (r$type == "categorical") {
+        !is.null(r$values) && length(r$values) > 0
+      } else if (r$type == "numeric") {
+        !is.null(r$operator) && !is.null(r$threshold)
+      } else {
+        FALSE
+      }
+    }, rules_list)
     
     if (length(rules_list) == 0) {
       showNotification("No valid subsetting rules. Please configure at least one rule.", type = "warning")
@@ -1643,23 +1736,40 @@ server <- function(input, output, session) {
     }
     
     # Apply subsetting logic
-    meta_orig <- rv$meta_sample_original
     n_before <- nrow(meta_orig)
     
     if (input$subset_logic == "intersection") {
       # Intersection: keep rows that match ALL rules
       keep_mask <- rep(TRUE, nrow(meta_orig))
       for (rule in rules_list) {
-        col_vals <- as.character(meta_orig[[rule$column]])
-        keep_mask <- keep_mask & (col_vals %in% rule$values)
+        if (rule$type == "categorical") {
+          col_vals <- as.character(meta_orig[[rule$column]])
+          keep_mask <- keep_mask & (col_vals %in% rule$values)
+        } else if (rule$type == "numeric") {
+          col_vals <- meta_orig[[rule$column]]
+          if (rule$operator == "above") {
+            keep_mask <- keep_mask & (col_vals >= rule$threshold | is.na(col_vals))
+          } else {
+            keep_mask <- keep_mask & (col_vals <= rule$threshold | is.na(col_vals))
+          }
+        }
       }
       meta_filtered <- meta_orig[keep_mask, , drop = FALSE]
     } else {
       # Union: keep rows that match ANY rule
       keep_mask <- rep(FALSE, nrow(meta_orig))
       for (rule in rules_list) {
-        col_vals <- as.character(meta_orig[[rule$column]])
-        keep_mask <- keep_mask | (col_vals %in% rule$values)
+        if (rule$type == "categorical") {
+          col_vals <- as.character(meta_orig[[rule$column]])
+          keep_mask <- keep_mask | (col_vals %in% rule$values)
+        } else if (rule$type == "numeric") {
+          col_vals <- meta_orig[[rule$column]]
+          if (rule$operator == "above") {
+            keep_mask <- keep_mask | (col_vals >= rule$threshold & !is.na(col_vals))
+          } else {
+            keep_mask <- keep_mask | (col_vals <= rule$threshold & !is.na(col_vals))
+          }
+        }
       }
       meta_filtered <- meta_orig[keep_mask, , drop = FALSE]
     }
@@ -1672,18 +1782,25 @@ server <- function(input, output, session) {
       return()
     }
     
+    # Generate unique subset ID based on system time
+    time_seed <- as.integer(Sys.time())
+    set.seed(time_seed)
+    subset_id <- paste0(sample(c(LETTERS, letters, rep(0:9, 2)), size = 9, replace = TRUE), collapse = "")
+    
     # Update reactive values
     rv$meta_sample <- meta_filtered
     rv$subsetting_enabled <- TRUE
     rv$subset_rules <- rules_list
+    rv$subset_id <- subset_id
     rv$subset_summary <- list(
       n_before = n_before,
       n_after = n_after,
-      n_excluded = n_excluded
+      n_excluded = n_excluded,
+      subset_id = subset_id
     )
     
     showNotification(
-      sprintf("Subsetting applied: %d samples included, %d excluded.", n_after, n_excluded),
+      sprintf("Subsetting applied: %d samples included, %d excluded. [Subset ID: %s]", n_after, n_excluded, subset_id),
       type = "message",
       duration = 5
     )
@@ -1695,6 +1812,7 @@ server <- function(input, output, session) {
       rv$meta_sample <- rv$meta_sample_original
       rv$subsetting_enabled <- FALSE
       rv$subset_summary <- NULL
+      # Don't reset subset_id - keep the last generated ID
       subset_rule_ids(integer(0))
       subset_next_id(1)
     }
@@ -1731,12 +1849,32 @@ server <- function(input, output, session) {
         tags$strong(style = "color: #3c763d;", "Subsetting Applied"),
         tags$p(style = "margin: 5px 0;", sprintf("Samples before: %d", summ$n_before)),
         tags$p(style = "margin: 5px 0;", sprintf("Samples after: %d", summ$n_after)),
-        tags$p(style = "margin: 5px 0;", sprintf("Samples excluded: %d", summ$n_excluded))
+        tags$p(style = "margin: 5px 0;", sprintf("Samples excluded: %d", summ$n_excluded)),
+        tags$p(style = "margin: 5px 0; font-family: monospace; color: #31708f;", sprintf("Subset ID: %s", summ$subset_id))
       ),
       tags$h5("Sample Distribution"),
       tagList(preview_tables)
     )
   })
+  
+  # Reactive to check if subset is active
+  output$hasSubset <- reactive({
+    # Always show button - even for "000000000" (full dataset)
+    !is.null(rv$subset_id)
+  })
+  outputOptions(output, "hasSubset", suspendWhenHidden = FALSE)
+  
+  # Export subset metadata
+  output$export_subset_meta <- downloadHandler(
+    filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
+      paste0("subset_metadata_", subset_id, ".csv")
+    },
+    content = function(file) {
+      req(rv$meta_sample)
+      write.csv(rv$meta_sample, file, row.names = FALSE)
+    }
+  )
   
   # Paired testing indicators for Categorical tab
   output$paired_cat_indicator_ui <- renderUI({
@@ -2176,6 +2314,68 @@ server <- function(input, output, session) {
       return(list(df = NULL, adj_col = NULL))
     }
     
+    # Validate pairing completeness if pairing is enabled and a group variable is selected
+    if (!is.null(pairing_var_run) && nzchar(pairing_var_run) && 
+        !is.null(group_var_run) && nzchar(group_var_run)) {
+      
+      if (!pairing_var_run %in% colnames(rv$meta_sample)) {
+        showNotification("Pairing variable not found in metadata.", type = "error")
+        return(list(df = NULL, adj_col = NULL))
+      }
+      
+      if (!group_var_run %in% colnames(rv$meta_sample)) {
+        showNotification("Group variable not found in metadata.", type = "error")
+        return(list(df = NULL, adj_col = NULL))
+      }
+      
+      # First check if pairing is even possible (any pair values appear in multiple groups)
+      pair_group_check <- rv$meta_sample %>%
+        dplyr::group_by(!!rlang::sym(pairing_var_run)) %>%
+        dplyr::summarise(
+          n_groups = dplyr::n_distinct(!!rlang::sym(group_var_run)),
+          .groups = "drop"
+        )
+      
+      # Only validate completeness if pairing is actually possible
+      if (any(pair_group_check$n_groups >= 2)) {
+        # Pairing is possible - check for complete pairs
+        pair_check <- rv$meta_sample %>%
+          dplyr::group_by(!!rlang::sym(pairing_var_run)) %>%
+          dplyr::summarise(
+            n_groups = dplyr::n_distinct(!!rlang::sym(group_var_run)),
+            groups = paste(sort(unique(as.character(!!rlang::sym(group_var_run)))), collapse = ", "),
+            .groups = "drop"
+          )
+        
+        total_groups <- dplyr::n_distinct(rv$meta_sample[[group_var_run]])
+        incomplete_pairs <- pair_check %>%
+          dplyr::filter(n_groups < total_groups)
+        
+        if (nrow(incomplete_pairs) > 0) {
+          # Build detailed error message
+          incomplete_details <- head(incomplete_pairs, 10)
+          details_text <- paste(
+            sprintf("    %s: %d group(s) present [%s]", 
+                    incomplete_details[[pairing_var_run]], 
+                    incomplete_details$n_groups,
+                    incomplete_details$groups),
+            collapse = "\n"
+          )
+          
+          error_msg <- sprintf(
+            "ERROR: Pairing Validation Failed\n\nCannot run paired test with incomplete pairs.\n\nProblem:\n  - %d subject(s) have incomplete pairs (missing samples in some groups)\n  - Each paired subject must have samples in ALL %d groups\n\nIncomplete pairs detected:\n%s%s\n\nSolution:\n  - Update subsetting rules to ensure complete pairs, OR\n  - Disable pairing (set Pairing Variable to 'None'), OR\n  - Change Group Variable to match available data",
+            nrow(incomplete_pairs),
+            total_groups,
+            details_text,
+            if (nrow(incomplete_pairs) > 10) sprintf("\n    ... and %d more", nrow(incomplete_pairs) - 10) else ""
+          )
+          
+          return(list(df = NULL, adj_col = NULL, error = error_msg))
+        }
+      }
+      # If no pairing is possible (n_groups always 1), fall back to unpaired tests silently
+    }
+    
     # Aggregate to celltypes if requested
     abund <- abund0
     if (test_entity_run == "Celltypes" && !is.null(rv$cluster_map)) {
@@ -2435,12 +2635,34 @@ server <- function(input, output, session) {
   
   output$hasResults <- reactive({
     run <- test_results_rv()
-    !is.null(run) && !is.null(run$df) && nrow(run$df) > 0
+    !is.null(run) && (!is.null(run$error) || (!is.null(run$df) && nrow(run$df) > 0))
   })
   outputOptions(output, "hasResults", suspendWhenHidden = FALSE)
   
+  output$hasValidResults <- reactive({
+    run <- test_results_rv()
+    !is.null(run) && is.null(run$error) && !is.null(run$df) && nrow(run$df) > 0
+  })
+  outputOptions(output, "hasValidResults", suspendWhenHidden = FALSE)
+  
+  output$test_error_msg <- renderUI({
+    run <- test_results_rv()
+    if (!is.null(run$error)) {
+      tags$div(
+        style = "background-color: #2b2b2b; color: #ff6b6b; border: 2px solid #ff6b6b; border-radius: 4px; padding: 15px; margin-bottom: 20px; font-family: 'Courier New', monospace; white-space: pre-wrap; font-size: 13px;",
+        tags$pre(
+          style = "margin: 0; color: #ff6b6b;",
+          run$error
+        )
+      )
+    } else {
+      NULL
+    }
+  })
+  
   output$test_table <- renderTable({
     run <- test_results_rv()
+    if (!is.null(run$error)) return(NULL)
     df <- req(run$df)
     adj_col <- run$adj_col
     
@@ -2476,14 +2698,16 @@ server <- function(input, output, session) {
   output$export_results <- downloadHandler(
     filename = function() {
       info <- rv$last_test_info
-      if (is.null(info)) return("results.csv")
+      subset_id <- rv$subset_id %||% "000000000"
+      if (is.null(info)) return(paste0("results_", subset_id, ".csv"))
       fname <- paste(info$entity, info$test, info$metadata, sep = "_")
       fname <- gsub(" ", "_", fname)
       fname <- tolower(fname)
-      paste0(fname, ".csv")
+      paste0(fname, "_", subset_id, ".csv")
     },
     content = function(file) {
-      run <- run_tests()
+      run <- test_results_rv()
+      req(!is.null(run), is.null(run$error))
       df <- run$df
       req(!is.null(df), nrow(df) > 0)
       write.csv(df, file, row.names = FALSE)
@@ -2609,6 +2833,72 @@ server <- function(input, output, session) {
     if (is.null(abund0)) {
       showNotification("No abundance matrix available.", type = "error")
       return(NULL)
+    }
+    
+    # Get plotting parameters early for validation
+    group_var <- input$cat_group_var
+    pairing_var <- input$pairing_var
+    
+    # Validate pairing completeness if pairing is enabled and a group variable is selected
+    if (!is.null(pairing_var) && nzchar(pairing_var) && 
+        !is.null(group_var) && nzchar(group_var)) {
+      
+      if (!pairing_var %in% colnames(rv$meta_sample)) {
+        error_msg <- "ERROR: Pairing Validation Failed\n\nPairing variable not found in metadata."
+        return(list(error = error_msg))
+      }
+      
+      if (!group_var %in% colnames(rv$meta_sample)) {
+        error_msg <- "ERROR: Group Validation Failed\n\nGroup variable not found in metadata."
+        return(list(error = error_msg))
+      }
+      
+      # First check if pairing is even possible (any pair values appear in multiple groups)
+      pair_group_check <- rv$meta_sample %>%
+        dplyr::group_by(!!rlang::sym(pairing_var)) %>%
+        dplyr::summarise(
+          n_groups = dplyr::n_distinct(!!rlang::sym(group_var)),
+          .groups = "drop"
+        )
+      
+      # Only validate completeness if pairing is actually possible
+      if (any(pair_group_check$n_groups >= 2)) {
+        # Pairing is possible - check for complete pairs
+        pair_check <- rv$meta_sample %>%
+          dplyr::group_by(!!rlang::sym(pairing_var)) %>%
+          dplyr::summarise(
+            n_groups = dplyr::n_distinct(!!rlang::sym(group_var)),
+            groups = paste(sort(unique(as.character(!!rlang::sym(group_var)))), collapse = ", "),
+            .groups = "drop"
+          )
+        
+        total_groups <- dplyr::n_distinct(rv$meta_sample[[group_var]])
+        incomplete_pairs <- pair_check %>%
+          dplyr::filter(n_groups < total_groups)
+        
+        if (nrow(incomplete_pairs) > 0) {
+          # Build detailed error message with proper line breaks for HTML
+          incomplete_details <- head(incomplete_pairs, 10)
+          details_text <- paste(
+            sprintf("    %s: %d group(s) present [%s]", 
+                    incomplete_details[[pairing_var]], 
+                    incomplete_details$n_groups,
+                    incomplete_details$groups),
+            collapse = "\n"
+          )
+          
+          error_msg <- sprintf(
+            "ERROR: Pairing Validation Failed\n\nCannot generate paired plots with incomplete pairs.\n\nProblem:\n  - %d subject(s) have incomplete pairs (missing samples in some groups)\n  - Each paired subject must have samples in ALL %d groups\n\nIncomplete pairs detected:\n%s%s\n\nSolution:\n  - Update subsetting rules to ensure complete pairs, OR\n  - Disable pairing (set Pairing Variable to 'None'), OR\n  - Change Group Variable to match available data",
+            nrow(incomplete_pairs),
+            total_groups,
+            details_text,
+            if (nrow(incomplete_pairs) > 10) sprintf("\n    ... and %d more", nrow(incomplete_pairs) - 10) else ""
+          )
+          
+          return(list(error = error_msg))
+        }
+      }
+      # If no pairing is possible (n_groups always 1), fall back to unpaired plots silently
     }
     
     # Aggregate to celltypes if needed
@@ -2857,9 +3147,15 @@ server <- function(input, output, session) {
   
   output$hasCatResults <- reactive({
     cp <- cat_state()
-    !is.null(cp) && !is.null(cp$data) && nrow(cp$data) > 0
+    !is.null(cp) && (!is.null(cp$error) || (!is.null(cp$data) && nrow(cp$data) > 0))
   })
   outputOptions(output, "hasCatResults", suspendWhenHidden = FALSE)
+  
+  output$hasValidCatResults <- reactive({
+    cp <- cat_state()
+    !is.null(cp) && is.null(cp$error) && !is.null(cp$data) && nrow(cp$data) > 0
+  })
+  outputOptions(output, "hasValidCatResults", suspendWhenHidden = FALSE)
   
   # Populate color pickers when button is clicked
   observeEvent(input$cat_populate_colors, {
@@ -2939,9 +3235,25 @@ server <- function(input, output, session) {
   })
   
   
+  output$cat_error_msg <- renderUI({
+    cp <- cat_state()
+    if (!is.null(cp$error)) {
+      tags$div(
+        style = "background-color: #2b2b2b; color: #ff6b6b; border: 2px solid #ff6b6b; border-radius: 4px; padding: 15px; margin-bottom: 20px; font-family: 'Courier New', monospace; white-space: pre-wrap; font-size: 13px;",
+        tags$pre(
+          style = "margin: 0; color: #ff6b6b;",
+          cp$error
+        )
+      )
+    } else {
+      NULL
+    }
+  })
+  
   output$categorical_plot <- renderPlot({
     # cp <- cat_plot_data(); req(cp)
     cp <- cat_state(); req(cp)
+    if (!is.null(cp$error)) return(NULL)
     abund_long <- cp$data
     res <- cp$results
     group_var <- cp$group_var
@@ -3277,13 +3589,14 @@ server <- function(input, output, session) {
   
   output$export_cat_pdf <- downloadHandler(
     filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
       info <- rv$last_cat_info
-      if (is.null(info)) return("categorical_plots.pdf")
+      if (is.null(info)) return(paste0("categorical_plots_", subset_id, ".pdf"))
       test <- tolower(info$test_raw)
       test <- gsub("\\s+", "_", test)
       test <- gsub("_\\(.*\\)", "", test)
       test <- gsub("kruskal_wallis", "kruskal-wallis", test)
-      paste0("categorical_", info$entity, "_", info$group, "_", test, ".pdf")
+      paste0("categorical_", info$entity, "_", info$group, "_", test, "_", subset_id, ".pdf")
     },
     content = function(file) {
       gg <- cat_plot_cache()
@@ -3503,9 +3816,10 @@ server <- function(input, output, session) {
   
   output$export_cont_pdf <- downloadHandler(
     filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
       info <- rv$last_cont_info
-      if (is.null(info)) return("continuous_plots.pdf")
-      paste0("continuous_", info$entity, "_", info$group, "_spearman.pdf")
+      if (is.null(info)) return(paste0("continuous_plots_", subset_id, ".pdf"))
+      paste0("continuous_", info$entity, "_", info$group, "_spearman_", subset_id, ".pdf")
     },
     content = function(file) {
       gg <- cont_plot_cache()
@@ -3755,8 +4069,8 @@ server <- function(input, output, session) {
         return()
       }
       df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
-      top_n <- head(df, 30)
-      ggplot2::ggplot(top_n,
+      # Plot all features that pass tolerance, not just top 30
+      ggplot2::ggplot(df,
                       ggplot2::aes(x = reorder(Feature, ImportanceMean),
                                    y = ImportanceMean,
                                    fill = Decision)) +
@@ -3777,10 +4091,10 @@ server <- function(input, output, session) {
         return()
       }
       if ("Class" %in% names(df)) {
+        # Plot all features that pass tolerance per class, not just top 20
         top_n <- df %>%
           dplyr::group_by(Class) %>%
-          dplyr::arrange(dplyr::desc(Coef), .by_group = TRUE) %>%
-          dplyr::slice_head(n = 20)
+          dplyr::arrange(dplyr::desc(Coef), .by_group = TRUE)
         ggplot2::ggplot(top_n,
                         ggplot2::aes(x = reorder(Feature, Coef),
                                      y = Coef,
@@ -3794,8 +4108,8 @@ server <- function(input, output, session) {
           ggplot2::theme_bw(base_size = 14)
       } else {
         df <- df[order(df$Coef, decreasing = TRUE), ]
-        top_n <- head(df, 30)
-        ggplot2::ggplot(top_n,
+        # Plot all features that pass tolerance, not just top 30
+        ggplot2::ggplot(df,
                         ggplot2::aes(x = reorder(Feature, Coef),
                                      y = Coef,
                                      fill = Coef)) +
@@ -3885,11 +4199,12 @@ server <- function(input, output, session) {
   
   output$export_fs_results <- downloadHandler(
     filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
       # res <- run_fs(); req(res)
       res <- fs_state(); req(res)
       method <- res$method %||% "FeatureSelection"
       outcome <- input$fs_outcome %||% "outcome"
-      paste0(method, "_feature_selection_with_outcome_", outcome, "_", Sys.Date(), ".csv")
+      paste0(method, "_feature_selection_with_outcome_", outcome, "_", Sys.Date(), "_", subset_id, ".csv")
     },
     content = function(file) {
       # res <- run_fs(); req(res)
@@ -4567,12 +4882,14 @@ server <- function(input, output, session) {
   
   output$export_lm_zip <- downloadHandler(
     filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
       model <- gsub("\\s+", "_", tolower(input$lm_model_type %||% "model"))
       validation <- gsub("\\s+", "_", tolower(input$lm_validation %||% "validation"))
       outcome <- gsub("\\s+", "_", tolower(input$lm_outcome %||% "outcome"))
-      paste0(model, "_", validation, "_", outcome, ".zip")
+      paste0(model, "_", validation, "_", outcome, "_", subset_id, ".zip")
     },
     content = function(file) {
+      subset_id <- rv$subset_id %||% "000000000"
       s <- lm_state()
       req(s, s$model)
       
@@ -4580,7 +4897,7 @@ server <- function(input, output, session) {
       files <- c()
       
       # 1. Model Summary (key-value CSV)
-      summary_file <- file.path(tmpdir, "model_summary.csv")
+      summary_file <- file.path(tmpdir, paste0("model_summary", subset_id, ".csv"))
       summary_kv <- data.frame(
         Key = c("Model type", "Outcome variable", "Predictors",
                 "Validation strategy", "Null accuracy",
@@ -4599,7 +4916,7 @@ server <- function(input, output, session) {
       files <- c(files, summary_file)
       
       # 2. Performance Metrics (exactly as in UI)
-      perf_file <- file.path(tmpdir, "performance_metrics.csv")
+      perf_file <- file.path(tmpdir, paste0("performance_metrics", subset_id, ".csv"))
       perf_df <- tryCatch({
         build_perf_table(s, rv)
       }, error = function(e) data.frame(Message = "Error extracting performance metrics"))
@@ -4607,7 +4924,7 @@ server <- function(input, output, session) {
       files <- c(files, perf_file)
       
       # 3. Model Features (coefficients / importance with enforced column order)
-      feat_file <- file.path(tmpdir, "model_features.csv")
+      feat_file <- file.path(tmpdir, paste0("model_features", subset_id, ".csv"))
       feat_df <- NULL
       if (s$model$method %in% c("glm", "glmnet", "multinom")) {
         feat_df <- coef_table()
@@ -4632,7 +4949,7 @@ server <- function(input, output, session) {
       files <- c(files, feat_file)
       
       # 4. ROC Curve (PDF) - wider for multi-class
-      roc_file <- file.path(tmpdir, "roc_curve.pdf")
+      roc_file <- file.path(tmpdir, paste0("roc_curve", subset_id, ".pdf"))
       if (!is.null(s$roc_plot)) {
         # Determine if multi-class to adjust width
         n_classes <- nlevels(s$preds$obs)
@@ -5077,12 +5394,14 @@ server <- function(input, output, session) {
   
   output$export_reg_zip <- downloadHandler(
     filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
       model <- gsub("\\s+", "_", tolower(input$reg_model_type %||% "model"))
       validation <- gsub("\\s+", "_", tolower(input$reg_validation %||% "validation"))
       outcome <- gsub("\\s+", "_", tolower(input$reg_outcome %||% "outcome"))
-      paste0(model, "_", validation, "_", outcome, ".zip")
+      paste0(model, "_", validation, "_", outcome, "_", subset_id, ".zip")
     },
     content = function(file) {
+      subset_id <- rv$subset_id %||% "000000000"
       s <- reg_state()
       req(s, s$model)
       
@@ -5090,7 +5409,7 @@ server <- function(input, output, session) {
       files <- c()
       
       # 1. Model Summary (key-value CSV)
-      summary_file <- file.path(tmpdir, "model_summary.csv")
+      summary_file <- file.path(tmpdir, paste0("model_summary", subset_id, ".csv"))
       summary_kv <- data.frame(
         Key = c("Model type", "Outcome variable", "Predictors",
                 "Validation strategy", "Null RMSE",
@@ -5109,7 +5428,7 @@ server <- function(input, output, session) {
       files <- c(files, summary_file)
       
       # 2. Performance Metrics
-      perf_file <- file.path(tmpdir, "performance_metrics.csv")
+      perf_file <- file.path(tmpdir, paste0("performance_metrics", subset_id, ".csv"))
       perf_df <- tryCatch({
         build_reg_perf_table(s)
       }, error = function(e) data.frame(Message = "Error extracting performance metrics"))
@@ -5117,7 +5436,7 @@ server <- function(input, output, session) {
       files <- c(files, perf_file)
       
       # 3. Model Features
-      feat_file <- file.path(tmpdir, "model_features.csv")
+      feat_file <- file.path(tmpdir, paste0("model_features", subset_id, ".csv"))
       feat_df <- NULL
       if (s$model$method %in% c("lm", "glmnet")) {
         feat_df <- reg_coef_table()
@@ -5134,7 +5453,7 @@ server <- function(input, output, session) {
       files <- c(files, feat_file)
       
       # 4. Observed vs Predicted plot (PDF)
-      obs_pred_file <- file.path(tmpdir, "observed_vs_predicted.pdf")
+      obs_pred_file <- file.path(tmpdir, paste0("observed_vs_predicted", subset_id, ".pdf"))
       if (!is.null(s$obs_pred_plot)) {
         ggsave(obs_pred_file, plot = s$obs_pred_plot,
                device = if (capabilities("cairo")) cairo_pdf else pdf, 
