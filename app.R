@@ -755,18 +755,30 @@ ui <- navbarPage(
                              choices = c("Intersection (AND)" = "intersection", "Union (OR)" = "union"),
                              selected = "intersection"),
                  br(),
+                 pickerInput("trim_incomplete_pairs", 
+                            "Trim incomplete pairs by feature(s):",
+                            choices = NULL,
+                            multiple = TRUE,
+                            options = list(`none-selected-text` = "(no trim)")),
+                 helpText("Optional: Remove samples with incomplete pairing based on selected categorical features. Applied after subsetting rules."),
+                 br(),
                  actionButton("apply_subsetting", "Apply Subsetting", icon = icon("filter"), class = "btn-primary"),
-                 br(), br(),
-                 conditionalPanel(
-                   condition = "output.hasSubset",
-                   downloadButton("export_subset_meta", "Export Subset Metadata")
-                 )
+                 br(), br()
                ),
                column(
                  6,
                  h4("Preview"),
                  uiOutput("subset_preview_ui")
                )
+             )
+           ),
+           hr(),
+           h3("Data Export"),
+           fluidRow(
+             column(
+               12,
+               uiOutput("export_buttons_ui"),
+               br()
              )
            )
   ),
@@ -1359,14 +1371,21 @@ server <- function(input, output, session) {
     # Initialize FS/LM pickers from per-sample objects
     if (!is.null(rv$meta_sample)) {
       meta_cols <- colnames(rv$meta_sample)
+      
+      # For Feature Selection: allow both categorical and continuous outcomes
+      fs_outcome_choices <- sort(meta_cols)
+      fs_outcome_choices <- setdiff(fs_outcome_choices, c("cluster", "patient_ID", "run_date", "source"))
+      
+      # For Classification (LM): only categorical outcomes
       categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.factor(x) || is.character(x))])
       # Exclude cluster, patient_ID, run_date, and source from outcome choices
       categorical_choices <- setdiff(categorical_choices, c("cluster", "patient_ID", "run_date", "source"))
+      
       predictor_choices <- sort(meta_cols)
       # Exclude patient_ID, source, and run_date from predictor choices
       predictor_choices <- setdiff(predictor_choices, c("patient_ID", "source", "run_date"))
       
-      updatePickerInput(session, "fs_outcome", choices = categorical_choices, selected = NULL)
+      updatePickerInput(session, "fs_outcome", choices = fs_outcome_choices, selected = NULL)
       updatePickerInput(session, "fs_predictors", choices = c(predictor_choices, "cluster"), selected = NULL)
       updatePickerInput(session, "fs_cluster_subset",
                         choices = if (!is.null(rv$abundance_sample)) colnames(rv$abundance_sample) else character(0),
@@ -1655,6 +1674,12 @@ server <- function(input, output, session) {
     } else {
       updatePickerInput(session, "pairing_var", choices = c("", all_cols), selected = "")
     }
+    
+    # Update trim_incomplete_pairs with categorical features only
+    categorical_cols <- names(rv$meta_sample)[sapply(rv$meta_sample, function(col) {
+      is.character(col) || is.factor(col)
+    })]
+    updatePickerInput(session, "trim_incomplete_pairs", choices = categorical_cols)
   }, ignoreInit = TRUE)
   
   # Display pairing summary
@@ -2081,10 +2106,61 @@ server <- function(input, output, session) {
       return()
     }
     
+    # Trim incomplete pairs if requested
+    n_before_trim <- n_after
+    n_trimmed <- 0
+    trim_features <- input$trim_incomplete_pairs
+    pairing_var <- input$pairing_var
+    
+    if (!is.null(trim_features) && length(trim_features) > 0 && 
+        !is.null(pairing_var) && nzchar(pairing_var) &&
+        pairing_var %in% colnames(meta_filtered)) {
+      
+      # For each trim feature, identify complete pairs
+      for (trim_feat in trim_features) {
+        if (trim_feat %in% colnames(meta_filtered)) {
+          # Get all pairing IDs
+          pairing_ids <- unique(meta_filtered[[pairing_var]])
+          
+          # For each pairing ID, check if all levels of trim_feat are present
+          trim_feat_levels <- unique(meta_filtered[[trim_feat]])
+          
+          complete_pair_ids <- character(0)
+          for (pair_id in pairing_ids) {
+            pair_rows <- meta_filtered[meta_filtered[[pairing_var]] == pair_id, ]
+            pair_trim_levels <- unique(pair_rows[[trim_feat]])
+            
+            # Check if this pair has all levels of the trim feature
+            if (length(pair_trim_levels) == length(trim_feat_levels)) {
+              complete_pair_ids <- c(complete_pair_ids, pair_id)
+            }
+          }
+          
+          # Keep only complete pairs
+          meta_filtered <- meta_filtered[meta_filtered[[pairing_var]] %in% complete_pair_ids, , drop = FALSE]
+        }
+      }
+      
+      n_after_trim <- nrow(meta_filtered)
+      n_trimmed <- n_before_trim - n_after_trim
+      n_after <- n_after_trim
+      n_excluded <- n_before - n_after
+      
+      if (n_after == 0) {
+        showNotification("Trimming incomplete pairs removed all samples. Please adjust your settings.", type = "error")
+        return()
+      }
+    }
+    
     # Generate unique subset ID based on system time
-    time_seed <- as.integer(Sys.time())
-    set.seed(time_seed)
-    subset_id <- paste0(sample(c(LETTERS, letters, rep(0:9, 2)), size = 9, replace = TRUE), collapse = "")
+    # Use default ID if no samples were dropped (equivalent to no subsetting)
+    if (n_excluded == 0) {
+      subset_id <- "000000000"
+    } else {
+      time_seed <- as.integer(Sys.time())
+      set.seed(time_seed)
+      subset_id <- paste0(sample(c(LETTERS, letters, rep(0:9, 2)), size = 9, replace = TRUE), collapse = "")
+    }
     
     # Update reactive values
     rv$meta_sample <- meta_filtered
@@ -2095,14 +2171,18 @@ server <- function(input, output, session) {
       n_before = n_before,
       n_after = n_after,
       n_excluded = n_excluded,
+      n_trimmed = n_trimmed,
       subset_id = subset_id
     )
     
-    showNotification(
-      sprintf("Subsetting applied: %d samples included, %d excluded. [Subset ID: %s]", n_after, n_excluded, subset_id),
-      type = "message",
-      duration = 5
-    )
+    # Build notification message
+    notif_msg <- sprintf("Subsetting applied: %d samples included, %d excluded", n_after, n_excluded)
+    if (n_trimmed > 0) {
+      notif_msg <- sprintf("%s (%d trimmed for incomplete pairs)", notif_msg, n_trimmed)
+    }
+    notif_msg <- sprintf("%s. [Subset ID: %s]", notif_msg, subset_id)
+    
+    showNotification(notif_msg, type = "message", duration = 5)
   })
   
   # Reset subsetting when disabled
@@ -2111,9 +2191,27 @@ server <- function(input, output, session) {
       rv$meta_sample <- rv$meta_sample_original
       rv$subsetting_enabled <- FALSE
       rv$subset_summary <- NULL
-      # Don't reset subset_id - keep the last generated ID
+      # Reset subset_id to default when subsetting is disabled
+      rv$subset_id <- "000000000"
       subset_rule_ids(integer(0))
       subset_next_id(1)
+    }
+  })
+  
+  # Render dynamic export buttons
+  output$export_buttons_ui <- renderUI({
+    is_subsetted <- isTRUE(rv$subsetting_enabled)
+    
+    if (is_subsetted) {
+      tagList(
+        downloadButton("export_subset_meta", "Export Subset Metadata"),
+        downloadButton("export_subset_cluster", "Export Subset Cluster Data")
+      )
+    } else {
+      tagList(
+        downloadButton("export_subset_meta", "Export Metadata"),
+        downloadButton("export_subset_cluster", "Export Cluster Data")
+      )
     }
   })
   
@@ -2149,6 +2247,11 @@ server <- function(input, output, session) {
         tags$p(style = "margin: 5px 0;", sprintf("Samples before: %d", summ$n_before)),
         tags$p(style = "margin: 5px 0;", sprintf("Samples after: %d", summ$n_after)),
         tags$p(style = "margin: 5px 0;", sprintf("Samples excluded: %d", summ$n_excluded)),
+        if (!is.null(summ$n_trimmed) && summ$n_trimmed > 0) {
+          tags$p(style = "margin: 5px 0; color: #8a6d3b;", sprintf("(includes %d trimmed for incomplete pairs)", summ$n_trimmed))
+        } else {
+          NULL
+        },
         tags$p(style = "margin: 5px 0; font-family: monospace; color: #31708f;", sprintf("Subset ID: %s", summ$subset_id))
       ),
       tags$h5("Sample Distribution"),
@@ -2172,6 +2275,28 @@ server <- function(input, output, session) {
     content = function(file) {
       req(rv$meta_sample)
       write.csv(rv$meta_sample, file, row.names = FALSE)
+    }
+  )
+  
+  # Export subset cluster data
+  output$export_subset_cluster <- downloadHandler(
+    filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
+      paste0("subset_cluster_data_", subset_id, ".csv")
+    },
+    content = function(file) {
+      req(rv$abundance_sample, rv$meta_sample)
+      
+      # Get patient_IDs from current subsetted metadata in exact order
+      subset_ids <- rv$meta_sample$patient_ID
+      
+      # Filter and reorder abundance data to match metadata row order exactly
+      abundance_subset <- rv$abundance_sample[match(subset_ids, rownames(rv$abundance_sample)), , drop = FALSE]
+      
+      # Add patient_ID as first column (in same order as metadata)
+      abundance_export <- data.frame(patient_ID = subset_ids, abundance_subset, check.names = FALSE)
+      
+      write.csv(abundance_export, file, row.names = FALSE)
     }
   )
   
@@ -2350,8 +2475,9 @@ server <- function(input, output, session) {
       predictors <- c(predictors, "cluster")
     }
     
-    # Update Feature Selection
-    updatePickerInput(session, "fs_outcome", choices = categorical_outcomes)
+    # Update Feature Selection - allow both categorical and continuous outcomes
+    fs_outcomes <- sort(c(categorical_outcomes, continuous_outcomes))
+    updatePickerInput(session, "fs_outcome", choices = fs_outcomes)
     updatePickerInput(session, "fs_predictors", choices = predictors)
     
     # Update Classification
@@ -3677,7 +3803,7 @@ server <- function(input, output, session) {
     
     gg <- gg +
       ggplot2::facet_wrap(~entity, ncol = facet_cols, scales = "free_y") +
-      ggplot2::scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+      ggplot2::scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
       ggplot2::theme_bw(base_size = 18) +
       ggplot2::labs(x = group_var, y = "Frequency") +
       ggplot2::theme(
@@ -4275,6 +4401,7 @@ server <- function(input, output, session) {
       "gaussian"
     }
     
+    # Create model matrix first
     Xmat <- model.matrix(~ . - 1, data = X_raw)
     colnames(Xmat) <- clean_dummy_names(colnames(Xmat))
     storage.mode(Xmat) <- "double"
@@ -4283,6 +4410,37 @@ server <- function(input, output, session) {
     if (ncol(Xmat) == 1) {
       Xmat <- cbind(Xmat, `__DUMMY__` = 0)
       added_dummy <- TRUE
+    }
+    
+    # Explicitly standardize all continuous columns in Xmat (mean=0, sd=1)
+    # Identify continuous columns (non-dummy variables with range > 0)
+    # Dummy variables from factors typically have only 0/1 values
+    X_scale_params <- list()
+    for (j in seq_len(ncol(Xmat))) {
+      col <- Xmat[, j]
+      unique_vals <- unique(col)
+      # If column has more than 2 unique values, treat as continuous and standardize
+      # This preserves dummy variables (0/1) while scaling continuous predictors
+      if (length(unique_vals) > 2) {
+        col_mean <- mean(col, na.rm = TRUE)
+        col_sd <- sd(col, na.rm = TRUE)
+        if (col_sd > 0) {
+          Xmat[, j] <- (col - col_mean) / col_sd
+          X_scale_params[[colnames(Xmat)[j]]] <- list(mean = col_mean, sd = col_sd)
+        }
+      }
+    }
+    
+    # Standardize continuous outcomes for better penalized regression performance
+    y_scaled <- y
+    y_scale_params <- NULL
+    if (family == "gaussian" && is.numeric(y)) {
+      y_mean <- mean(y, na.rm = TRUE)
+      y_sd <- sd(y, na.rm = TRUE)
+      if (y_sd > 0) {
+        y_scaled <- (y - y_mean) / y_sd
+        y_scale_params <- list(mean = y_mean, sd = y_sd)
+      }
     }
     
     alpha_val <- if (method == "Ridge Regression") 0 else (input$fs_alpha %||% 0.5)
@@ -4296,8 +4454,9 @@ server <- function(input, output, session) {
       # Wrap model fitting in tryCatch to handle errors gracefully
       cvfit <- tryCatch({
         glmnet::cv.glmnet(
-          x = Xmat, y = y, family = family,
-          alpha = alpha_val, nfolds = nfolds_val
+          x = Xmat, y = y_scaled, family = family,
+          alpha = alpha_val, nfolds = nfolds_val,
+          standardize = FALSE  # We already standardized manually
         )
       }, error = function(e) {
         err_msg <- conditionMessage(e)
@@ -4321,7 +4480,13 @@ server <- function(input, output, session) {
         coef_list[[r]] <- coef_df
       } else {
         cm <- as.matrix(coef_obj)
-        coef_df <- data.frame(Feature = rownames(cm), Coef = as.numeric(cm[, 1]), stringsAsFactors = FALSE)
+        coef_raw <- as.numeric(cm[, 1])
+        feat_names <- rownames(cm)
+        
+        # For Feature Selection, keep coefficients in STANDARDIZED space
+        # This makes them comparable across features regardless of original units
+        # A coefficient of -1.0 means "1 SD increase in predictor → 1 SD decrease in outcome"
+        coef_df <- data.frame(Feature = feat_names, Coef = coef_raw, stringsAsFactors = FALSE)
         coef_df <- coef_df[coef_df$Feature != "(Intercept)", , drop = FALSE]
         if (added_dummy) coef_df <- coef_df[coef_df$Feature != "__DUMMY__", , drop = FALSE]
         coef_list[[r]] <- coef_df
@@ -4390,6 +4555,8 @@ server <- function(input, output, session) {
         return()
       }
       df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
+      # Remove backticks from feature names for cleaner plot labels
+      df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
       # Plot all features that pass tolerance, not just top 30
       ggplot2::ggplot(df,
                       ggplot2::aes(x = reorder(Feature, ImportanceMean),
@@ -4411,6 +4578,8 @@ server <- function(input, output, session) {
         text(0.5, 0.5, "All coefficients are zero after regularization.\nTry lowering alpha or adding predictors.", cex = 1.1)
         return()
       }
+      # Remove backticks from feature names for cleaner plot labels
+      df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
       if ("Class" %in% names(df)) {
         # Plot all features that pass tolerance per class, not just top 20
         top_n <- df %>%
@@ -4473,6 +4642,12 @@ server <- function(input, output, session) {
           return(data.frame(Message = "All coefficients shrank to zero after regularization."))
         }
       }
+    }
+    
+    # Remove backticks and backslashes from feature names (added by model.matrix for numeric column names)
+    if ("Feature" %in% names(df)) {
+      df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
+      df$Feature <- gsub("\\\\", "", df$Feature)
     }
     
     df
@@ -4901,11 +5076,15 @@ server <- function(input, output, session) {
         predictor = preds[[paste0(".pred_", positive)]],
         levels = rev(classes)
       )
-      roc_plot <- ggplot2::ggplot(data.frame(
+      # Create ROC data frame and sort by fpr to ensure smooth curve
+      roc_data <- data.frame(
         fpr = 1 - roc_obj$specificities,
         tpr = roc_obj$sensitivities
-      ), ggplot2::aes(x = fpr, y = tpr)) +
-        ggplot2::geom_line(color = "blue", linewidth = 1) +
+      )
+      roc_data <- roc_data[order(roc_data$fpr, roc_data$tpr), ]
+      
+      roc_plot <- ggplot2::ggplot(roc_data, ggplot2::aes(x = fpr, y = tpr)) +
+        ggplot2::geom_step(color = "blue", linewidth = 1, direction = "vh") +
         ggplot2::geom_abline(linetype = "dashed", color = "grey50") +
         ggplot2::labs(title = sprintf("Binary ROC Curve (AUC = %.3f)", pROC::auc(roc_obj)),
                       x = "False Positive Rate", y = "True Positive Rate") +
@@ -5117,7 +5296,7 @@ server <- function(input, output, session) {
     df <- as.data.frame(df)
     
     # Flag intercept rows
-    intercept_row <- grepl("\\(Intercept\\)", df$feature, fixed = TRUE)
+    intercept_row <- grepl("\\(Intercept\\)", df$Feature, fixed = TRUE)
     df_intercept <- df[intercept_row, , drop = FALSE]
     df_notintercept <- df[!intercept_row, , drop = FALSE]
     
@@ -5157,43 +5336,49 @@ server <- function(input, output, session) {
         df_list <- lapply(names(coefs), function(cls) {
           mat <- as.matrix(coefs[[cls]])
           data.frame(
-            class = cls,                     # outcome category
-            feature = rownames(mat),         # predictor
-            ScaledCoefficient = as.numeric(mat),
+            Class = cls,                     # outcome category
+            Feature = rownames(mat),         # predictor
+            StandardizedCoef = as.numeric(mat),
             stringsAsFactors = FALSE
           )
         })
         df <- do.call(rbind, df_list)
       } else {
-        # Binary glmnet: single matrix, rows = predictors
+        # Binary/continuous glmnet: single matrix, rows = predictors
         mat <- as.matrix(coefs)
         df <- data.frame(
-          feature = rownames(mat),
-          ScaledCoefficient = as.numeric(mat),
+          Feature = rownames(mat),
+          StandardizedCoef = as.numeric(mat),
           stringsAsFactors = FALSE
         )
       }
       
-      # Back-transform to unscaled coefficients if caret preProcess was used
-      if (!is.null(s$model$preProcess)) {
-        pp <- s$model$preProcess
-        sds <- pp$std
-        df$RawCoefficient <- df$ScaledCoefficient
-        for (feat in intersect(names(sds), df$feature)) {
-          idx <- df$feature == feat
-          df$RawCoefficient[idx] <- df$ScaledCoefficient[idx] / sds[feat]
+      # Remove backticks from feature names (added by model.matrix for numeric column names)
+      df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
+      
+      # Calculate original-scale coefficients for interpretation
+      # Formula: beta_original = beta_standardized * (sd_y / sd_x)
+      df$OriginalCoef <- df$StandardizedCoef
+      
+      if (!is.null(s$model$y_scale_params) || !is.null(s$model$X_scale_params)) {
+        y_sd <- if (!is.null(s$model$y_scale_params)) s$model$y_scale_params$sd else 1
+        X_scale <- s$model$X_scale_params
+        
+        for (i in seq_len(nrow(df))) {
+          feat <- df$Feature[i]
+          x_sd <- if (!is.null(X_scale[[feat]])) X_scale[[feat]]$sd else 1
+          # Rescale to original units
+          df$OriginalCoef[i] <- df$StandardizedCoef[i] * (y_sd / x_sd)
         }
-      } else {
-        df$RawCoefficient <- df$ScaledCoefficient
       }
       
       # Enforce column order
-      if ("class" %in% names(df)) {
-        df <- df[, c("class", "feature", "RawCoefficient", "ScaledCoefficient")]
+      if ("Class" %in% names(df)) {
+        df <- df[, c("Class", "Feature", "StandardizedCoef", "OriginalCoef")]
       } else {
-        df <- df[, c("feature", "RawCoefficient", "ScaledCoefficient")]
+        df <- df[, c("Feature", "StandardizedCoef", "OriginalCoef")]
       }
-      df <- order_features(df, "RawCoefficient")
+      df <- order_features(df, "StandardizedCoef")
       rownames(df) <- NULL
       df
     } else if (s$model$method %in% c("glm", "multinom")) {
@@ -5202,28 +5387,31 @@ server <- function(input, output, session) {
       if (is.matrix(coefs)) {
         # Multiclass multinom: rows = outcome classes, columns = predictors
         df <- as.data.frame(coefs)
-        df$class <- rownames(coefs)  # outcome categories from row names
+        df$Class <- rownames(coefs)  # outcome categories from row names
         
         df_long <- tidyr::pivot_longer(
           df,
-          cols = setdiff(names(df), "class"),
-          names_to = "feature",          # predictors from column names
-          values_to = "RawCoefficient"
+          cols = setdiff(names(df), "Class"),
+          names_to = "Feature",          # predictors from column names
+          values_to = "OriginalCoef"
         )
         
-        df_long$ScaledCoefficient <- df_long$RawCoefficient
-        df <- df_long[, c("class", "feature", "RawCoefficient", "ScaledCoefficient")]
+        # No standardization for glm/multinom, so standardized = original
+        df_long$StandardizedCoef <- df_long$OriginalCoef
+        df <- df_long[, c("Class", "Feature", "StandardizedCoef", "OriginalCoef")]
       } else {
         # Binary logistic regression: named vector of coefficients (predictors)
         df <- data.frame(
-          feature = names(coefs),
-          RawCoefficient = unname(coefs),
+          Feature = names(coefs),
+          OriginalCoef = unname(coefs),
           stringsAsFactors = FALSE
         )
-        df$ScaledCoefficient <- df$RawCoefficient
-        df <- df[, c("feature", "RawCoefficient", "ScaledCoefficient")]
+        df$StandardizedCoef <- df$OriginalCoef
+        df <- df[, c("Feature", "StandardizedCoef", "OriginalCoef")]
       }
-      df <- order_features(df, "RawCoefficient")
+      # Remove backticks from feature names
+      df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
+      df <- order_features(df, "StandardizedCoef")
       rownames(df) <- NULL
       df
     } else {
@@ -5238,7 +5426,7 @@ server <- function(input, output, session) {
     
     if (s$model$method == "rf") {
       imp_scaled <- caret::varImp(s$model, scale = TRUE)$importance
-      imp_scaled$feature <- rownames(imp_scaled)
+      imp_scaled$Feature <- rownames(imp_scaled)
       colnames(imp_scaled)[1] <- "ScaledImportance"
       
       rf_model <- s$model$finalModel
@@ -5248,12 +5436,12 @@ server <- function(input, output, session) {
       } else {
         raw_vals <- imp_raw[, 1]
       }
-      imp_raw_df <- data.frame(feature = rownames(imp_raw),
+      imp_raw_df <- data.frame(Feature = rownames(imp_raw),
                                RawImportance = raw_vals,
                                stringsAsFactors = FALSE)
       
-      df <- dplyr::left_join(imp_scaled, imp_raw_df, by = "feature")
-      df <- df[, c("feature", "RawImportance", "ScaledImportance")]
+      df <- dplyr::left_join(imp_scaled, imp_raw_df, by = "Feature")
+      df <- df[, c("Feature", "RawImportance", "ScaledImportance")]
       df <- order_features(df, "RawImportance")
       rownames(df) <- NULL
       df
@@ -5335,12 +5523,12 @@ server <- function(input, output, session) {
       
       if (!is.null(feat_df) && nrow(feat_df) > 0) {
         # Enforce column order
-        if (all(c("class","feature","RawCoefficient","ScaledCoefficient") %in% names(feat_df))) {
-          feat_df <- feat_df[, c("class","feature","RawCoefficient","ScaledCoefficient")]
-        } else if (all(c("feature","RawCoefficient","ScaledCoefficient") %in% names(feat_df))) {
-          feat_df <- feat_df[, c("feature","RawCoefficient","ScaledCoefficient")]
-        } else if (all(c("feature","RawImportance","ScaledImportance") %in% names(feat_df))) {
-          feat_df <- feat_df[, c("feature","RawImportance","ScaledImportance")]
+        if (all(c("Class","Feature","StandardizedCoef","OriginalCoef") %in% names(feat_df))) {
+          feat_df <- feat_df[, c("Class","Feature","StandardizedCoef","OriginalCoef")]
+        } else if (all(c("Feature","StandardizedCoef","OriginalCoef") %in% names(feat_df))) {
+          feat_df <- feat_df[, c("Feature","StandardizedCoef","OriginalCoef")]
+        } else if (all(c("Feature","RawImportance","ScaledImportance") %in% names(feat_df))) {
+          feat_df <- feat_df[, c("Feature","RawImportance","ScaledImportance")]
         }
         write.csv(feat_df, feat_file, row.names = FALSE)
       } else {
@@ -5455,12 +5643,12 @@ server <- function(input, output, session) {
       idx <- sample(seq_len(length(y)), size = floor(train_frac * length(y)))
       trainX <- X[idx, , drop = FALSE]
       testX  <- X[-idx, , drop = FALSE]
-      trainY <- y[idx]
-      testY  <- y[-idx]
+      trainY_orig <- y[idx]
+      testY_orig <- y[-idx]
       
       split_info <- list(
-        n_train = length(trainY),
-        n_test  = length(testY)
+        n_train = length(trainY_orig),
+        n_test  = length(testY_orig)
       )
       
       if (method == "glmnet") {
@@ -5468,6 +5656,29 @@ server <- function(input, output, session) {
         testMat  <- model.matrix(~ . - 1, data = testX)
         storage.mode(trainMat) <- "double"
         storage.mode(testMat)  <- "double"
+        
+        # Standardize continuous predictors explicitly
+        X_scale_params <- list()
+        for (j in seq_len(ncol(trainMat))) {
+          col <- trainMat[, j]
+          unique_vals <- unique(col)
+          if (length(unique_vals) > 2) {
+            col_mean <- mean(col, na.rm = TRUE)
+            col_sd <- sd(col, na.rm = TRUE)
+            if (col_sd > 0) {
+              trainMat[, j] <- (col - col_mean) / col_sd
+              testMat[, j] <- (testMat[, j] - col_mean) / col_sd
+              X_scale_params[[colnames(trainMat)[j]]] <- list(mean = col_mean, sd = col_sd)
+            }
+          }
+        }
+        
+        # Standardize outcome
+        trainY_mean <- mean(trainY_orig, na.rm = TRUE)
+        trainY_sd <- sd(trainY_orig, na.rm = TRUE)
+        trainY <- if (trainY_sd > 0) (trainY_orig - trainY_mean) / trainY_sd else trainY_orig
+        y_scale_params <- list(mean = trainY_mean, sd = trainY_sd)
+        
         alpha_val <- if (input$reg_model_type == "Ridge Regression") 0 else (input$reg_alpha %||% 0.5)
         model <- tryCatch({
           caret::train(
@@ -5480,11 +5691,18 @@ server <- function(input, output, session) {
         }, error = function(e) {
           stop(paste0("Regression model training failed: ", conditionMessage(e)), call. = FALSE)
         })
-        preds <- predict(model, newdata = testMat)
+        
+        # Store scaling params for coefficient interpretation
+        model$X_scale_params <- X_scale_params
+        model$y_scale_params <- y_scale_params
+        
+        preds_scaled <- predict(model, newdata = testMat)
+        # Rescale predictions back to original scale
+        preds <- preds_scaled * y_scale_params$sd + y_scale_params$mean
       } else if (method == "rf") {
         model <- tryCatch({
           caret::train(
-            x = trainX, y = trainY,
+            x = trainX, y = trainY_orig,
             method = method,
             trControl = caret::trainControl(verboseIter = TRUE),
             verbose = TRUE
@@ -5494,20 +5712,55 @@ server <- function(input, output, session) {
         })
         preds <- predict(model, newdata = testX)
       } else {
+        # Linear regression - apply same standardization for consistency
+        trainMat <- model.matrix(~ . - 1, data = trainX)
+        testMat  <- model.matrix(~ . - 1, data = testX)
+        storage.mode(trainMat) <- "double"
+        storage.mode(testMat)  <- "double"
+        
+        # Standardize continuous predictors explicitly
+        X_scale_params <- list()
+        for (j in seq_len(ncol(trainMat))) {
+          col <- trainMat[, j]
+          unique_vals <- unique(col)
+          if (length(unique_vals) > 2) {
+            col_mean <- mean(col, na.rm = TRUE)
+            col_sd <- sd(col, na.rm = TRUE)
+            if (col_sd > 0) {
+              trainMat[, j] <- (col - col_mean) / col_sd
+              testMat[, j] <- (testMat[, j] - col_mean) / col_sd
+              X_scale_params[[colnames(trainMat)[j]]] <- list(mean = col_mean, sd = col_sd)
+            }
+          }
+        }
+        
+        # Standardize outcome
+        trainY_mean <- mean(trainY_orig, na.rm = TRUE)
+        trainY_sd <- sd(trainY_orig, na.rm = TRUE)
+        trainY <- if (trainY_sd > 0) (trainY_orig - trainY_mean) / trainY_sd else trainY_orig
+        y_scale_params <- list(mean = trainY_mean, sd = trainY_sd)
+        
         model <- tryCatch({
           caret::train(
-            x = trainX, y = trainY,
+            x = trainMat, y = trainY,
             method = method,
             trControl = caret::trainControl(verboseIter = TRUE)
           )
         }, error = function(e) {
           stop(paste0("Regression model training failed: ", conditionMessage(e)), call. = FALSE)
         })
-        preds <- predict(model, newdata = testX)
+        
+        # Store scaling params for coefficient interpretation
+        model$X_scale_params <- X_scale_params
+        model$y_scale_params <- y_scale_params
+        
+        preds_scaled <- predict(model, newdata = testMat)
+        # Rescale predictions back to original scale
+        preds <- preds_scaled * y_scale_params$sd + y_scale_params$mean
       }
       
       preds_tbl <- data.frame(
-        obs = testY,
+        obs = testY_orig,
         pred = preds
       )
       
@@ -5533,14 +5786,40 @@ server <- function(input, output, session) {
     if (method == "glmnet") {
       Xmat <- model.matrix(~ . - 1, data = X)
       storage.mode(Xmat) <- "double"
+      
+      # Standardize continuous predictors explicitly
+      X_scale_params <- list()
+      for (j in seq_len(ncol(Xmat))) {
+        col <- Xmat[, j]
+        unique_vals <- unique(col)
+        if (length(unique_vals) > 2) {
+          col_mean <- mean(col, na.rm = TRUE)
+          col_sd <- sd(col, na.rm = TRUE)
+          if (col_sd > 0) {
+            Xmat[, j] <- (col - col_mean) / col_sd
+            X_scale_params[[colnames(Xmat)[j]]] <- list(mean = col_mean, sd = col_sd)
+          }
+        }
+      }
+      
+      # Standardize outcome
+      y_mean <- mean(y, na.rm = TRUE)
+      y_sd <- sd(y, na.rm = TRUE)
+      y_scaled <- if (y_sd > 0) (y - y_mean) / y_sd else y
+      y_scale_params <- list(mean = y_mean, sd = y_sd)
+      
       alpha_val <- if (input$reg_model_type == "Ridge Regression") 0 else (input$reg_alpha %||% 0.5)
       model <- caret::train(
-        x = Xmat, y = y,
+        x = Xmat, y = y_scaled,
         method = "glmnet",
         trControl = ctrl,
         tuneGrid = expand.grid(alpha = alpha_val,
                                lambda = 10^seq(-3, 1, length = 20))
       )
+      
+      # Store scaling params for coefficient interpretation
+      model$X_scale_params <- X_scale_params
+      model$y_scale_params <- y_scale_params
     } else if (method == "rf") {
       model <- caret::train(
         x = X, y = y,
@@ -5549,17 +5828,52 @@ server <- function(input, output, session) {
         verbose = TRUE
       )
     } else {
+      # Linear regression - apply same standardization for consistency
+      Xmat <- model.matrix(~ . - 1, data = X)
+      storage.mode(Xmat) <- "double"
+      
+      # Standardize continuous predictors explicitly
+      X_scale_params <- list()
+      for (j in seq_len(ncol(Xmat))) {
+        col <- Xmat[, j]
+        unique_vals <- unique(col)
+        if (length(unique_vals) > 2) {
+          col_mean <- mean(col, na.rm = TRUE)
+          col_sd <- sd(col, na.rm = TRUE)
+          if (col_sd > 0) {
+            Xmat[, j] <- (col - col_mean) / col_sd
+            X_scale_params[[colnames(Xmat)[j]]] <- list(mean = col_mean, sd = col_sd)
+          }
+        }
+      }
+      
+      # Standardize outcome
+      y_mean <- mean(y, na.rm = TRUE)
+      y_sd <- sd(y, na.rm = TRUE)
+      y_scaled <- if (y_sd > 0) (y - y_mean) / y_sd else y
+      y_scale_params <- list(mean = y_mean, sd = y_sd)
+      
       model <- caret::train(
-        x = X, y = y,
+        x = Xmat, y = y_scaled,
         method = method,
         trControl = ctrl
       )
+      
+      # Store scaling params for coefficient interpretation
+      model$X_scale_params <- X_scale_params
+      model$y_scale_params <- y_scale_params
     }
     
     preds <- model$pred
     if (is.null(preds) || !nrow(preds)) {
       showNotification("No predictions available from resampling. Try Train/Test split.", type = "error")
       return(NULL)
+    }
+    
+    # Rescale predictions back to original scale for glmnet and lm
+    if (method %in% c("glmnet", "lm")) {
+      preds$pred <- preds$pred * y_scale_params$sd + y_scale_params$mean
+      preds$obs <- preds$obs * y_scale_params$sd + y_scale_params$mean
     }
     
     preds_tbl <- data.frame(
@@ -5771,25 +6085,97 @@ server <- function(input, output, session) {
       
       mat <- as.matrix(coefs)
       df <- data.frame(
-        feature = rownames(mat),
-        RawCoefficient = as.numeric(mat),
+        Feature = rownames(mat),
+        StandardizedCoef = as.numeric(mat),
         stringsAsFactors = FALSE
       )
-      df$ScaledCoefficient <- df$RawCoefficient
-      df <- df[, c("feature", "RawCoefficient", "ScaledCoefficient")]
-      df <- order_features(df, "RawCoefficient")
+      
+      # Remove backticks and backslashes from feature names (added by model.matrix for numeric column names)
+      df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
+      df$Feature <- gsub("\\\\", "", df$Feature)
+      
+      # Calculate original-scale coefficients for interpretation
+      df$OriginalCoef <- df$StandardizedCoef
+      
+      if (!is.null(s$model$y_scale_params) || !is.null(s$model$X_scale_params)) {
+        y_sd <- if (!is.null(s$model$y_scale_params)) s$model$y_scale_params$sd else 1
+        X_scale <- s$model$X_scale_params
+        
+        cat("Rescaling coefficients:\n")
+        cat("  y_sd:", y_sd, "\n")
+        cat("  X_scale params available for:", if (!is.null(X_scale)) names(X_scale) else "NONE", "\n")
+        cat("  Features in df:", df$Feature, "\n")
+        
+        for (i in seq_len(nrow(df))) {
+          feat <- df$Feature[i]
+          # Try matching with backticks if exact match fails
+          feat_with_backticks <- paste0("`", feat, "`")
+          x_sd <- if (!is.null(X_scale[[feat]])) {
+            X_scale[[feat]]$sd
+          } else if (!is.null(X_scale[[feat_with_backticks]])) {
+            X_scale[[feat_with_backticks]]$sd
+          } else {
+            1
+          }
+          # Rescale to original units
+          df$OriginalCoef[i] <- df$StandardizedCoef[i] * (y_sd / x_sd)
+          if (i <= 3) {  # Debug first few
+            cat("  Feature", feat, ": x_sd =", x_sd, ", rescaled from", df$StandardizedCoef[i], "to", df$OriginalCoef[i], "\n")
+          }
+        }
+      } else {
+        cat("No scaling params found - y_scale_params:", !is.null(s$model$y_scale_params), 
+            "X_scale_params:", !is.null(s$model$X_scale_params), "\n")
+      }
+      
+      df <- df[, c("Feature", "StandardizedCoef", "OriginalCoef")]
+      df <- order_features(df, "StandardizedCoef")
       rownames(df) <- NULL
       df
     } else if (s$model$method == "lm") {
       coefs <- coef(s$model$finalModel)
       df <- data.frame(
-        feature = names(coefs),
-        RawCoefficient = unname(coefs),
+        Feature = names(coefs),
+        StandardizedCoef = unname(coefs),
         stringsAsFactors = FALSE
       )
-      df$ScaledCoefficient <- df$RawCoefficient
-      df <- df[, c("feature", "RawCoefficient", "ScaledCoefficient")]
-      df <- order_features(df, "RawCoefficient")
+      
+      # Remove backticks and backslashes from feature names (added by model.matrix for numeric column names)
+      df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
+      df$Feature <- gsub("\\\\", "", df$Feature)
+      
+      # Calculate original-scale coefficients for interpretation
+      df$OriginalCoef <- df$StandardizedCoef
+      
+      if (!is.null(s$model$y_scale_params) || !is.null(s$model$X_scale_params)) {
+        y_sd <- if (!is.null(s$model$y_scale_params)) s$model$y_scale_params$sd else 1
+        X_scale <- s$model$X_scale_params
+        
+        cat("Rescaling lm coefficients:\n")
+        cat("  y_sd:", y_sd, "\n")
+        cat("  X_scale params available for:", if (!is.null(X_scale)) names(X_scale) else "NONE", "\n")
+        
+        for (i in seq_len(nrow(df))) {
+          feat <- df$Feature[i]
+          # Try matching with backticks if exact match fails
+          feat_with_backticks <- paste0("`", feat, "`")
+          x_sd <- if (!is.null(X_scale[[feat]])) {
+            X_scale[[feat]]$sd
+          } else if (!is.null(X_scale[[feat_with_backticks]])) {
+            X_scale[[feat_with_backticks]]$sd
+          } else {
+            1
+          }
+          # Rescale to original units
+          df$OriginalCoef[i] <- df$StandardizedCoef[i] * (y_sd / x_sd)
+          if (i <= 3) {  # Debug first few
+            cat("  Feature", feat, ": x_sd =", x_sd, ", rescaled from", df$StandardizedCoef[i], "to", df$OriginalCoef[i], "\n")
+          }
+        }
+      }
+      
+      df <- df[, c("Feature", "StandardizedCoef", "OriginalCoef")]
+      df <- order_features(df, "StandardizedCoef")
       rownames(df) <- NULL
       df
     } else {
@@ -5804,7 +6190,7 @@ server <- function(input, output, session) {
     
     if (s$model$method == "rf") {
       imp_scaled <- caret::varImp(s$model, scale = TRUE)$importance
-      imp_scaled$feature <- rownames(imp_scaled)
+      imp_scaled$Feature <- rownames(imp_scaled)
       colnames(imp_scaled)[1] <- "ScaledImportance"
       
       rf_model <- s$model$finalModel
@@ -5814,12 +6200,12 @@ server <- function(input, output, session) {
       } else {
         raw_vals <- imp_raw[, 1]
       }
-      imp_raw_df <- data.frame(feature = rownames(imp_raw),
+      imp_raw_df <- data.frame(Feature = rownames(imp_raw),
                                RawImportance = raw_vals,
                                stringsAsFactors = FALSE)
       
-      df <- dplyr::left_join(imp_scaled, imp_raw_df, by = "feature")
-      df <- df[, c("feature", "RawImportance", "ScaledImportance")]
+      df <- dplyr::left_join(imp_scaled, imp_raw_df, by = "Feature")
+      df <- df[, c("Feature", "RawImportance", "ScaledImportance")]
       df <- order_features(df, "RawImportance")
       rownames(df) <- NULL
       df
