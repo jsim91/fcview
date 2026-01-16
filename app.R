@@ -934,7 +934,7 @@ ui <- navbarPage(
                br(), br(),
                conditionalPanel(
                  condition = "output.hasFSResults",
-                 downloadButton("export_fs_results", "Export results as CSV"),
+                 downloadButton("export_fs_results", "Download All Results (ZIP)"),
                  br(), br(),
                  actionButton("reset_fs", "Clear Results")
                )
@@ -944,7 +944,7 @@ ui <- navbarPage(
                conditionalPanel(
                  condition = "output.hasFSResults",
                  h4("Summary Plot"),
-                 plotOutput("fs_plot", height = "550px"),
+                 uiOutput("fs_plot_ui"),
                  h4("Details"),
                  verbatimTextOutput("fs_summary")
                ),
@@ -1095,6 +1095,111 @@ ui <- navbarPage(
                  h4("Model Features"),
                  tableOutput("reg_features")
                )
+             )
+           )
+  ),
+  tabPanel("sccomp",
+           h4("Differential Composition Analysis with sccomp"),
+           fluidRow(
+             column(
+               3,
+               helpText("sccomp tests for differential composition of cell types/clusters across sample groups."),
+               
+               radioButtons("sccomp_formula_mode", "Formula mode",
+                           choices = c("Simple" = "simple", "Custom" = "custom"),
+                           selected = "simple"),
+               
+               conditionalPanel(
+                 condition = "input.sccomp_formula_mode == 'simple'",
+                 pickerInput("sccomp_group_var", "Grouping variable", choices = NULL),
+                 conditionalPanel(
+                   condition = "input.sccomp_group_var != '' && input.sccomp_group_var != null",
+                   pickerInput("sccomp_reference_level", "Reference level (first level is default)", 
+                              choices = NULL, options = list(`live-search` = TRUE))
+                 ),
+                 pickerInput("sccomp_formula_vars", "Additional covariates (optional)", choices = NULL, multiple = TRUE),
+                 checkboxInput("sccomp_interactions", "Include interactions", FALSE)
+               ),
+               
+               conditionalPanel(
+                 condition = "input.sccomp_formula_mode == 'custom'",
+                 helpText("Formula syntax examples:"),
+                 helpText("Fixed effects: ~ condition + age"),
+                 helpText("Interaction: ~ condition * age"),
+                 helpText("Random effects: ~ condition + (1|patient_ID)"),
+                 helpText("No intercept: ~ 0 + condition"),
+                 textInput("sccomp_custom_formula", "Custom formula", value = "~ condition", placeholder = "~ condition + age"),
+                 textInput("sccomp_custom_reference_levels", "Reference levels (optional)",
+                          value = "",
+                          placeholder = "variable1=level1; variable2=level2"),
+                 helpText("Specify reference levels as: variable=level; separated by semicolons. Example: condition=Control; treatment=Placebo")
+               ),
+               
+               sliderInput("sccomp_cores", "Number of cores",
+                          min = 1, max = parallel::detectCores(),
+                          value = max(1, parallel::detectCores() - 2), step = 1),
+               
+               actionButton("run_sccomp", "Run sccomp_estimate", class = "btn-primary"),
+               br(), br(),
+               
+               conditionalPanel(
+                 condition = "output.hasSccompResults",
+                 h5("Post-hoc Contrasts"),
+                 helpText("After running sccomp_estimate with '~ 0 + variable', you can test specific contrasts."),
+                 helpText(strong("Available parameters for contrasts:")),
+                 helpText("Use backticks (`) around parameter names. See options below."),
+                 verbatimTextOutput("sccomp_available_params"),
+                 textInput("sccomp_contrast", "Contrast specification", 
+                          placeholder = "e.g., `conditionTreated` - `conditionControl`"),
+                 actionButton("run_sccomp_test", "Run sccomp_test", class = "btn-secondary"),
+                 br(), br(),
+                 downloadButton("export_sccomp_results", "Export results as CSV"),
+                 br(), br(),
+                 actionButton("reset_sccomp", "Clear Results")
+               )
+             ),
+             column(
+               9,
+               conditionalPanel(
+                 condition = "output.hasSccompResults",
+                 h4("Results Summary"),
+                 verbatimTextOutput("sccomp_summary"),
+                 uiOutput("sccomp_intercept_warning"),
+                 fluidRow(
+                   column(
+                     6,
+                     h4("Credible Intervals Plot"),
+                     plotOutput("sccomp_interval_plot", height = "auto", width = "100%"),
+                     downloadButton("download_sccomp_plot", "Download Interval Plot"),
+                     br(), br()
+                   ),
+                   column(
+                     6,
+                     conditionalPanel(
+                       condition = "output.hasSccompTestResults",
+                       h4("Contrast Credible Intervals Plot"),
+                       plotOutput("sccomp_contrast_plot", height = "auto", width = "100%"),
+                       downloadButton("download_sccomp_contrast_plot", "Download Contrast Interval Plot"),
+                       br(), br()
+                     )
+                   )
+                 ),
+                 fluidRow(
+                   column(
+                     6,
+                     uiOutput("sccomp_table_ui")
+                   ),
+                   column(
+                     6,
+                     conditionalPanel(
+                       condition = "output.hasSccompTestResults",
+                       h4("Contrast Test Results"),
+                       uiOutput("sccomp_test_table_ui")
+                     )
+                   )
+                 )
+               ),
+               textOutput("sccomp_cleared_msg")
              )
            )
   )
@@ -1336,6 +1441,16 @@ server <- function(input, output, session) {
       clusters$abundance <- NULL
       rv$abundance_sample <- NULL
       showNotification("No cluster$abundance matrix found in upload; abundance-based tabs will be disabled.", type = "warning")
+    }
+    
+    # Load counts data for sccomp
+    if (!is.null(obj$cluster$counts) && is.matrix(obj$cluster$counts)) {
+      rv$counts_sample <- obj$cluster$counts
+      message(sprintf("Counts matrix loaded: %d sources × %d entities",
+                      nrow(rv$counts_sample), ncol(rv$counts_sample)))
+    } else {
+      rv$counts_sample <- NULL
+      message("No cluster$counts matrix found in upload; sccomp tab will be disabled.")
     }
     
     # Canonical per-sample metadata (prefer direct sample-level object if provided)
@@ -2205,12 +2320,14 @@ server <- function(input, output, session) {
     if (is_subsetted) {
       tagList(
         downloadButton("export_subset_meta", "Export Subset Metadata"),
-        downloadButton("export_subset_cluster", "Export Subset Cluster Data")
+        downloadButton("export_subset_frequencies", "Export Subset Cluster Frequencies"),
+        downloadButton("export_subset_counts", "Export Subset Cluster Counts")
       )
     } else {
       tagList(
         downloadButton("export_subset_meta", "Export Metadata"),
-        downloadButton("export_subset_cluster", "Export Cluster Data")
+        downloadButton("export_subset_frequencies", "Export Cluster Frequencies"),
+        downloadButton("export_subset_counts", "Export Cluster Counts")
       )
     }
   })
@@ -2278,11 +2395,11 @@ server <- function(input, output, session) {
     }
   )
   
-  # Export subset cluster data
-  output$export_subset_cluster <- downloadHandler(
+  # Export subset cluster frequencies (abundance data)
+  output$export_subset_frequencies <- downloadHandler(
     filename = function() {
       subset_id <- rv$subset_id %||% "000000000"
-      paste0("subset_cluster_data_", subset_id, ".csv")
+      paste0("subset_cluster_frequencies_", subset_id, ".csv")
     },
     content = function(file) {
       req(rv$abundance_sample, rv$meta_sample)
@@ -2297,6 +2414,28 @@ server <- function(input, output, session) {
       abundance_export <- data.frame(patient_ID = subset_ids, abundance_subset, check.names = FALSE)
       
       write.csv(abundance_export, file, row.names = FALSE)
+    }
+  )
+  
+  # Export subset cluster counts
+  output$export_subset_counts <- downloadHandler(
+    filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
+      paste0("subset_cluster_counts_", subset_id, ".csv")
+    },
+    content = function(file) {
+      req(rv$counts_sample, rv$meta_sample)
+      
+      # Get patient_IDs from current subsetted metadata in exact order
+      subset_ids <- rv$meta_sample$patient_ID
+      
+      # Filter and reorder counts data to match metadata row order exactly
+      counts_subset <- rv$counts_sample[match(subset_ids, rownames(rv$counts_sample)), , drop = FALSE]
+      
+      # Add patient_ID as first column (in same order as metadata)
+      counts_export <- data.frame(patient_ID = subset_ids, counts_subset, check.names = FALSE)
+      
+      write.csv(counts_export, file, row.names = FALSE)
     }
   )
   
@@ -2705,7 +2844,7 @@ server <- function(input, output, session) {
   
   output$export_heatmap_pdf <- downloadHandler(
     filename = function() {
-      paste0("cluster_heatmap_", Sys.Date(), ".pdf")
+      paste0("cluster_heatmap.pdf")
     },
     content = function(file) {
       # Get the underlying matrix from your reactive
@@ -3049,6 +3188,18 @@ server <- function(input, output, session) {
   observeEvent(input$run_test, {
     res <- run_tests()
     test_results_rv(res)
+    
+    # Store test info for export filename
+    rv$last_test_info <- list(
+      entity = input$test_entity %||% "clusters",
+      test = input$test_type %||% "unknown",
+      metadata = if (grepl("spearman|pearson", tolower(input$test_type %||% ""))) {
+        input$cont_var %||% "variable"
+      } else {
+        input$group_var %||% "variable"
+      }
+    )
+    
     output$test_cleared_msg <- renderText(NULL)
   })
   
@@ -3125,10 +3276,25 @@ server <- function(input, output, session) {
       info <- rv$last_test_info
       subset_id <- rv$subset_id %||% "000000000"
       if (is.null(info)) return(paste0("results_", subset_id, ".csv"))
-      fname <- paste(info$entity, info$test, info$metadata, sep = "_")
-      fname <- gsub(" ", "_", fname)
-      fname <- tolower(fname)
-      paste0(fname, "_", subset_id, ".csv")
+      
+      # Determine if continuous or categorical based on test type
+      test_type <- if (grepl("spearman|pearson", tolower(info$test))) {
+        "continuous"
+      } else {
+        "categorical"
+      }
+      
+      # Format test name (lowercase, underscores, no parentheses)
+      test <- tolower(info$test)
+      test <- gsub("\\s+", "_", test)
+      test <- gsub("_\\(.*\\)", "", test)
+      test <- gsub("kruskal_wallis", "kruskal-wallis", test)
+      
+      # Format entity and metadata (clusters/outcome)
+      entity <- gsub("\\s+", "_", tolower(info$entity))
+      metadata <- gsub("\\s+", "_", tolower(info$metadata))
+      
+      paste0(test_type, "_", entity, "_", metadata, "_", test, "_", subset_id, ".csv")
     },
     content = function(file) {
       run <- test_results_rv()
@@ -4533,6 +4699,54 @@ server <- function(input, output, session) {
     head(res$merged, 5)
   }, sanitize.text.function = function(x) x)
   
+  # Dynamic height for Feature Selection plot based on facet rows and features
+  fs_plot_height <- reactive({
+    res <- fs_state()
+    if (is.null(res)) return(550)
+    
+    tol <- res$tolerance
+    df <- res$results
+    
+    # Filter by tolerance to count features that will actually be plotted
+    if (identical(res$method, "Boruta")) {
+      df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+    } else {
+      df <- df[abs(df$Coef) >= tol, , drop = FALSE]
+    }
+    
+    if (nrow(df) == 0) return(550)
+    
+    # For multinomial outcomes, calculate height based on facet rows and features
+    if ("Class" %in% names(df)) {
+      n_classes <- length(unique(df$Class))
+      # Count max features in any class (this is the height per facet)
+      max_features_per_class <- max(table(df$Class))
+      
+      # ggplot2 facet_wrap default behavior: uses roughly sqrt(n) columns
+      # We calculate number of rows based on default wrapping
+      ncol_facets <- ceiling(sqrt(n_classes))
+      n_rows <- ceiling(n_classes / ncol_facets)
+      
+      # Height calculation: base + (features per facet * pixels per feature * number of rows)
+      # Reduced values for more compact display
+      base_height <- 150
+      pixels_per_feature <- 20
+      height <- base_height + (max_features_per_class * pixels_per_feature * n_rows)
+      
+      return(max(400, min(height, 1500)))  # Lower minimum and cap
+    } else {
+      # For binary/continuous, single plot - base on total features
+      n_features <- nrow(df)
+      height <- 200 + (n_features * 20)
+      return(max(400, min(height, 1200)))  # Cap at 1200px
+    }
+  })
+  
+  output$fs_plot_ui <- renderUI({
+    height_val <- fs_plot_height()
+    plotOutput("fs_plot", height = paste0(height_val, "px"))
+  })
+  
   output$fs_plot <- renderPlot({
     # res <- run_fs(); req(res)
     res <- fs_state(); req(res)
@@ -4715,15 +4929,35 @@ server <- function(input, output, session) {
   output$export_fs_results <- downloadHandler(
     filename = function() {
       subset_id <- rv$subset_id %||% "000000000"
-      # res <- run_fs(); req(res)
       res <- fs_state(); req(res)
-      method <- res$method %||% "FeatureSelection"
-      outcome <- input$fs_outcome %||% "outcome"
-      paste0(method, "_feature_selection_with_outcome_", outcome, "_", Sys.Date(), "_", subset_id, ".csv")
+      method <- gsub("\\s+", "_", tolower(res$method %||% "unknown"))
+      outcome <- gsub("\\s+", "_", tolower(input$fs_outcome %||% "outcome"))
+      
+      # Add alpha to filename if Elastic Net
+      if (identical(res$method, "Elastic Net")) {
+        alpha_val <- input$fs_alpha %||% 0.5
+        paste0("feature_selection_", method, "_", outcome, "_alpha", alpha_val, "_", subset_id, ".zip")
+      } else {
+        paste0("feature_selection_", method, "_", outcome, "_", subset_id, ".zip")
+      }
     },
     content = function(file) {
-      # res <- run_fs(); req(res)
       res <- fs_state(); req(res)
+      subset_id <- rv$subset_id %||% "000000000"
+      
+      tmpdir <- tempdir()
+      files <- c()
+      
+      # Build filename prefix
+      alpha_suffix <- if (identical(res$method, "Elastic Net")) {
+        alpha_val <- input$fs_alpha %||% 0.5
+        paste0("_alpha", alpha_val)
+      } else {
+        ""
+      }
+      
+      # 1. Selected Features CSV
+      feat_file <- file.path(tmpdir, paste0("feature_selection_selected_features", alpha_suffix, "_", subset_id, ".csv"))
       df <- res$results
       tol <- res$tolerance
       
@@ -4731,24 +4965,142 @@ server <- function(input, output, session) {
         df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
         df <- df[order(df$ImportanceMean, decreasing = TRUE), , drop = FALSE]
         if (nrow(df) == 0) {
-          utils::write.csv(data.frame(Message = "No Boruta features passed the tolerance threshold."),
-                           file, row.names = FALSE)
-          return()
+          write.csv(data.frame(Message = "No Boruta features passed the tolerance threshold."),
+                    feat_file, row.names = FALSE)
+        } else {
+          write.csv(df, feat_file, row.names = FALSE)
         }
       } else {
         if ("Coef" %in% names(df)) {
           df <- df[abs(df$Coef) >= tol, , drop = FALSE]
           df <- df[order(df$Coef, decreasing = TRUE), , drop = FALSE]
           if (nrow(df) == 0) {
-            utils::write.csv(data.frame(Message = "All coefficients shrank to zero after regularization."),
-                             file, row.names = FALSE)
-            return()
+            write.csv(data.frame(Message = "All coefficients shrank to zero after regularization."),
+                      feat_file, row.names = FALSE)
+          } else {
+            write.csv(df, feat_file, row.names = FALSE)
           }
         }
       }
-      utils::write.csv(df, file, row.names = FALSE)
+      files <- c(files, feat_file)
+      
+      # 2. Details CSV (key-value format)
+      details_file <- file.path(tmpdir, paste0("feature_selection_details", alpha_suffix, "_", subset_id, ".csv"))
+      det <- res$details %||% list(samples_before = NA, samples_after = NA, samples_dropped = NA)
+      
+      details_kv <- data.frame(
+        Key = c("Method", "Outcome variable", "Samples before filtering", 
+                "Samples after filtering", "Samples dropped"),
+        Value = c(res$method %||% NA,
+                  input$fs_outcome %||% NA,
+                  det$samples_before %||% NA,
+                  det$samples_after %||% NA,
+                  det$samples_dropped %||% NA),
+        stringsAsFactors = FALSE
+      )
+      
+      # Add method-specific details
+      if (identical(res$method, "Elastic Net") || identical(res$method, "Ridge Regression")) {
+        alpha_val <- if (identical(res$method, "Ridge Regression")) 0 else (input$fs_alpha %||% 0.5)
+        nfolds_val <- input$fs_nfolds %||% 5
+        details_kv <- rbind(details_kv, 
+                           data.frame(Key = "Alpha", Value = alpha_val, stringsAsFactors = FALSE),
+                           data.frame(Key = "CV folds", Value = nfolds_val, stringsAsFactors = FALSE))
+      } else if (identical(res$method, "Boruta")) {
+        maxruns <- input$fs_maxruns %||% 500
+        details_kv <- rbind(details_kv, 
+                           data.frame(Key = "Max runs", Value = maxruns, stringsAsFactors = FALSE))
+      }
+      
+      write.csv(details_kv, details_file, row.names = FALSE)
+      files <- c(files, details_file)
+      
+      # 3. Summary Plot PDF
+      plot_file <- file.path(tmpdir, paste0("feature_selection_summary_plot", alpha_suffix, "_", subset_id, ".pdf"))
+      
+      # Regenerate the plot
+      tol <- res$tolerance
+      if (identical(res$method, "Boruta")) {
+        df <- res$results
+        df <- df[abs(df$ImportanceMean) >= tol, , drop = FALSE]
+        if (nrow(df) > 0) {
+          df <- df[order(df$ImportanceMean, decreasing = TRUE), ]
+          df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
+          
+          gg <- ggplot2::ggplot(df,
+                                ggplot2::aes(x = reorder(Feature, ImportanceMean),
+                                             y = ImportanceMean,
+                                             fill = Decision)) +
+            ggplot2::geom_col(color = 'black', lwd = 0.4) +
+            ggplot2::coord_flip() +
+            ggplot2::labs(title = "Boruta feature importance",
+                          x = "Feature", y = "Mean importance") +
+            ggplot2::scale_fill_manual(values = c('Confirmed' = 'green4',
+                                                  'Rejected' = 'red4',
+                                                  'Tentative' = 'grey40')) +
+            ggplot2::theme_bw(base_size = 14)
+          
+          n_features <- nrow(df)
+          plot_height <- max(6, min(n_features * 0.3, 20))
+          ggplot2::ggsave(plot_file, gg, width = 10, height = plot_height)
+          files <- c(files, plot_file)
+        }
+      } else {
+        df <- res$results
+        df <- df[abs(df$Coef) >= tol, , drop = FALSE]
+        if (nrow(df) > 0) {
+          df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
+          
+          if ("Class" %in% names(df)) {
+            # Multinomial
+            top_n <- df %>%
+              dplyr::group_by(Class) %>%
+              dplyr::arrange(dplyr::desc(Coef), .by_group = TRUE)
+            
+            gg <- ggplot2::ggplot(top_n,
+                                  ggplot2::aes(x = reorder(Feature, Coef),
+                                               y = Coef,
+                                               fill = Coef)) +
+              ggplot2::geom_col(color = 'black', lwd = 0.4) +
+              ggplot2::facet_wrap(~Class, scales = "free_y") +
+              ggplot2::coord_flip() +
+              ggplot2::labs(title = paste(res$method, "coefficients (lambda.min)"),
+                            x = "Feature", y = "Coefficient") +
+              ggplot2::scale_fill_gradient(low = 'blue3', high = 'red3') +
+              ggplot2::theme_bw(base_size = 14)
+            
+            n_classes <- length(unique(df$Class))
+            max_features_per_class <- max(table(df$Class))
+            plot_height <- max(8, min((max_features_per_class * 0.3 * n_classes), 20))
+            ggplot2::ggsave(plot_file, gg, width = 12, height = plot_height)
+            files <- c(files, plot_file)
+          } else {
+            # Binary/continuous
+            df <- df[order(df$Coef, decreasing = TRUE), ]
+            
+            gg <- ggplot2::ggplot(df,
+                                  ggplot2::aes(x = reorder(Feature, Coef),
+                                               y = Coef,
+                                               fill = Coef)) +
+              ggplot2::geom_col(color = 'black', lwd = 0.4) +
+              ggplot2::coord_flip() +
+              ggplot2::labs(title = paste(res$method, "coefficients (lambda.min)"),
+                            x = "Feature", y = "Coefficient") +
+              ggplot2::scale_fill_gradient(low = 'blue3', high = 'red3') +
+              ggplot2::theme_bw(base_size = 14)
+            
+            n_features <- nrow(df)
+            plot_height <- max(6, min(n_features * 0.3, 20))
+            ggplot2::ggsave(plot_file, gg, width = 10, height = plot_height)
+            files <- c(files, plot_file)
+          }
+        }
+      }
+      
+      # Create zip file
+      zip::zip(file, files = basename(files), root = tmpdir, mode = "cherry-pick")
     },
-    contentType = "text/csv"
+    contentType = "application/zip"
   )
   
   observeEvent(list(rv$meta_sample, rv$abundance_sample), {
@@ -5482,11 +5834,17 @@ server <- function(input, output, session) {
       s <- lm_state()
       req(s, s$model)
       
+      # Build filename prefix from zip name components
+      model <- gsub("\\s+", "_", tolower(input$lm_model_type %||% "model"))
+      validation <- gsub("\\s+", "_", tolower(input$lm_validation %||% "validation"))
+      outcome <- gsub("\\s+", "_", tolower(input$lm_outcome %||% "outcome"))
+      prefix <- paste0(model, "_", validation, "_", outcome)
+      
       tmpdir <- tempdir()
       files <- c()
       
       # 1. Model Summary (key-value CSV)
-      summary_file <- file.path(tmpdir, paste0("model_summary", subset_id, ".csv"))
+      summary_file <- file.path(tmpdir, paste0(prefix, "_model_summary_", subset_id, ".csv"))
       summary_kv <- data.frame(
         Key = c("Model type", "Outcome variable", "Predictors",
                 "Validation strategy", "Null accuracy",
@@ -5505,7 +5863,7 @@ server <- function(input, output, session) {
       files <- c(files, summary_file)
       
       # 2. Performance Metrics (exactly as in UI)
-      perf_file <- file.path(tmpdir, paste0("performance_metrics", subset_id, ".csv"))
+      perf_file <- file.path(tmpdir, paste0(prefix, "_performance_metrics_", subset_id, ".csv"))
       perf_df <- tryCatch({
         build_perf_table(s, rv)
       }, error = function(e) data.frame(Message = "Error extracting performance metrics"))
@@ -5513,7 +5871,7 @@ server <- function(input, output, session) {
       files <- c(files, perf_file)
       
       # 3. Model Features (coefficients / importance with enforced column order)
-      feat_file <- file.path(tmpdir, paste0("model_features", subset_id, ".csv"))
+      feat_file <- file.path(tmpdir, paste0(prefix, "_model_features_", subset_id, ".csv"))
       feat_df <- NULL
       if (s$model$method %in% c("glm", "glmnet", "multinom")) {
         feat_df <- coef_table()
@@ -5538,7 +5896,7 @@ server <- function(input, output, session) {
       files <- c(files, feat_file)
       
       # 4. ROC Curve (PDF) - wider for multi-class
-      roc_file <- file.path(tmpdir, paste0("roc_curve", subset_id, ".pdf"))
+      roc_file <- file.path(tmpdir, paste0("roc_curve_", subset_id, ".pdf"))
       if (!is.null(s$roc_plot)) {
         # Determine if multi-class to adjust width
         n_classes <- nlevels(s$preds$obs)
@@ -6246,11 +6604,17 @@ server <- function(input, output, session) {
       s <- reg_state()
       req(s, s$model)
       
+      # Build filename prefix from zip name components
+      model <- gsub("\\s+", "_", tolower(input$reg_model_type %||% "model"))
+      validation <- gsub("\\s+", "_", tolower(input$reg_validation %||% "validation"))
+      outcome <- gsub("\\s+", "_", tolower(input$reg_outcome %||% "outcome"))
+      prefix <- paste0(model, "_", validation, "_", outcome)
+      
       tmpdir <- tempdir()
       files <- c()
       
       # 1. Model Summary (key-value CSV)
-      summary_file <- file.path(tmpdir, paste0("model_summary", subset_id, ".csv"))
+      summary_file <- file.path(tmpdir, paste0(prefix, "_model_summary_", subset_id, ".csv"))
       summary_kv <- data.frame(
         Key = c("Model type", "Outcome variable", "Predictors",
                 "Validation strategy", "Null RMSE",
@@ -6269,7 +6633,7 @@ server <- function(input, output, session) {
       files <- c(files, summary_file)
       
       # 2. Performance Metrics
-      perf_file <- file.path(tmpdir, paste0("performance_metrics", subset_id, ".csv"))
+      perf_file <- file.path(tmpdir, paste0(prefix, "_performance_metrics_", subset_id, ".csv"))
       perf_df <- tryCatch({
         build_reg_perf_table(s)
       }, error = function(e) data.frame(Message = "Error extracting performance metrics"))
@@ -6277,7 +6641,7 @@ server <- function(input, output, session) {
       files <- c(files, perf_file)
       
       # 3. Model Features
-      feat_file <- file.path(tmpdir, paste0("model_features", subset_id, ".csv"))
+      feat_file <- file.path(tmpdir, paste0(prefix, "_model_features_", subset_id, ".csv"))
       feat_df <- NULL
       if (s$model$method %in% c("lm", "glmnet")) {
         feat_df <- reg_coef_table()
@@ -6294,7 +6658,7 @@ server <- function(input, output, session) {
       files <- c(files, feat_file)
       
       # 4. Observed vs Predicted plot (PDF)
-      obs_pred_file <- file.path(tmpdir, paste0("observed_vs_predicted", subset_id, ".pdf"))
+      obs_pred_file <- file.path(tmpdir, paste0(prefix, "_observed_vs_predicted_", subset_id, ".pdf"))
       if (!is.null(s$obs_pred_plot)) {
         ggsave(obs_pred_file, plot = s$obs_pred_plot,
                device = if (capabilities("cairo")) cairo_pdf else pdf, 
@@ -6305,7 +6669,7 @@ server <- function(input, output, session) {
       files <- c(files, obs_pred_file)
       
       # 5. Residual plot (PDF)
-      resid_file <- file.path(tmpdir, "residuals_vs_fitted.pdf")
+      resid_file <- file.path(tmpdir, paste0(prefix, "_residuals_vs_fitted_", subset_id, ".pdf"))
       if (!is.null(s$residual_plot)) {
         ggsave(resid_file, plot = s$residual_plot,
                device = if (capabilities("cairo")) cairo_pdf else pdf, 
@@ -6319,6 +6683,1027 @@ server <- function(input, output, session) {
       zip::zip(zipfile = file, files = files, mode = "cherry-pick")
     },
     contentType = "application/zip"
+  )
+  
+  # ========== SCCOMP TAB LOGIC ==========
+  
+  # Helper functions for sccomp interval plots
+  interval_plots <- function(x, subset_id = NULL, contrasts_string = 'comparison') {
+    x$parameter <- gsub(pattern = contrasts_string, replacement = '', x = x$parameter)
+    
+    attr_x <- attributes(x)
+    res_x <- as.data.frame(x)
+    
+    # Remove Intercept parameter (not meaningful for interpretation)
+    res_x <- res_x[!grepl("Intercept", res_x$parameter, ignore.case = TRUE), ]
+    
+    if (nrow(res_x) == 0) {
+      return(list())
+    }
+    
+    param_split <- split(x = res_x, f = res_x$parameter)
+    
+    iterate_parameters <- function(x2) {
+      # Use cell_group column (sccomp standard) or celltype if it exists
+      celltype_col <- if ("cell_group" %in% colnames(x2)) "cell_group" else "celltype"
+      
+      factor_order <- x2[[celltype_col]][order(x2$c_effect, decreasing = FALSE)]
+      x2[[celltype_col]] <- factor(x2[[celltype_col]], levels = factor_order)
+      
+      param <- x2$parameter[1]
+      # Remove backticks from parameter names (common in contrasts)
+      param_clean <- gsub("`", "", param)
+      # For contrasts like "VariableLevel1 - VariableLevel2", remove prefix from both sides
+      if (grepl(" - ", param_clean)) {
+        # Split by " - ", remove prefix from each part, then rejoin
+        parts <- strsplit(param_clean, " - ")[[1]]
+        parts_clean <- sapply(parts, function(p) gsub("^[^_]+_", "", trimws(p)))
+        param_clean <- paste(parts_clean, collapse = " - ")
+      } else {
+        # Remove prefix before first underscore (e.g., "Status" from "StatusDiabetes_Bad_Control")
+        param_clean <- gsub("^[^_]+_", "", param_clean)
+      }
+      param_str <- gsub(pattern = '\\) \\- \\(', replacement = ') -\n(', x = param_clean)
+      param_str <- gsub(pattern = 'cmv', replacement = 'pp65', x = param_str) # hard-coded replacement
+      param_str <- gsub(pattern = 'HIVp', replacement = 'HIV+', x = param_str)
+      param_str <- gsub(pattern = 'HIVn', replacement = 'HIV-', x = param_str)
+      
+      # Build title and subtitle
+      subtitle_text <- if (!is.null(subset_id)) paste0("Subset ID: ", subset_id) else NULL
+      
+      int_pl <- ggplot(data = x2, mapping = aes(x = c_effect, y = .data[[celltype_col]], color = c_FDR < 0.05)) + 
+        geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") + 
+        geom_errorbar(aes(xmin = c_lower, xmax = c_upper, color = c_FDR < 0.05), linewidth = 0.8, width = 0.5) + 
+        geom_point(mapping = aes(fill = c_FDR < 0.05), size = 4, pch = 21, stroke = 0.4, color = 'black') + 
+        scale_color_manual(values = c("grey30", "red")) + 
+        scale_fill_manual(values = c("grey30", "red")) + 
+        labs(x = "Credible interval\n(log-odds scale)", 
+             y = 'Cell Group',
+             title = param_str,
+             subtitle = subtitle_text) + 
+        theme_bw(base_size = 14) + 
+        theme(axis.text.y = element_text(size = 16),
+              axis.ticks.y = element_blank(),  # Remove y-axis tick marks
+              axis.text.x = element_text(size = 15), 
+              axis.title.x = element_text(size = 16), 
+              axis.title.y = element_blank(), 
+              plot.title = element_text(size = 18, hjust = 0.5), 
+              plot.subtitle = element_text(size = 14, hjust = 0.5),
+              legend.position = 'bottom', 
+              legend.text = element_text(size = 14), 
+              legend.title = element_text(size = 15))
+      return(int_pl)
+    }
+    iterate_pl <- lapply(X = param_split, FUN = iterate_parameters)
+    return(iterate_pl)
+  }
+  
+  add_caption <- function(plot_obj) {
+    if (!requireNamespace("patchwork", quietly = TRUE)) {
+      return(plot_obj)  # Return plot without caption if patchwork not available
+    }
+    combined_plot <- plot_obj + 
+      patchwork::plot_annotation(
+        caption = paste0("Bayesian FDR: Stephens' method (doi: 10.1093/biostatistics/kxw041)\n", 
+                        "FDR-significant populations may cross fold change thresholds because Bayesian FDR considers posterior probabilities rather than p-values.\n", 
+                        "The method sorts null hypothesis probabilities in ascending order and calculates cumulative averages for robust false discovery control."),
+        theme = ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0))
+      )
+    return(combined_plot)
+  }
+  
+  # Update variable choices
+  observeEvent(rv$meta_sample, {
+    req(rv$meta_sample)
+    meta_cols <- colnames(rv$meta_sample)
+    categorical_choices <- sort(meta_cols[sapply(rv$meta_sample, function(x) is.character(x) || is.factor(x))])
+    categorical_choices <- setdiff(categorical_choices, c("patient_ID", "run_date", "source"))
+    categorical_choices <- filter_by_global_settings(categorical_choices)
+    
+    # For simple mode
+    updatePickerInput(session, "sccomp_group_var", choices = c("", categorical_choices))
+    updatePickerInput(session, "sccomp_formula_vars", choices = c("", categorical_choices))
+    
+    # For custom mode - show all variables including continuous
+    all_vars <- sort(colnames(rv$meta_sample))
+    all_vars <- setdiff(all_vars, c("run_date", "source"))
+    all_vars <- filter_by_global_settings(all_vars)
+    updatePickerInput(session, "sccomp_available_vars", choices = all_vars)
+  })
+  
+  # Update reference level choices when grouping variable changes
+  observeEvent(input$sccomp_group_var, {
+    req(rv$meta_sample, input$sccomp_group_var)
+    
+    if (input$sccomp_group_var == "") {
+      return()
+    }
+    
+    # Get unique levels from the selected grouping variable
+    if (input$sccomp_group_var %in% colnames(rv$meta_sample)) {
+      unique_levels <- sort(unique(as.character(rv$meta_sample[[input$sccomp_group_var]])))
+      unique_levels <- unique_levels[!is.na(unique_levels)]
+      
+      # Update picker with first level as default
+      updatePickerInput(session, "sccomp_reference_level", 
+                       choices = unique_levels,
+                       selected = unique_levels[1])
+    }
+  })
+  
+  # Reactive to store sccomp results
+  sccomp_state <- reactiveVal(NULL)
+  
+  # Run sccomp_estimate
+  observeEvent(input$run_sccomp, {
+    req(rv$meta_sample, rv$counts_sample)
+    
+    # Validate counts data exists
+    if (is.null(rv$counts_sample)) {
+      showNotification("No counts data available. sccomp requires obj$cluster$counts.", type = "error")
+      return()
+    }
+    
+    # Build formula based on mode
+    formula_str <- if (input$sccomp_formula_mode == "simple") {
+      req(input$sccomp_group_var)
+      group_var <- input$sccomp_group_var
+      formula_vars <- input$sccomp_formula_vars
+      
+      if (length(formula_vars) > 0) {
+        if (input$sccomp_interactions) {
+          # Use * for interactions
+          paste0("~ ", paste(c(group_var, formula_vars), collapse = " * "))
+        } else {
+          # Use + for additive effects
+          paste0("~ ", group_var, " + ", paste(formula_vars, collapse = " + "))
+        }
+      } else {
+        paste0("~ ", group_var)
+      }
+    } else {
+      # Custom mode
+      req(input$sccomp_custom_formula)
+      input$sccomp_custom_formula
+    }
+    
+    tryCatch({
+      # Log formula information
+      message("\n=== sccomp_estimate Configuration ===")
+      message("Formula mode: ", input$sccomp_formula_mode)
+      message("Formula string: ", formula_str)
+      message("Parsed formula: ", deparse(as.formula(formula_str)))
+      if (input$sccomp_formula_mode == "simple") {
+        message("Primary grouping variable: ", input$sccomp_group_var)
+        if (length(input$sccomp_formula_vars) > 0) {
+          message("Additional covariates: ", paste(input$sccomp_formula_vars, collapse = ", "))
+          message("Interactions enabled: ", input$sccomp_interactions)
+        }
+      }
+      
+      # Prepare data: convert counts matrix to long format with metadata
+      message("\n=== Data Preparation ===")
+      message("Counts matrix dimensions: ", nrow(rv$counts_sample), " samples × ", ncol(rv$counts_sample), " clusters")
+      message("Counts matrix rownames (first 3): ", paste(head(rownames(rv$counts_sample), 3), collapse = ", "))
+      
+      counts_long <- as.data.frame(rv$counts_sample) %>%
+        tibble::rownames_to_column("sample") %>%
+        tidyr::pivot_longer(cols = -sample, names_to = "cell_group", values_to = "count")
+      
+      message("Counts long format: ", nrow(counts_long), " rows")
+      message("Sample values in counts (first 3): ", paste(head(unique(counts_long$sample), 3), collapse = ", "))
+      
+      # Prepare metadata - use patient_ID column if it exists, otherwise use rownames
+      meta_df <- rv$meta_sample
+      if ("patient_ID" %in% colnames(meta_df)) {
+        # patient_ID column exists - use it as the merge key
+        message("Using patient_ID column from metadata for merging")
+        # Don't add rownames as a column, patient_ID is already there
+      } else {
+        # No patient_ID column - use rownames
+        message("Using metadata rownames for merging")
+        meta_df <- meta_df %>% tibble::rownames_to_column("patient_ID")
+      }
+      
+      message("Metadata dimensions: ", nrow(meta_df), " samples × ", ncol(meta_df), " variables")
+      message("Metadata patient_ID values (first 3): ", paste(head(meta_df$patient_ID, 3), collapse = ", "))
+      message("Metadata column names: ", paste(colnames(meta_df), collapse = ", "))
+      
+      # Check formula variables in metadata BEFORE merge
+      formula_vars_check <- all.vars(as.formula(formula_str))
+      message("\nChecking formula variables in metadata BEFORE merge:")
+      for (var in formula_vars_check) {
+        if (var %in% colnames(meta_df)) {
+          na_count <- sum(is.na(meta_df[[var]]))
+          unique_vals <- length(unique(meta_df[[var]][!is.na(meta_df[[var]])]))
+          message("  ", var, ": ", na_count, " NAs out of ", nrow(meta_df), " rows, ", 
+                  unique_vals, " unique non-NA values")
+          if (unique_vals > 0 && unique_vals <= 10) {
+            message("    Unique values: ", paste(head(unique(meta_df[[var]][!is.na(meta_df[[var]])]), 10), collapse = ", "))
+          }
+        } else {
+          message("  ", var, ": NOT FOUND in metadata")
+        }
+      }
+      
+      sccomp_data <- counts_long %>%
+        dplyr::left_join(meta_df, by = c("sample" = "patient_ID"))
+      
+      message("Merged data dimensions: ", nrow(sccomp_data), " rows × ", ncol(sccomp_data), " columns")
+      
+      # Remove rows with NA in formula variables
+      formula_vars_used <- all.vars(as.formula(formula_str))
+      message("Formula variables to check: ", paste(formula_vars_used, collapse = ", "))
+      
+      rows_before <- nrow(sccomp_data)
+      for (var in formula_vars_used) {
+        if (var %in% colnames(sccomp_data)) {
+          na_count <- sum(is.na(sccomp_data[[var]]))
+          if (na_count > 0) {
+            message("  Removing ", na_count, " rows with NA in variable: ", var)
+          }
+          sccomp_data <- sccomp_data %>% dplyr::filter(!is.na(.data[[var]]))
+        } else {
+          message("  WARNING: Variable '", var, "' not found in data columns")
+        }
+      }
+      message("Rows after NA filtering: ", nrow(sccomp_data), " (removed ", rows_before - nrow(sccomp_data), ")")
+      
+      # Check if all rows were filtered out
+      if (nrow(sccomp_data) == 0) {
+        stop("All rows were filtered out due to NA values in formula variables. ",
+             "Check that the selected variables have non-NA values in your metadata. ",
+             "Variables used in formula: ", paste(formula_vars_used, collapse = ", "))
+      }
+      
+      # Clean special characters in formula variables to prevent sccomp errors
+      # This must happen BEFORE releveling so the reference level matches the cleaned values
+      message("\n=== Cleaning Special Characters ===")
+      formula_vars_to_clean <- all.vars(as.formula(formula_str))
+      for (var in formula_vars_to_clean) {
+        if (var %in% colnames(sccomp_data)) {
+          original_vals <- unique(sccomp_data[[var]])
+          # Replace + with p and - with n
+          sccomp_data[[var]] <- gsub("\\+", "p", sccomp_data[[var]])
+          sccomp_data[[var]] <- gsub("\\-", "n", sccomp_data[[var]])
+          
+          cleaned_vals <- unique(sccomp_data[[var]])
+          if (!identical(sort(as.character(original_vals)), sort(as.character(cleaned_vals)))) {
+            message("  Cleaned variable '", var, "':")
+            message("    Original values: ", paste(head(original_vals, 10), collapse = ", "))
+            message("    Cleaned values: ", paste(head(cleaned_vals, 10), collapse = ", "))
+          }
+        }
+      }
+      
+      # Relevel variables based on mode
+      if (input$sccomp_formula_mode == "simple" && !is.null(input$sccomp_group_var) && 
+          input$sccomp_group_var != "" && !is.null(input$sccomp_reference_level)) {
+        # Simple mode: relevel the grouping variable
+        group_var <- input$sccomp_group_var
+        ref_level <- input$sccomp_reference_level
+        
+        # Clean the reference level to match the cleaned data
+        ref_level_cleaned <- gsub("\\+", "p", ref_level)
+        ref_level_cleaned <- gsub("\\-", "n", ref_level_cleaned)
+        
+        if (group_var %in% colnames(sccomp_data)) {
+          message("\n=== Releveling Grouping Variable ===")
+          message("Variable: ", group_var)
+          message("Reference level (original): ", ref_level)
+          message("Reference level (cleaned): ", ref_level_cleaned)
+          
+          sccomp_data[[group_var]] <- factor(sccomp_data[[group_var]])
+          sccomp_data[[group_var]] <- relevel(sccomp_data[[group_var]], ref = ref_level_cleaned)
+          
+          message("Factor levels after releveling: ", paste(levels(sccomp_data[[group_var]]), collapse = ", "))
+        }
+      } else if (input$sccomp_formula_mode == "custom" && 
+                 !is.null(input$sccomp_custom_reference_levels) && 
+                 input$sccomp_custom_reference_levels != "") {
+        # Custom mode: parse and apply reference levels
+        message("\n=== Releveling Variables (Custom Mode) ===")
+        ref_specs <- strsplit(input$sccomp_custom_reference_levels, ";")[[1]]
+        ref_specs <- trimws(ref_specs)
+        
+        for (spec in ref_specs) {
+          if (grepl("=", spec)) {
+            parts <- strsplit(spec, "=")[[1]]
+            if (length(parts) == 2) {
+              var_name <- trimws(parts[1])
+              ref_level <- trimws(parts[2])
+              
+              # Clean the reference level to match the cleaned data
+              ref_level_cleaned <- gsub("\\+", "p", ref_level)
+              ref_level_cleaned <- gsub("\\-", "n", ref_level_cleaned)
+              
+              if (var_name %in% colnames(sccomp_data)) {
+                message("Variable: ", var_name)
+                message("Reference level (original): ", ref_level)
+                message("Reference level (cleaned): ", ref_level_cleaned)
+                
+                sccomp_data[[var_name]] <- factor(sccomp_data[[var_name]])
+                sccomp_data[[var_name]] <- relevel(sccomp_data[[var_name]], ref = ref_level_cleaned)
+                
+                message("Factor levels after releveling: ", paste(levels(sccomp_data[[var_name]]), collapse = ", "))
+              } else {
+                message("Warning: Variable '", var_name, "' not found in data")
+              }
+            }
+          }
+        }
+      }
+      
+      # Log data structure
+      message("\n=== sccomp_data Structure ===")
+      message("Column names: ", paste(colnames(sccomp_data), collapse = ", "))
+      message("\nColumn types:")
+      for (col in colnames(sccomp_data)) {
+        message("  ", col, ": ", class(sccomp_data[[col]])[1])
+      }
+      message("\nFirst 6 rows of sccomp_data:")
+      print(head(sccomp_data))
+      
+      # Validate required columns
+      if (!"sample" %in% colnames(sccomp_data)) {
+        stop("'sample' column missing from sccomp_data")
+      }
+      if (!"cell_group" %in% colnames(sccomp_data)) {
+        stop("'cell_group' column missing from sccomp_data")
+      }
+      if (!"count" %in% colnames(sccomp_data)) {
+        stop("'count' column missing from sccomp_data")
+      }
+      
+      message("\nUnique samples: ", length(unique(sccomp_data$sample)))
+      message("Unique cell groups: ", length(unique(sccomp_data$cell_group)))
+      if (nrow(sccomp_data) > 0) {
+        message("Count range: ", min(sccomp_data$count), " to ", max(sccomp_data$count))
+      }
+      
+      # Run sccomp
+      if (!requireNamespace("sccomp", quietly = TRUE)) {
+        showNotification("sccomp package not installed. Install with: devtools::install_github('MangiolaLaboratory/sccomp')", 
+                        type = "error", duration = NULL)
+        return()
+      }
+      
+      message("\n=== Running sccomp_estimate ===")
+      message("Using ", input$sccomp_cores, " cores")
+      result <- sccomp::sccomp_estimate(
+        .data = sccomp_data,
+        formula_composition = as.formula(formula_str),
+        sample = "sample",
+        cell_group = "cell_group",
+        abundance = "count",
+        bimodal_mean_variability_association = FALSE, 
+        cores = input$sccomp_cores
+      )
+      message("sccomp_estimate completed successfully")
+      
+      # Automatically run sccomp_test to get FDR values (required for significance testing)
+      message("\n=== Running sccomp_test (automatic) ===")
+      result <- sccomp::sccomp_test(result)
+      message("sccomp_test completed successfully")
+      
+      # Store results
+      sccomp_state(list(
+        estimate_result = result,
+        test_result = NULL,
+        formula = formula_str,
+        n_samples = length(unique(sccomp_data$sample)),
+        n_clusters = length(unique(sccomp_data$cell_group))
+      ))
+      
+      output$sccomp_cleared_msg <- renderText(NULL)
+      showNotification("sccomp analysis completed!", type = "message", duration = 3)
+      
+    }, error = function(e) {
+      message("\n=== ERROR in sccomp_estimate ===")
+      message("Error message: ", e$message)
+      message("Error call: ", deparse(e$call))
+      message("\nFull traceback:")
+      print(traceback())
+      showNotification(paste("Error running sccomp_estimate:", e$message), type = "error", duration = NULL)
+    })
+  })
+  
+  # Run sccomp_test for contrasts
+  observeEvent(input$run_sccomp_test, {
+    s <- sccomp_state()
+    req(s, s$estimate_result, input$sccomp_contrast)
+    
+    contrast_str <- input$sccomp_contrast
+    
+    tryCatch({
+      if (!requireNamespace("sccomp", quietly = TRUE)) {
+        showNotification("sccomp package not installed.", type = "error")
+        return()
+      }
+      
+      # Run sccomp_test with contrast
+      test_result <- sccomp::sccomp_test(
+        s$estimate_result,
+        contrasts = contrast_str
+      )
+      
+      # Update state with test results
+      s$test_result <- test_result
+      sccomp_state(s)
+      
+      showNotification("sccomp_test completed!", type = "message", duration = 3)
+      
+    }, error = function(e) {
+      showNotification(paste("Error running sccomp_test:", e$message), type = "error", duration = NULL)
+    })
+  })
+  
+  # Clear results
+  observeEvent(input$reset_sccomp, {
+    sccomp_state(NULL)
+    output$sccomp_cleared_msg <- renderText("Results cleared. Configure settings and click 'Run sccomp_estimate'.")
+  })
+  
+  # Display available parameters for contrasts
+  output$sccomp_available_params <- renderPrint({
+    s <- sccomp_state()
+    req(s, s$estimate_result)
+    
+    # Get unique parameters (excluding NA and Intercept)
+    params <- unique(s$estimate_result$parameter)
+    params <- params[!is.na(params)]
+    params <- params[!grepl("Intercept", params, ignore.case = TRUE)]
+    
+    if (length(params) > 0) {
+      # Show parameters with backticks for clarity
+      params_formatted <- paste0("`", params, "`")
+      cat("Use these in contrasts:\n")
+      cat(paste(params_formatted, collapse = "\n"))
+      cat("\n\nExample contrast:\n")
+      if (length(params) >= 2) {
+        cat("`", params[1], "` - `", params[2], "`", sep = "")
+      } else {
+        cat("(Need at least 2 parameters for contrasts)")
+      }
+    } else {
+      cat("No parameters available for contrasts.\nNote: Standard model parameterization doesn't support post-hoc contrasts.\nUse '~ 0 + variable' formula instead.")
+    }
+  })
+  
+  # Check if results exist
+  output$hasSccompResults <- reactive({
+    !is.null(sccomp_state())
+  })
+  outputOptions(output, "hasSccompResults", suspendWhenHidden = FALSE)
+  
+  output$hasSccompTestResults <- reactive({
+    s <- sccomp_state()
+    !is.null(s) && !is.null(s$test_result)
+  })
+  outputOptions(output, "hasSccompTestResults", suspendWhenHidden = FALSE)
+  
+  # Warning for no-intercept formulas without contrasts
+  output$sccomp_intercept_warning <- renderUI({
+    s <- sccomp_state()
+    req(s)
+    
+    # Check if formula has no intercept (contains ~ 0 + or ~ -1 +)
+    has_no_intercept <- grepl("~\\s*(0|\\-1)\\s*\\+", s$formula)
+    
+    # Show warning whenever no intercept formula is used (regardless of contrast test)
+    if (has_no_intercept) {
+      tags$div(
+        style = "background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 15px; margin-bottom: 15px;",
+        tags$strong(style = "color: #856404;", "⚠ No-Intercept Formula Detected"),
+        tags$p(
+          style = "color: #856404; margin-top: 10px; margin-bottom: 0;",
+          "When using a no-intercept formula (e.g., ", tags$code("~ 0 + condition"), "),",
+          " the parameters represent absolute compositions for each group, not differences between groups.",
+          " Nearly all clusters will show 'significant' intervals because they test if composition differs from zero,",
+          " which is rarely meaningful."
+        ),
+        tags$p(
+          style = "color: #856404; margin-top: 10px; margin-bottom: 0;",
+          tags$strong("Recommendation:"), " Specify a custom contrast below (e.g., ",
+          tags$code("`conditionTreated` - `conditionControl`"),
+          ") to test meaningful differences between groups."
+        )
+      )
+    } else {
+      NULL
+    }
+  })
+  
+  # Summary output
+  output$sccomp_summary <- renderPrint({
+    s <- sccomp_state()
+    req(s)
+    
+    cat("Formula:", s$formula, "\n")
+    cat("Samples analyzed:", s$n_samples, "\n")
+    cat("Clusters tested:", s$n_clusters, "\n\n")
+    
+    # Extract test results from estimate
+    if (!is.null(s$estimate_result)) {
+      test_res <- s$estimate_result %>%
+        dplyr::filter(!is.na(c_effect))
+      
+      # Check if c_FDR column exists (from sccomp_test)
+      if ("c_FDR" %in% colnames(test_res)) {
+        sig_clusters <- sum(test_res$c_FDR < 0.05, na.rm = TRUE)
+        cat("Significant clusters (FDR < 0.05):", sig_clusters, "/", nrow(test_res), "\n")
+      } else {
+        cat("Note: Run sccomp_test to calculate FDR values\n")
+        cat("Total effects estimated:", nrow(test_res), "\n")
+      }
+    }
+    
+    # If contrast test was run
+    if (!is.null(s$test_result)) {
+      cat("\nContrast test performed\n")
+      if ("c_FDR" %in% colnames(s$test_result)) {
+        test_sig <- sum(s$test_result$c_FDR < 0.05, na.rm = TRUE)
+        cat("Significant in contrast (FDR < 0.05):", test_sig, "\n")
+      }
+    }
+  })
+  
+  # Conditional UI for significant clusters table
+  output$sccomp_table_ui <- renderUI({
+    s <- sccomp_state()
+    req(s)
+    
+    # Check if formula has no intercept
+    has_no_intercept <- grepl("~\\s*(0|\\-1)\\s*\\+", s$formula)
+    
+    # If no intercept, always show message instead of table (even after contrast test)
+    # The estimate_result table is not meaningful with no-intercept formulas
+    # Users should rely on the Contrast Test Results table instead
+    if (has_no_intercept) {
+      tagList(
+        h4("Significant Clusters"),
+        tags$div(
+          style = "background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; padding: 15px; margin-bottom: 15px;",
+          tags$p(
+            style = "color: #6c757d; margin-bottom: 0;",
+            tags$em("Table hidden: With no-intercept formulas, this table tests if composition differs from zero, ",
+            "which is not meaningful. Please specify a custom contrast above to test group differences. ",
+            "Significant results from your contrast will appear in the 'Contrast Test Results' section on the right.")
+          )
+        )
+      )
+    } else {
+      # Check if there are any significant results
+      has_results <- FALSE
+      if ("c_FDR" %in% colnames(s$estimate_result)) {
+        sig_df <- s$estimate_result %>%
+          dplyr::filter(!is.na(c_effect), c_FDR < 0.05, !grepl("Intercept", parameter, ignore.case = TRUE))
+        has_results <- nrow(sig_df) > 0
+      }
+      
+      if (has_results) {
+        tagList(
+          h4("Significant Clusters"),
+          tableOutput("sccomp_table")
+        )
+      } else {
+        tagList(
+          h4("Significant Clusters"),
+          tags$p(style = "color: #6c757d; font-style: italic;", "No significant clusters found at FDR < 0.05")
+        )
+      }
+    }
+  })
+  
+  # Results table
+  output$sccomp_table <- renderTable({
+    s <- sccomp_state()
+    req(s, s$estimate_result)
+    
+    # Check if c_FDR column exists
+    if (!"c_FDR" %in% colnames(s$estimate_result)) {
+      return(NULL)
+    }
+    
+    # Extract significant results from estimate, excluding Intercept
+    df <- s$estimate_result %>%
+      dplyr::filter(!is.na(c_effect), c_FDR < 0.05, !grepl("Intercept", parameter, ignore.case = TRUE)) %>%
+      dplyr::select(cell_group, parameter, c_effect, c_lower, c_upper, c_FDR) %>%
+      dplyr::arrange(c_FDR)
+    
+    if (nrow(df) == 0) {
+      return(NULL)
+    }
+    
+    df
+  }, digits = 6, sanitize.text.function = function(x) x)
+  
+  # Conditional UI for contrast test results table
+  output$sccomp_test_table_ui <- renderUI({
+    s <- sccomp_state()
+    req(s, s$test_result)
+    
+    # Check if there are any significant results
+    has_results <- FALSE
+    if ("c_FDR" %in% colnames(s$test_result)) {
+      sig_df <- s$test_result %>%
+        dplyr::filter(!is.na(c_effect), c_FDR < 0.05)
+      has_results <- nrow(sig_df) > 0
+    }
+    
+    if (has_results) {
+      tableOutput("sccomp_test_table")
+    } else {
+      tags$p(style = "color: #6c757d; font-style: italic;", "No significant clusters found at FDR < 0.05 for this contrast")
+    }
+  })
+  
+  # Contrast test results table
+  output$sccomp_test_table <- renderTable({
+    s <- sccomp_state()
+    req(s, s$test_result)
+    
+    # Check if c_FDR column exists
+    if (!"c_FDR" %in% colnames(s$test_result)) {
+      return(NULL)
+    }
+    
+    df <- s$test_result %>%
+      dplyr::filter(!is.na(c_effect), c_FDR < 0.05) %>%
+      dplyr::select(cell_group, parameter, c_effect, c_lower, c_upper, c_FDR) %>%
+      dplyr::arrange(c_FDR)
+    
+    if (nrow(df) == 0) {
+      return(NULL)
+    }
+    
+    df
+  }, digits = 6, sanitize.text.function = function(x) x)
+  
+  # Generate interval plot
+  sccomp_interval_plot <- reactive({
+    s <- sccomp_state()
+    req(s, s$estimate_result)
+    
+    # Check if c_FDR column exists
+    if (!"c_FDR" %in% colnames(s$estimate_result)) {
+      return(NULL)
+    }
+    
+    # Filter to rows with effect estimates
+    plot_data <- s$estimate_result %>%
+      dplyr::filter(!is.na(c_effect))
+    
+    if (nrow(plot_data) == 0) {
+      return(NULL)
+    }
+    
+    # Generate interval plots
+    subset_id <- rv$subset_id %||% "data"
+    plots_list <- interval_plots(x = plot_data, subset_id = subset_id, contrasts_string = '')
+    
+    if (length(plots_list) == 0) {
+      return(NULL)
+    }
+    
+    # If multiple parameters, combine them in 4 columns
+    if (length(plots_list) > 1) {
+      # Arrange plots in 4 columns
+      combined <- patchwork::wrap_plots(plots_list, ncol = 4)
+      plot_with_caption <- add_caption(combined)
+    } else {
+      plot_with_caption <- add_caption(plots_list[[1]])
+    }
+    
+    return(plot_with_caption)
+  })
+  
+  # Calculate dynamic height for interval plot
+  sccomp_plot_height <- reactive({
+    s <- sccomp_state()
+    req(s, s$estimate_result)
+    
+    if (!"c_FDR" %in% colnames(s$estimate_result)) {
+      return(400)
+    }
+    
+    plot_data <- s$estimate_result %>%
+      dplyr::filter(!is.na(c_effect))
+    
+    if (nrow(plot_data) == 0) {
+      return(400)
+    }
+    
+    # Get number of unique parameters (excluding Intercept) and cell groups
+    n_params <- length(unique(plot_data$parameter[!grepl("Intercept", plot_data$parameter, ignore.case = TRUE)]))
+    
+    if (n_params == 0) {
+      return(400)
+    }
+    
+    n_clusters <- s$n_clusters
+    
+    # Calculate more reasonable height based on clusters and rows
+    # With 4 columns, height is for rows (ceiling of n_params/4)
+    n_rows <- ceiling(n_params / 4)
+    
+    # Adjusted formula: base + (clusters * pixels_per_cluster)
+    # Reduced from 30px to 18px per cluster for more reasonable sizing
+    base_height <- 150
+    pixels_per_cluster <- 18
+    height_per_row <- base_height + (n_clusters * pixels_per_cluster)
+    total_height <- max(300, n_rows * height_per_row)
+    
+    return(total_height)
+  })
+  
+  # Calculate dynamic width for interval plot (for PDF export)
+  sccomp_plot_width <- reactive({
+    s <- sccomp_state()
+    req(s, s$estimate_result)
+    
+    if (!"c_FDR" %in% colnames(s$estimate_result)) {
+      return(16)
+    }
+    
+    plot_data <- s$estimate_result %>%
+      dplyr::filter(!is.na(c_effect))
+    
+    if (nrow(plot_data) == 0) {
+      return(16)
+    }
+    
+    # Get number of unique parameters (excluding Intercept)
+    n_params <- length(unique(plot_data$parameter[!grepl("Intercept", plot_data$parameter, ignore.case = TRUE)]))
+    
+    if (n_params == 0) {
+      return(16)
+    }
+    
+    # Width based on number of plots
+    # Single plot: 4 inches, 2-4 plots: 16 inches for 4-column layout
+    if (n_params == 1) {
+      return(4)  # Single plot width
+    } else if (n_params <= 4) {
+      return(16)  # Full width for up to 4 plots (4 columns)
+    } else {
+      return(16)  # Full width for multiple rows
+    }
+  })
+  
+  output$sccomp_interval_plot <- renderPlot({
+    plot <- sccomp_interval_plot()
+    req(plot)
+    plot
+  }, height = function() sccomp_plot_height(),
+     width = function() {
+       # Adjust width for plot layout
+       s <- sccomp_state()
+       if (is.null(s) || is.null(s$estimate_result)) return(1200)
+       
+       plot_data <- s$estimate_result %>%
+         dplyr::filter(!is.na(c_effect))
+       n_params <- length(unique(plot_data$parameter[!grepl("Intercept", plot_data$parameter, ignore.case = TRUE)]))
+       
+       if (n_params == 1) {
+         return(300)  # Single plot width
+       } else {
+         return(900)  # Increased width for 6/6 split
+       }
+     })
+  
+  # Download interval plot
+  output$download_sccomp_plot <- downloadHandler(
+    filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
+      s <- sccomp_state()
+      req(s)
+      
+      formula_clean <- gsub("[~\\s\\+\\*\\(\\)]", "_", s$formula)
+      formula_clean <- gsub("_{2,}", "_", formula_clean)
+      formula_clean <- gsub("^_|_$", "", formula_clean)
+      
+      paste0("sccomp_intervals_", formula_clean, "_", subset_id, ".pdf")
+    },
+    content = function(file) {
+      plot <- sccomp_interval_plot()
+      req(plot)
+      
+      s <- sccomp_state()
+      req(s, s$estimate_result)
+      
+      # Calculate height based on clusters and rows
+      plot_data <- s$estimate_result %>%
+        dplyr::filter(!is.na(c_effect))
+      
+      n_params <- length(unique(plot_data$parameter[!grepl("Intercept", plot_data$parameter, ignore.case = TRUE)]))
+      n_clusters <- s$n_clusters
+      n_rows <- ceiling(n_params / 4)  # 4 columns
+      
+      # Height calculation: adjusted for PDF (slightly different from screen)
+      base_height <- 4  # inches
+      height_per_cluster <- 0.17  # inches per cluster (slightly increased for better spacing)
+      height_per_row <- base_height + (n_clusters * height_per_cluster)
+      height_val <- max(5, n_rows * height_per_row)
+      
+      # Width from reactive function
+      width_val <- sccomp_plot_width()
+      
+      ggsave(file, plot = plot, device = if (capabilities("cairo")) cairo_pdf else pdf,
+             width = width_val, height = height_val, units = "in", limitsize = FALSE)
+    }
+  )
+  
+  # Export results
+  output$export_sccomp_results <- downloadHandler(
+    filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
+      s <- sccomp_state()
+      req(s)
+      
+      # Build descriptive name from formula
+      formula_clean <- gsub("[~\\s\\+\\*\\(\\)]", "_", s$formula)
+      formula_clean <- gsub("_{2,}", "_", formula_clean)
+      formula_clean <- gsub("^_|_$", "", formula_clean)
+      formula_clean <- tolower(formula_clean)
+      
+      paste0("sccomp_", formula_clean, "_", subset_id, ".csv")
+    },
+    content = function(file) {
+      s <- sccomp_state()
+      req(s)
+      
+      # Export both estimate and test results if available
+      if (!is.null(s$test_result)) {
+        df <- as.data.frame(s$test_result) %>%
+          dplyr::filter(!is.na(c_effect))
+        
+        # Select available columns
+        available_cols <- c("cell_group", "parameter", "c_effect", "c_lower", "c_upper", "c_p_value", "c_FDR")
+        available_cols <- available_cols[available_cols %in% colnames(df)]
+        
+        df <- df %>%
+          dplyr::select(dplyr::all_of(available_cols)) %>%
+          dplyr::arrange(c_FDR)
+      } else if (!is.null(s$estimate_result)) {
+        df <- as.data.frame(s$estimate_result) %>%
+          dplyr::filter(!is.na(c_effect))
+        
+        # Select available columns
+        available_cols <- c("cell_group", "parameter", "c_effect", "c_lower", "c_upper", "c_p_value", "c_FDR")
+        available_cols <- available_cols[available_cols %in% colnames(df)]
+        
+        df <- df %>%
+          dplyr::select(dplyr::all_of(available_cols)) %>%
+          dplyr::arrange(c_FDR)
+      } else {
+        df <- data.frame(Message = "No results available")
+      }
+      
+      write.csv(df, file, row.names = FALSE)
+    },
+    contentType = "text/csv"
+  )
+  
+  # Generate contrast interval plot
+  sccomp_contrast_plot <- reactive({
+    s <- sccomp_state()
+    req(s, s$test_result)
+    
+    # Check if c_FDR column exists
+    if (!"c_FDR" %in% colnames(s$test_result)) {
+      return(NULL)
+    }
+    
+    # Filter to rows with effect estimates
+    plot_data <- s$test_result %>%
+      dplyr::filter(!is.na(c_effect))
+    
+    if (nrow(plot_data) == 0) {
+      return(NULL)
+    }
+    
+    # Generate interval plots
+    subset_id <- rv$subset_id %||% "data"
+    plots_list <- interval_plots(x = plot_data, subset_id = subset_id, contrasts_string = 'contrast')
+    
+    if (length(plots_list) == 0) {
+      return(NULL)
+    }
+    
+    # If multiple parameters, combine them in 4 columns
+    if (length(plots_list) > 1) {
+      combined <- patchwork::wrap_plots(plots_list, ncol = 4)
+      plot_with_caption <- add_caption(combined)
+    } else {
+      plot_with_caption <- add_caption(plots_list[[1]])
+    }
+    
+    return(plot_with_caption)
+  })
+  
+  # Calculate dynamic height for contrast plot - match main plot height
+  sccomp_contrast_plot_height <- reactive({
+    # Use the same height as the main plot
+    return(sccomp_plot_height())
+  })
+  
+  # Calculate dynamic width for contrast plot
+  sccomp_contrast_plot_width <- reactive({
+    s <- sccomp_state()
+    req(s, s$test_result)
+    
+    if (!"c_FDR" %in% colnames(s$test_result)) {
+      return(16)
+    }
+    
+    plot_data <- s$test_result %>%
+      dplyr::filter(!is.na(c_effect))
+    
+    if (nrow(plot_data) == 0) {
+      return(16)
+    }
+    
+    n_params <- length(unique(plot_data$parameter))
+    
+    if (n_params == 0) {
+      return(32)  # Doubled from 16
+    }
+    
+    if (n_params == 1) {
+      return(8)  # Doubled from 4
+    } else if (n_params <= 4) {
+      return(32)  # Doubled from 16
+    } else {
+      return(32)  # Doubled from 16
+    }
+  })
+  
+  output$sccomp_contrast_plot <- renderPlot({
+    plot <- sccomp_contrast_plot()
+    req(plot)
+    plot
+  }, height = function() sccomp_contrast_plot_height(),
+     width = function() {
+       s <- sccomp_state()
+       if (is.null(s) || is.null(s$test_result)) return(2400)
+       
+       plot_data <- s$test_result %>%
+         dplyr::filter(!is.na(c_effect))
+       n_params <- length(unique(plot_data$parameter))
+       
+       if (n_params == 1) {
+         return(500)  # Single plot width
+       } else {
+         return(1600)  # Further increased width for better visibility
+       }
+     })
+  
+  # Download contrast interval plot
+  output$download_sccomp_contrast_plot <- downloadHandler(
+    filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
+      s <- sccomp_state()
+      req(s)
+      
+      # Get contrast string from test result parameters
+      contrast_name <- "contrast"
+      if (!is.null(s$test_result) && "parameter" %in% colnames(s$test_result)) {
+        params <- unique(s$test_result$parameter)
+        if (length(params) > 0) {
+          contrast_name <- gsub("[^A-Za-z0-9_]", "_", params[1])
+        }
+      }
+      
+      paste0("sccomp_contrast_intervals_", contrast_name, "_", subset_id, ".pdf")
+    },
+    content = function(file) {
+      plot <- sccomp_contrast_plot()
+      req(plot)
+      
+      s <- sccomp_state()
+      req(s, s$test_result)
+      
+      # Calculate height to match main plot - use same formula
+      plot_data <- s$estimate_result %>%
+        dplyr::filter(!is.na(c_effect))
+      
+      n_params <- length(unique(plot_data$parameter[!grepl("Intercept", plot_data$parameter, ignore.case = TRUE)]))
+      n_clusters <- s$n_clusters
+      n_rows <- ceiling(n_params / 4)  # 4 columns to match main plot
+      
+      # Height calculation - same as main plot
+      base_height <- 4
+      height_per_cluster <- 0.17
+      height_per_row <- base_height + (n_clusters * height_per_cluster)
+      height_val <- max(5, n_rows * height_per_row)
+      
+      # Width from reactive function
+      width_val <- sccomp_contrast_plot_width()
+      
+      ggsave(file, plot = plot, device = if (capabilities("cairo")) cairo_pdf else pdf,
+             width = width_val, height = height_val, units = "in", limitsize = FALSE)
+    }
   )
   
 }
