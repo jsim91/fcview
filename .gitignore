@@ -48,3 +48,6 @@ po/*~
 # RStudio Connect folder
 rsconnect/
 .ssh/
+
+# sccomp intermediate draws directory
+sccomp_draws_files/

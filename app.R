@@ -6751,7 +6751,8 @@ server <- function(input, output, session) {
               plot.subtitle = element_text(size = 14, hjust = 0.5),
               legend.position = 'bottom', 
               legend.text = element_text(size = 14), 
-              legend.title = element_text(size = 15))
+              legend.title.position = 'top', 
+              legend.title = element_text(size = 15, hjust = 0.5))
       return(int_pl)
     }
     iterate_pl <- lapply(X = param_split, FUN = iterate_parameters)
@@ -7050,21 +7051,41 @@ server <- function(input, output, session) {
       
       message("\n=== Running sccomp_estimate ===")
       message("Using ", input$sccomp_cores, " cores")
-      result <- sccomp::sccomp_estimate(
-        .data = sccomp_data,
-        formula_composition = as.formula(formula_str),
-        sample = "sample",
-        cell_group = "cell_group",
-        abundance = "count",
-        bimodal_mean_variability_association = FALSE, 
-        cores = input$sccomp_cores
-      )
-      message("sccomp_estimate completed successfully")
-      
-      # Automatically run sccomp_test to get FDR values (required for significance testing)
-      message("\n=== Running sccomp_test (automatic) ===")
-      result <- sccomp::sccomp_test(result)
-      message("sccomp_test completed successfully")
+
+      # Run sccomp inside a per-call temporary directory and remove intermediate files
+      tmpdir <- tempfile("sccomp_draws_")
+      dir.create(tmpdir, showWarnings = FALSE, recursive = TRUE)
+      oldwd <- getwd()
+      setwd(tmpdir)
+      tmp_result <- NULL
+      tryCatch({
+        tmp_result <- sccomp::sccomp_estimate(
+          .data = sccomp_data,
+          formula_composition = as.formula(formula_str),
+          sample = "sample",
+          cell_group = "cell_group",
+          abundance = "count",
+          bimodal_mean_variability_association = FALSE,
+          cores = input$sccomp_cores
+        )
+        message("sccomp_estimate completed successfully")
+
+        # Automatically run sccomp_test to get FDR values (required for significance testing)
+        message("\n=== Running sccomp_test (automatic) ===")
+        tmp_result <- sccomp::sccomp_test(tmp_result)
+        message("sccomp_test completed successfully")
+      }, error = function(e) {
+        stop(e)
+      }, finally = {
+        # Restore working directory and clean up temporary files
+        try(setwd(oldwd), silent = TRUE)
+        if (dir.exists(tmpdir)) {
+          try(unlink(tmpdir, recursive = TRUE, force = TRUE), silent = TRUE)
+        }
+      })
+
+      # Use the result from the temporary run
+      result <- tmp_result
       
       # Store results
       sccomp_state(list(
@@ -7076,7 +7097,7 @@ server <- function(input, output, session) {
       ))
       
       output$sccomp_cleared_msg <- renderText(NULL)
-      showNotification("sccomp analysis completed!", type = "message", duration = 3)
+      showNotification("sccomp analysis completed — intermediate files removed.", type = "message", duration = 5)
       
     }, error = function(e) {
       message("\n=== ERROR in sccomp_estimate ===")
