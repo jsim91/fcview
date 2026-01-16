@@ -30,6 +30,7 @@ suppressPackageStartupMessages({
     library(randomForest)
     library(multiROC) # for multiclass ROC curves
     library(zip) # for ZIP download handlers
+    # also requires patchwork and sccomp
   })
 })
 
