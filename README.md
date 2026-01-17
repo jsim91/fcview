@@ -1,4 +1,8 @@
 # shiny app for exploring [FCSimple](https://github.com/jsim91/FCSimple) results
+
+<b>TODO:</b></br>
+- update interval plots to correctly identify contrast string for removal from titles
+
 The input object, saved in .RData format, should contain the following elements, as formatted by FCSimple functions unless otherwise noted:
   - data `[required]`
   - source `[required]`
