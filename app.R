@@ -6689,8 +6689,21 @@ server <- function(input, output, session) {
   # ========== SCCOMP TAB LOGIC ==========
   
   # Helper functions for sccomp interval plots
-  interval_plots <- function(x, subset_id = NULL, contrasts_string = 'comparison') {
-    x$parameter <- gsub(pattern = contrasts_string, replacement = '', x = x$parameter)
+  interval_plots <- function(x, subset_id = NULL) {
+    # Derive contrasts_string from a 'factor' column if present and non-NA;
+    # otherwise leave parameter names untouched. This prevents gsub() being
+    # called with NA (which would produce all-NA parameters) when plotting
+    # contrast results where 'factor' may be absent or all-NA.
+    contrasts_string <- NA_character_
+    if ("factor" %in% colnames(x)) {
+      non_na <- x$factor[!is.na(x$factor)]
+      if (length(non_na) > 0) contrasts_string <- as.character(non_na[1])
+    }
+    if (!is.na(contrasts_string) && nzchar(contrasts_string)) {
+      x$parameter <- gsub(pattern = contrasts_string, replacement = '', x = as.character(x$parameter))
+    } else {
+      x$parameter <- as.character(x$parameter)
+    }
     
     attr_x <- attributes(x)
     res_x <- as.data.frame(x)
@@ -6714,15 +6727,17 @@ server <- function(input, output, session) {
       param <- x2$parameter[1]
       # Remove backticks from parameter names (common in contrasts)
       param_clean <- gsub("`", "", param)
-      # For contrasts like "VariableLevel1 - VariableLevel2", remove prefix from both sides
-      if (grepl(" - ", param_clean)) {
-        # Split by " - ", remove prefix from each part, then rejoin
-        parts <- strsplit(param_clean, " - ")[[1]]
-        parts_clean <- sapply(parts, function(p) gsub("^[^_]+_", "", trimws(p)))
-        param_clean <- paste(parts_clean, collapse = " - ")
-      } else {
-        # Remove prefix before first underscore (e.g., "Status" from "StatusDiabetes_Bad_Control")
-        param_clean <- gsub("^[^_]+_", "", param_clean)
+      if(F){ # will come back to this later
+        # For contrasts like "VariableLevel1 - VariableLevel2", remove prefix from both sides
+        if (grepl(" - ", param_clean)) {
+          # Split by " - ", remove prefix from each part, then rejoin
+          parts <- strsplit(param_clean, " - ")[[1]]
+          parts_clean <- sapply(parts, function(p) gsub("^[^_]+_", "", trimws(p)))
+          param_clean <- paste(parts_clean, collapse = " - ")
+        } else {
+          # Remove prefix before first underscore (e.g., "Status" from "StatusDiabetes_Bad_Control")
+          param_clean <- gsub("^[^_]+_", "", param_clean)
+        }
       }
       param_str <- gsub(pattern = '\\) \\- \\(', replacement = ') -\n(', x = param_clean)
       param_str <- gsub(pattern = 'cmv', replacement = 'pp65', x = param_str) # hard-coded replacement
@@ -6731,7 +6746,34 @@ server <- function(input, output, session) {
       
       # Build title and subtitle
       subtitle_text <- if (!is.null(subset_id)) paste0("Subset ID: ", subset_id) else NULL
-      
+
+      # Title wrapping: only allow breaks at ' - ' separators while respecting
+      # the maximum width. If no separators present, fall back to standard wrap.
+      title_wrapped <- param_str
+      if (nchar(param_str) > 50) {
+        if (grepl(" - ", param_str)) {
+          parts <- stringr::str_split(param_str, " - ")[[1]]
+          parts <- stringr::str_trim(parts)
+          lines <- character(0)
+          cur <- parts[1]
+          if (length(parts) > 1) {
+            for (i in seq(2, length(parts))) {
+              cand <- paste(cur, parts[i], sep = " - ")
+              if (nchar(cand) <= 50) {
+                cur <- cand
+              } else {
+                lines <- c(lines, cur)
+                cur <- parts[i]
+              }
+            }
+          }
+          lines <- c(lines, cur)
+          title_wrapped <- paste(lines, collapse = " -\n")
+        } else {
+          title_wrapped <- stringr::str_wrap(param_str, width = 50)
+        }
+      }
+
       int_pl <- ggplot(data = x2, mapping = aes(x = c_effect, y = .data[[celltype_col]], color = c_FDR < 0.05)) + 
         geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") + 
         geom_errorbar(aes(xmin = c_lower, xmax = c_upper, color = c_FDR < 0.05), linewidth = 0.8, width = 0.5) + 
@@ -6740,7 +6782,7 @@ server <- function(input, output, session) {
         scale_fill_manual(values = c("grey30", "red")) + 
         labs(x = "Credible interval\n(log-odds scale)", 
              y = 'Cell Group',
-             title = param_str,
+             title = title_wrapped,
              subtitle = subtitle_text) + 
         theme_bw(base_size = 14) + 
         theme(axis.text.y = element_text(size = 16),
@@ -7088,13 +7130,15 @@ server <- function(input, output, session) {
       # Use the result from the temporary run
       result <- tmp_result
       
-      # Store results
+      # Store results (capture subset_id used for this run so subsequent UI
+      # changes to `rv$subset_id` do not retroactively change these plots)
       sccomp_state(list(
         estimate_result = result,
         test_result = NULL,
         formula = formula_str,
         n_samples = length(unique(sccomp_data$sample)),
-        n_clusters = length(unique(sccomp_data$cell_group))
+        n_clusters = length(unique(sccomp_data$cell_group)),
+        subset_id = rv$subset_id %||% "data"
       ))
       
       output$sccomp_cleared_msg <- renderText(NULL)
@@ -7380,9 +7424,10 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    # Generate interval plots
-    subset_id <- rv$subset_id %||% "data"
-    plots_list <- interval_plots(x = plot_data, subset_id = subset_id, contrasts_string = '')
+    # Generate interval plots using the subset_id captured when sccomp was run
+    s <- sccomp_state()
+    subset_id <- s$subset_id %||% "data"
+    plots_list <- interval_plots(x = plot_data, subset_id = subset_id)
     
     if (length(plots_list) == 0) {
       return(NULL)
@@ -7605,9 +7650,10 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    # Generate interval plots
-    subset_id <- rv$subset_id %||% "data"
-    plots_list <- interval_plots(x = plot_data, subset_id = subset_id, contrasts_string = 'contrast')
+    # Generate interval plots using the subset_id captured when sccomp was run
+    s <- sccomp_state()
+    subset_id <- s$subset_id %||% "data"
+    plots_list <- interval_plots(x = plot_data, subset_id = subset_id)
     
     if (length(plots_list) == 0) {
       return(NULL)
