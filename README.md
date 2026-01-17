@@ -13,7 +13,7 @@ Load time scales with object size. Consider subsampling obj$data and all element
 
 **Recommended Object Layout**
 
-This app expects a named list-like object (example: `obj_small`) with the following top-level elements.
+This app expects a named list-like object (format: `.RData`) with the following top-level elements.
 
 Top-level structure
 
