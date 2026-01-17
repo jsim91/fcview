@@ -55,5 +55,5 @@ Top-level structure
 | --- | --- | --- | --- |
 | `heatmap_tile_data` | numeric matrix | Heatmap data | FCSimple::fcs_cluster_heatmap |
 
-<b>IMPORTANT:</b> </br>
-Delete the `obj$cluster_heatmap$heatmap` and `obj$cluster_heatmap$rep_used` elements of `obj$cluster_heatmap` if present; `heatmap` and `rep_used` are not needed for fcview and will cut down on file size if set to NULL. Reminder: `obj$cluster_heatmap` must remain type list after dropping `heatmap` and `rep_used` elements.
+<b>NOTE:</b> </br>
+You may delete the `obj$cluster_heatmap$heatmap` and `obj$cluster_heatmap$rep_used` elements of `obj$cluster_heatmap` if present; `heatmap` and `rep_used` are not needed for fcview and it will cut down on file size if these are set to NULL. Reminder: `obj$cluster_heatmap` must remain type list after dropping `heatmap` and `rep_used` elements.
