@@ -1956,7 +1956,8 @@ server <- function(input, output, session) {
                 column(6, actionButton(mean_btn_id, "Mean", class = "btn-sm btn-default", style = "width: 100%;")),
                 column(6, actionButton(median_btn_id, "Median", class = "btn-sm btn-default", style = "width: 100%;"))
               ),
-              uiOutput(paste0(ns_id, "_slider_ui"))
+              uiOutput(paste0(ns_id, "_slider_ui")),
+              checkboxInput(paste0(ns_id, "_exclude_missing"), "Exclude NA values", value = isTRUE(isolate(input[[paste0(ns_id, "_exclude_missing")]])))
             )
           })
           
@@ -2024,10 +2025,10 @@ server <- function(input, output, session) {
           }, ignoreInit = TRUE)
           
         } else {
-          # Categorical column: show pickerInput
+          # Categorical column: show pickerInput + option to exclude missing/blank
           unique_vals <- sort(unique(as.character(col_data)))
           unique_vals <- unique_vals[!is.na(unique_vals)]
-          
+
           # Use isolate to read current values without creating dependency
           current_values <- isolate(input[[values_input_id]])
           if (is.null(current_values)) {
@@ -2038,22 +2039,25 @@ server <- function(input, output, session) {
             selected_vals <- intersect(current_values, unique_vals)
             if (length(selected_vals) == 0) selected_vals <- unique_vals
           }
-          
+
           output[[values_ui_id]] <- renderUI({
-            pickerInput(
-              values_input_id,
-              "Values to keep",
-              choices = unique_vals,
-              selected = selected_vals,
-              multiple = TRUE,
-              options = list(
-                `actions-box` = TRUE,
-                `selected-text-format` = "count > 3",
-                `deselect-all-text` = "Deselect All",
-                `select-all-text` = "Select All",
-                `none-selected-text` = "No values selected",
-                `live-search` = TRUE
-              )
+            tagList(
+              pickerInput(
+                values_input_id,
+                "Values to keep",
+                choices = unique_vals,
+                selected = selected_vals,
+                multiple = TRUE,
+                options = list(
+                  `actions-box` = TRUE,
+                  `selected-text-format` = "count > 3",
+                  `deselect-all-text` = "Deselect All",
+                  `select-all-text` = "Select All",
+                  `none-selected-text` = "No values selected",
+                  `live-search` = TRUE
+                )
+              ),
+              # (No exclude checkbox for categorical columns)
             )
           })
         }
@@ -2121,14 +2125,18 @@ server <- function(input, output, session) {
           if (!is.null(operator) && operator %in% c("range_internal", "range_external")) {
             # threshold should be a vector of length 2 for ranges
             if (!is.null(threshold) && length(threshold) == 2) {
+              exclude_missing <- isTRUE(input[[paste0(ns_id, "_exclude_missing")]])
               list(column = col, type = "numeric", operator = operator, 
-                   threshold_min = threshold[1], threshold_max = threshold[2])
+                   threshold_min = threshold[1], threshold_max = threshold[2],
+                   exclude_missing = exclude_missing)
             } else {
               NULL  # Invalid range rule
             }
           } else {
             # Single threshold for above/below
-            list(column = col, type = "numeric", operator = operator, threshold = threshold)
+            exclude_missing <- isTRUE(input[[paste0(ns_id, "_exclude_missing")]])
+            list(column = col, type = "numeric", operator = operator, threshold = threshold,
+                 exclude_missing = exclude_missing)
           }
         } else {
           # Categorical rule
@@ -2144,7 +2152,8 @@ server <- function(input, output, session) {
     rules_list <- Filter(function(r) {
       if (is.null(r) || is.null(r$column)) return(FALSE)
       if (r$type == "categorical") {
-        !is.null(r$values) && length(r$values) > 0
+        # Require at least one selected value for categorical rules
+        (!is.null(r$values) && length(r$values) > 0)
       } else if (r$type == "numeric") {
         if (!is.null(r$operator) && r$operator %in% c("range_internal", "range_external")) {
           # Range rule validation
@@ -2172,19 +2181,44 @@ server <- function(input, output, session) {
       for (rule in rules_list) {
         if (rule$type == "categorical") {
           col_vals <- as.character(meta_orig[[rule$column]])
-          keep_mask <- keep_mask & (col_vals %in% rule$values)
+          # Build condition: if values specified, match them; otherwise default to TRUE
+          if (!is.null(rule$values) && length(rule$values) > 0) {
+            cond <- col_vals %in% rule$values
+          } else {
+            cond <- rep(TRUE, length(col_vals))
+          }
+          keep_mask <- keep_mask & cond
         } else if (rule$type == "numeric") {
           col_vals <- meta_orig[[rule$column]]
+          excl_missing <- !is.null(rule$exclude_missing) && isTRUE(rule$exclude_missing)
           if (rule$operator == "above") {
-            keep_mask <- keep_mask & (col_vals >= rule$threshold | is.na(col_vals))
+            if (excl_missing) {
+              cond <- (col_vals >= rule$threshold) & !is.na(col_vals)
+            } else {
+              cond <- (col_vals >= rule$threshold) | is.na(col_vals)
+            }
+            keep_mask <- keep_mask & cond
           } else if (rule$operator == "below") {
-            keep_mask <- keep_mask & (col_vals <= rule$threshold | is.na(col_vals))
+            if (excl_missing) {
+              cond <- (col_vals <= rule$threshold) & !is.na(col_vals)
+            } else {
+              cond <- (col_vals <= rule$threshold) | is.na(col_vals)
+            }
+            keep_mask <- keep_mask & cond
           } else if (rule$operator == "range_internal") {
-            # Keep values within range (inclusive)
-            keep_mask <- keep_mask & ((col_vals >= rule$threshold_min & col_vals <= rule$threshold_max) | is.na(col_vals))
+            if (excl_missing) {
+              cond <- (col_vals >= rule$threshold_min & col_vals <= rule$threshold_max) & !is.na(col_vals)
+            } else {
+              cond <- (col_vals >= rule$threshold_min & col_vals <= rule$threshold_max) | is.na(col_vals)
+            }
+            keep_mask <- keep_mask & cond
           } else if (rule$operator == "range_external") {
-            # Keep values outside range (inclusive of boundaries)
-            keep_mask <- keep_mask & ((col_vals <= rule$threshold_min | col_vals >= rule$threshold_max) | is.na(col_vals))
+            if (excl_missing) {
+              cond <- (col_vals <= rule$threshold_min | col_vals >= rule$threshold_max) & !is.na(col_vals)
+            } else {
+              cond <- (col_vals <= rule$threshold_min | col_vals >= rule$threshold_max) | is.na(col_vals)
+            }
+            keep_mask <- keep_mask & cond
           }
         }
       }
@@ -2195,7 +2229,12 @@ server <- function(input, output, session) {
       for (rule in rules_list) {
         if (rule$type == "categorical") {
           col_vals <- as.character(meta_orig[[rule$column]])
-          keep_mask <- keep_mask | (col_vals %in% rule$values)
+          if (!is.null(rule$values) && length(rule$values) > 0) {
+            cond <- col_vals %in% rule$values
+          } else {
+            cond <- rep(FALSE, length(col_vals))
+          }
+          keep_mask <- keep_mask | cond
         } else if (rule$type == "numeric") {
           col_vals <- meta_orig[[rule$column]]
           if (rule$operator == "above") {
