@@ -1,7 +1,6 @@
 # shiny app for exploring [FCSimple](https://github.com/jsim91/FCSimple) results
 
 <b>TODO:</b></br>
-- update interval plots to correctly identify contrast string for removal from titles
 
 The input object, saved in .RData format, should contain the following elements, as formatted by FCSimple functions unless otherwise noted:
   - data `[required]`
@@ -13,6 +12,7 @@ The input object, saved in .RData format, should contain the following elements,
   - cluster `[required]`
   - cluster_heatmap `[required]`
 
+See [FEATURES.md](FEATURES.md) for a full list of app features (general and comprehensive).
 For compatibility, the cluster element should be renamed to "cluster" and the heatmap element renamed to "cluster_heatmap", no matter what algorithm was used during the calculation phase. The heatmap plot object can be dropped to shrink file size. Only the underlying heatmap matrix data is required. See layout below for more on this.
 
 **Recommended Object Layout**
