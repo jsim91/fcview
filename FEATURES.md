@@ -8,7 +8,7 @@
 - Downsampling: optional per-upload cell downsampling.
 - Metadata Mapping: coherent mapping of per-sample metadata with per-cell metadata.
 - Metadata Feature Quick Actions: hide features or set custom data types for features (continuous -> categorical or categorical -> continuous).
-- Subsetting Rules: build, apply, preview, and export per-sample subsetting rules (numeric and categorical).
+- Subsetting Rules: build, apply, preview, and export per-sample/feature subsetting rules (numeric and categorical).
 - Pairing Support: select the metadata variable that should be used for paired testing if repeated measures were taken.
 - Paired Testing Autodetection: app backend detects if paired testing can be done and updates UI options in real-time.
 - Data Modeling Tasks: mult-method support for feature selection and prediction modeling along continuous and categorical endpoints.
