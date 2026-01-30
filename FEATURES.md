@@ -108,9 +108,3 @@
 
 - Multiple Download Handlers: metadata, counts, frequencies, sccomp CSVs, sccomp PDF plots, model ZIP bundles, heatmap PDFs, and rendered embeddings PDFs.
 - Human-Readable Summaries: `global_settings_summary`, pairing summaries, and subsetting preview UI provide concise overviews.
-
-### Developer & Debugging Aids
-
-- Verbose Messages: server prints and messages for tracing upload and sccomp steps.
-- Caching for Plots: `cat_plot_cache` and `cont_plot_cache` reactiveVals for expensive plotting reuse.
-- Internal Flags: `rv$data_ready` used to gate expensive/reactive updates.
