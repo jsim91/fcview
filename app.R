@@ -7679,15 +7679,26 @@ server <- function(input, output, session) {
         }
 
         # Clean special characters in formula variables to prevent sccomp errors
+        # Only sanitize character/factor variables (do NOT coerce numeric/integer columns)
         # This must happen BEFORE releveling so the reference level matches the cleaned values
         message("\n=== Cleaning Special Characters ===")
         formula_vars_to_clean <- all.vars(as.formula(formula_str))
         for (var in formula_vars_to_clean) {
           if (var %in% colnames(sccomp_data)) {
             original_vals <- unique(sccomp_data[[var]])
-            # Replace + with p and - with n
-            sccomp_data[[var]] <- gsub("\\+", "p", sccomp_data[[var]])
-            sccomp_data[[var]] <- gsub("\\-", "n", sccomp_data[[var]])
+
+            # Only operate on factors or character vectors; leave numeric/integer untouched
+            if (is.factor(sccomp_data[[var]])) {
+              # Clean factor levels in-place
+              levels(sccomp_data[[var]]) <- gsub("\\+", "p", levels(sccomp_data[[var]]))
+              levels(sccomp_data[[var]]) <- gsub("\\-", "n", levels(sccomp_data[[var]]))
+            } else if (is.character(sccomp_data[[var]])) {
+              sccomp_data[[var]] <- gsub("\\+", "p", sccomp_data[[var]])
+              sccomp_data[[var]] <- gsub("\\-", "n", sccomp_data[[var]])
+            } else {
+              # Numeric or other types: skip cleaning to preserve type
+              next
+            }
 
             cleaned_vals <- unique(sccomp_data[[var]])
             if (!identical(sort(as.character(original_vals)), sort(as.character(cleaned_vals)))) {
@@ -7743,11 +7754,15 @@ server <- function(input, output, session) {
                   message("Variable: ", var_name)
                   message("Reference level (original): ", ref_level)
                   message("Reference level (cleaned): ", ref_level_cleaned)
+                  
+                  if(mean(class(sccomp_data[[var_name]]) %in% c('factor','character'))!=0) {
+                    sccomp_data[[var_name]] <- factor(sccomp_data[[var_name]])
+                    sccomp_data[[var_name]] <- relevel(sccomp_data[[var_name]], ref = ref_level_cleaned)
+                    message("Factor levels after releveling: ", paste(levels(sccomp_data[[var_name]]), collapse = ", "))
+                  } else {
+                    message("Term is not categorical; skipping releveling: ", var_name)
+                  }
 
-                  sccomp_data[[var_name]] <- factor(sccomp_data[[var_name]])
-                  sccomp_data[[var_name]] <- relevel(sccomp_data[[var_name]], ref = ref_level_cleaned)
-
-                  message("Factor levels after releveling: ", paste(levels(sccomp_data[[var_name]]), collapse = ", "))
                 } else {
                   message("Warning: Variable '", var_name, "' not found in data")
                 }
