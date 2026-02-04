@@ -1196,7 +1196,7 @@ ui <- navbarPage(
         conditionalPanel(
           condition = "output.hasSccompResults",
           h5("Post-hoc Contrasts"),
-          helpText("After running sccomp_estimate with '~ 0 + variable', you can test specific contrasts."),
+          helpText("After running sccomp_estimate, you can test specific contrasts below."),
           helpText(strong("Available parameters for contrasts:")),
           helpText("Use backticks (`) around parameter names. See options below."),
           verbatimTextOutput("sccomp_available_params"),
