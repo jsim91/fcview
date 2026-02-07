@@ -832,7 +832,22 @@ ui <- navbarPage(
         br(),
         downloadButton("export_heatmap_pdf", "Export heatmap as PDF")
       ),
-      column(9, plotOutput("cluster_heatmap", height = "700px"))
+      column(
+        9, 
+        plotOutput("cluster_heatmap", height = "700px"),
+        br(),
+        hr(),
+        h4("Cluster Annotation Engine"),
+        helpText("Define cell types and assign clusters to them. Annotations are used throughout the app when 'Celltypes' is selected."),
+        uiOutput("celltype_annotations_ui"),
+        br(),
+        actionButton("add_celltype", "Add Cell Type", icon = icon("plus")),
+        br(), br(),
+        conditionalPanel(
+          condition = "output.hasAnnotations",
+          actionButton("apply_annotations", "Apply Annotations", icon = icon("check"), class = "btn-success")
+        )
+      )
     )
   ),
   tabPanel(
@@ -1366,7 +1381,9 @@ server <- function(input, output, session) {
     subsetting_enabled = FALSE,
     subset_rules = list(), # List of subsetting rules
     subset_summary = NULL, # Summary of subsetting results
-    subset_id = "000000000" # Unique ID for current subset - "000000000" means no subsetting applied
+    subset_id = "000000000", # Unique ID for current subset - "000000000" means no subsetting applied
+    # Cluster annotation engine
+    celltype_annotations = list() # List of celltype -> cluster assignments
   )
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
@@ -1377,6 +1394,7 @@ server <- function(input, output, session) {
   lm_state <- reactiveVal(NULL)
   reg_state <- reactiveVal(NULL)
   surv_state <- reactiveVal(NULL)
+  celltype_id_counter <- reactiveVal(0) # Counter for unique celltype IDs
   # rv$log <- reactiveVal(character())
 
   # Disable tabs at startup
@@ -1628,6 +1646,29 @@ server <- function(input, output, session) {
     rv$cluster_heat <- cluster_heat
     rv$pop_size <- pop_size
     rv$rep_used <- rep_used
+    
+    # Initialize celltype annotations from cluster_map if available
+    if (!is.null(cluster_map) && all(c("cluster", "celltype") %in% names(cluster_map))) {
+      # Extract unique celltypes and their cluster mappings
+      annotations <- list()
+      celltype_names <- unique(cluster_map$celltype)
+      for (i in seq_along(celltype_names)) {
+        ct <- celltype_names[i]
+        assigned_clusters <- cluster_map$cluster[cluster_map$celltype == ct]
+        annotations[[as.character(i)]] <- list(
+          id = i,
+          name = ct,
+          clusters = as.character(assigned_clusters)
+        )
+      }
+      rv$celltype_annotations <- annotations
+      celltype_id_counter(length(celltype_names))
+      message("Initialized celltype annotations from cluster_map: ", length(celltype_names), " cell types")
+    } else {
+      rv$celltype_annotations <- list()
+      celltype_id_counter(0)
+      message("No cluster_map found; celltype annotations initialized empty")
+    }
 
     message(
       "Upload complete: expr rows=", nrow(rv$expr),
@@ -2696,6 +2737,253 @@ server <- function(input, output, session) {
     !is.null(rv$subset_id)
   })
   outputOptions(output, "hasSubset", suspendWhenHidden = FALSE)
+
+  # ==== Cluster Annotation Engine ====
+  
+  # Reactive for available clusters
+  available_clusters <- reactive({
+    if (!is.null(rv$clusters) && !is.null(rv$clusters$assignments)) {
+      sort(unique(rv$clusters$assignments))
+    } else {
+      character(0)
+    }
+  })
+  
+  # Check if annotations exist
+  output$hasAnnotations <- reactive({
+    length(rv$celltype_annotations) > 0
+  })
+  outputOptions(output, "hasAnnotations", suspendWhenHidden = FALSE)
+  
+  # Render annotation UI
+  output$celltype_annotations_ui <- renderUI({
+    if (length(rv$celltype_annotations) == 0) {
+      return(tags$p(style = "color: #999; font-style: italic;", "Click 'Add Cell Type' to create annotations."))
+    }
+    
+    clusters <- available_clusters()
+    if (length(clusters) == 0) {
+      return(tags$p(style = "color: #dc3545;", "No clusters available. Load data with cluster assignments."))
+    }
+    
+    ann_ids <- names(rv$celltype_annotations)
+    n_annotations <- length(ann_ids)
+    
+    # Create grid layout with 2 columns
+    n_cols <- 2
+    n_rows <- ceiling(n_annotations / n_cols)
+    
+    rows <- lapply(seq_len(n_rows), function(row_idx) {
+      start_idx <- (row_idx - 1) * n_cols + 1
+      end_idx <- min(start_idx + n_cols - 1, n_annotations)
+      
+      cols <- lapply(start_idx:end_idx, function(idx) {
+        ann_id <- ann_ids[idx]
+        ann <- rv$celltype_annotations[[ann_id]]
+        
+        column(
+          6,  # 12/2 = 6 for 2 columns
+          tags$div(
+            id = paste0("annotation_container_", ann_id),
+            style = "border: 1px solid #ddd; padding: 8px; margin-bottom: 8px; border-radius: 4px; background-color: #f9f9f9;",
+            fluidRow(
+              column(
+                5,
+                textInput(paste0("celltype_name_", ann_id), "Cell Type", value = ann$name, placeholder = "e.g., T cells")
+              ),
+              column(
+                6,
+                pickerInput(
+                  paste0("celltype_clusters_", ann_id),
+                  "Clusters",
+                  choices = as.character(clusters),
+                  selected = ann$clusters,
+                  multiple = TRUE,
+                  options = list(
+                    `actions-box` = TRUE,
+                    `selected-text-format` = "count > 3",
+                    `count-selected-text` = "{0} clusters"
+                  )
+                )
+              ),
+              column(
+                1,
+                br(),
+                actionButton(paste0("remove_celltype_", ann_id), "",
+                  icon = icon("trash"), class = "btn-danger btn-sm",
+                  style = "margin-top: 5px;"
+                )
+              )
+            )
+          )
+        )
+      })
+      
+      fluidRow(cols)
+    })
+    
+    tagList(rows)
+  })
+  
+  # Add celltype button
+  observeEvent(input$add_celltype, {
+    clusters <- available_clusters()
+    if (length(clusters) == 0) {
+      showNotification("No clusters available. Load data with cluster assignments first.", type = "error")
+      return()
+    }
+    
+    # Initialize with cluster->cluster mapping if this is the first celltype
+    default_clusters <- if (length(rv$celltype_annotations) == 0) {
+      as.character(clusters)
+    } else {
+      character(0)
+    }
+    
+    new_id <- celltype_id_counter() + 1
+    celltype_id_counter(new_id)
+    
+    rv$celltype_annotations[[as.character(new_id)]] <- list(
+      id = new_id,
+      name = paste0("Cell Type ", new_id),
+      clusters = default_clusters
+    )
+  })
+  
+  # Remove celltype buttons (dynamic observers)
+  observe({
+    if (length(rv$celltype_annotations) == 0) return()
+    
+    lapply(names(rv$celltype_annotations), function(ann_id) {
+      observeEvent(input[[paste0("remove_celltype_", ann_id)]],
+        {
+          # Remove this annotation
+          rv$celltype_annotations[[ann_id]] <- NULL
+        },
+        ignoreInit = TRUE,
+        ignoreNULL = TRUE,
+        once = TRUE
+      )
+    })
+  })
+  
+  # Update annotations in real-time as user makes changes
+  observe({
+    if (length(rv$celltype_annotations) == 0) return()
+    
+    lapply(names(rv$celltype_annotations), function(ann_id) {
+      # Update name
+      observeEvent(input[[paste0("celltype_name_", ann_id)]], {
+        if (!is.null(rv$celltype_annotations[[ann_id]])) {
+          rv$celltype_annotations[[ann_id]]$name <- input[[paste0("celltype_name_", ann_id)]]
+        }
+      }, ignoreInit = TRUE)
+      
+      # Update cluster assignments
+      observeEvent(input[[paste0("celltype_clusters_", ann_id)]], {
+        if (!is.null(rv$celltype_annotations[[ann_id]])) {
+          rv$celltype_annotations[[ann_id]]$clusters <- input[[paste0("celltype_clusters_", ann_id)]]
+        }
+      }, ignoreInit = TRUE)
+    })
+  })
+  
+  # Update dropdown choices to prevent duplicate cluster assignments
+  observe({
+    if (length(rv$celltype_annotations) == 0) return()
+    
+    all_clusters <- as.character(available_clusters())
+    ann_ids <- names(rv$celltype_annotations)
+    
+    # For each annotation, update its dropdown choices
+    lapply(ann_ids, function(current_ann_id) {
+      # Get clusters selected in OTHER annotations
+      clusters_selected_elsewhere <- character(0)
+      for (other_ann_id in setdiff(ann_ids, current_ann_id)) {
+        selected <- input[[paste0("celltype_clusters_", other_ann_id)]]
+        if (!is.null(selected) && length(selected) > 0) {
+          clusters_selected_elsewhere <- c(clusters_selected_elsewhere, selected)
+        }
+      }
+      
+      # Get currently selected clusters for THIS annotation
+      current_selected <- input[[paste0("celltype_clusters_", current_ann_id)]]
+      
+      # Available choices = all clusters - clusters selected elsewhere
+      available_choices <- setdiff(all_clusters, clusters_selected_elsewhere)
+      
+      # Update the picker with new choices, preserving current selection
+      updatePickerInput(
+        session = session,
+        inputId = paste0("celltype_clusters_", current_ann_id),
+        choices = available_choices,
+        selected = current_selected
+      )
+    })
+  })
+  
+  # Apply annotations button
+  observeEvent(input$apply_annotations, {
+    if (length(rv$celltype_annotations) == 0) {
+      showNotification("No cell type annotations defined.", type = "warning")
+      return()
+    }
+    
+    # Validate: check for empty names
+    invalid_names <- sapply(rv$celltype_annotations, function(ann) {
+      is.null(ann$name) || nchar(trimws(ann$name)) == 0
+    })
+    if (any(invalid_names)) {
+      showNotification("All cell types must have non-empty names.", type = "error")
+      return()
+    }
+    
+    # Validate: check for duplicate names
+    all_names <- sapply(rv$celltype_annotations, function(ann) trimws(ann$name))
+    if (any(duplicated(all_names))) {
+      showNotification("Cell type names must be unique.", type = "error")
+      return()
+    }
+    
+    # Build cluster_map from annotations
+    cluster_map_list <- list()
+    for (ann_id in names(rv$celltype_annotations)) {
+      ann <- rv$celltype_annotations[[ann_id]]
+      celltype_name <- trimws(ann$name)
+      assigned_clusters <- ann$clusters
+      
+      if (length(assigned_clusters) > 0) {
+        for (cl in assigned_clusters) {
+          cluster_map_list[[cl]] <- celltype_name
+        }
+      }
+    }
+    
+    # Handle unassigned clusters: map to themselves
+    all_clusters <- available_clusters()
+    unassigned_clusters <- setdiff(as.character(all_clusters), names(cluster_map_list))
+    for (cl in unassigned_clusters) {
+      cluster_map_list[[cl]] <- as.character(cl)
+    }
+    
+    # Convert to data frame
+    if (length(cluster_map_list) > 0) {
+      rv$cluster_map <- data.frame(
+        cluster = as.integer(names(cluster_map_list)),
+        celltype = unlist(cluster_map_list),
+        stringsAsFactors = FALSE
+      )
+      
+      showNotification(
+        sprintf("Applied annotations: %d cell types, %d clusters assigned", 
+                length(rv$celltype_annotations), length(all_clusters)),
+        type = "message"
+      )
+    } else {
+      rv$cluster_map <- NULL
+      showNotification("No cluster assignments made.", type = "warning")
+    }
+  })
 
   # Export subset metadata
   output$export_subset_meta <- downloadHandler(
