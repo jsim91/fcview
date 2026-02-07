@@ -9899,6 +9899,18 @@ server <- function(input, output, session) {
           Interpretation = "Tests whether predictor significantly affects hazard as continuous variable in Cox model",
           stringsAsFactors = FALSE
         )
+      } else {
+        # Multivariate mode - show overall model significance (likelihood ratio test)
+        # This tests whether the model as a whole is better than null model
+        lr_test <- s$cox_summary$logtest
+        lr_p <- lr_test["pvalue"]
+        perf_rows[[length(perf_rows) + 1]] <- data.frame(
+          Metric = "Overall Model P-value (Likelihood Ratio)",
+          Value = "---",
+          P_value = if (lr_p < 0.001) formatC(lr_p, format = "e", digits = 2) else sprintf("%.4f", lr_p),
+          Interpretation = "Tests whether the multivariate model as a whole significantly predicts outcome (all predictors together vs null model)",
+          stringsAsFactors = FALSE
+        )
       }
     }
 
