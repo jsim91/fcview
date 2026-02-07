@@ -819,7 +819,7 @@ ui <- navbarPage(
   tabPanel("UMAP", EmbeddingUI("umap", title = "UMAP")),
   tabPanel("tSNE", EmbeddingUI("tsne", title = "tSNE")),
   tabPanel(
-    "Heatmap",
+    "Annotation",
     fluidRow(
       column(
         3,
