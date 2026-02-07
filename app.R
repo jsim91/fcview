@@ -35,7 +35,6 @@ suppressPackageStartupMessages({
     library(sccomp)
     library(survival) # Cox proportional hazards, survfit, cox.zph
     library(survminer) # ggsurvplot for better survival curve visualization
-    library(DT) # DataTables for interactive tables
   })
 })
 
