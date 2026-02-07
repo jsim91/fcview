@@ -1290,6 +1290,29 @@ ui <- navbarPage(
         helpText("Multivariate: all predictors in one model."),
         helpText("Univariate: test each predictor separately."),
         hr(),
+        conditionalPanel(
+          condition = "input.surv_analysis_mode == 'multivariate'",
+          checkboxInput("surv_use_regularization", "Apply regularization (glmnet)", value = FALSE),
+          helpText("Adds penalty to reduce overfitting with many/correlated predictors.")
+        ),
+        conditionalPanel(
+          condition = "input.surv_analysis_mode == 'multivariate' && input.surv_use_regularization",
+          selectInput("surv_penalty_type", "Penalty type:",
+            choices = c("Lasso (L1, feature selection)" = "lasso",
+                        "Ridge (L2, shrinkage only)" = "ridge",
+                        "Elastic Net (L1+L2 mix)" = "elasticnet"),
+            selected = "lasso"
+          ),
+          helpText("Lasso can shrink coefficients to zero (automatic feature selection).")
+        ),
+        conditionalPanel(
+          condition = "input.surv_analysis_mode == 'multivariate' && input.surv_use_regularization && input.surv_penalty_type == 'elasticnet'",
+          sliderInput("surv_alpha", "Elastic net mixing (α):",
+            min = 0, max = 1, value = 0.5, step = 0.1
+          ),
+          helpText("α=0: pure ridge, α=1: pure lasso, 0<α<1: elastic net mix.")
+        ),
+        hr(),
         pickerInput("surv_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
         conditionalPanel(
           condition = "input.surv_predictors.includes('cluster')",
@@ -1301,7 +1324,7 @@ ui <- navbarPage(
           selected = "median"
         ),
         checkboxInput("surv_show_ci", "Show confidence intervals", value = TRUE),
-        helpText("Use for visualization only."),
+        helpText("Use time to event curve figure for visualization only. Continuous model results are more powerful."),
         br(),
         actionButton("run_surv", "Run Model", class = "btn-primary"),
         br(), br(),
@@ -1325,18 +1348,10 @@ ui <- navbarPage(
           condition = "output.hasSurvResults",
           h4("Time to Event Curve"),
           plotOutput("surv_curve_plot", height = "500px"),
-          fluidRow(
-            column(
-              4,
-              h4("Model Summary"),
-              verbatimTextOutput("surv_summary")
-            ),
-            column(
-              8,
-              h4("Performance Metrics"),
-              tableOutput("surv_perf_table")
-            )
-          )
+          h4("Model Summary"),
+          verbatimTextOutput("surv_summary"),
+          h4("Performance Metrics"),
+          tableOutput("surv_perf_table")
         ),
         uiOutput("surv_error_ui"),
         textOutput("surv_cleared_msg")
@@ -8907,7 +8922,7 @@ server <- function(input, output, session) {
       updatePickerInput(session, "surv_predictors", choices = predictor_choices, selected = NULL)
       updatePickerInput(session, "surv_cluster_subset",
         choices = colnames(rv$abundance_sample),
-        selected = character(0)
+        selected = character(0)  # No selection = use all clusters
       )
     },
     ignoreInit = TRUE
@@ -8953,12 +8968,13 @@ server <- function(input, output, session) {
     # Build predictor matrix
     predictor_list <- input$surv_predictors
     design_df <- data.frame(patient_ID = meta_patient$patient_ID)
+    name_mapping <- NULL
 
     # Add cluster predictors if selected
     if ("cluster" %in% predictor_list) {
       abund <- rv$abundance_sample
 
-      # Filter to selected clusters
+      # Filter to selected clusters (if none selected, use all)
       if (!is.null(input$surv_cluster_subset) && length(input$surv_cluster_subset) > 0) {
         selected_clusters <- input$surv_cluster_subset
         keep_cols <- colnames(abund)[colnames(abund) %in% selected_clusters]
@@ -8967,6 +8983,7 @@ server <- function(input, output, session) {
         }
         abund <- abund[, keep_cols, drop = FALSE]
       }
+      # If no clusters selected, use all clusters (default behavior)
 
       # Merge abundance with design
       abund_df <- as.data.frame(abund)
@@ -8976,7 +8993,11 @@ server <- function(input, output, session) {
       # Use custom replacements to preserve meaning: spaces->_, +->p, -->n
       # Also create a mapping to restore original names in output tables
       cluster_cols <- setdiff(names(abund_df), "patient_ID")
-      name_mapping <- setNames(cluster_cols, cluster_cols)  # Initialize with identity mapping
+      
+      # Initialize name_mapping if NULL
+      if (is.null(name_mapping)) {
+        name_mapping <- character(0)
+      }
       
       for (col in cluster_cols) {
         new_name <- col
@@ -8989,9 +9010,13 @@ server <- function(input, output, session) {
         if (!grepl("^[A-Za-z_]", new_name)) {
           new_name <- paste0("X_", new_name)
         }
+        
+        # Always add to name_mapping (sanitized -> original)
+        name_mapping[new_name] <- col
+        
+        # Update column name if it changed
         if (new_name != col) {
           names(abund_df)[names(abund_df) == col] <- new_name
-          name_mapping[new_name] <- col  # Store sanitized -> original mapping
         }
       }
       
@@ -9002,6 +9027,17 @@ server <- function(input, output, session) {
     meta_predictors <- setdiff(predictor_list, "cluster")
     if (length(meta_predictors) > 0) {
       meta_subset <- meta_patient[, c("patient_ID", meta_predictors), drop = FALSE]
+      
+      # Initialize name_mapping if NULL
+      if (is.null(name_mapping)) {
+        name_mapping <- character(0)
+      }
+      
+      # Add metadata predictors to name_mapping (they don't need sanitization)
+      for (meta_col in meta_predictors) {
+        name_mapping[meta_col] <- meta_col
+      }
+      
       design_df <- merge(design_df, meta_subset, by = "patient_ID", all.x = TRUE)
     }
 
@@ -9093,24 +9129,114 @@ server <- function(input, output, session) {
     formula_str <- paste("Surv(time, status) ~", paste(predictor_cols, collapse = " + "))
     formula_obj <- as.formula(formula_str)
 
-    # Fit Cox proportional hazards model
-    cox_model <- tryCatch(
-      {
-        survival::coxph(formula_obj, data = design_df_complete)
-      },
-      warning = function(w) {
-        warnings <<- c(warnings, paste("Cox model warning:", conditionMessage(w)))
-        survival::coxph(formula_obj, data = design_df_complete)
-      },
-      error = function(e) {
-        stop(paste0(
-          "Cox model fitting failed: ", conditionMessage(e), "\n\n",
-          "This often occurs when predictors are too highly correlated with the outcome, ",
-          "or when there's perfect separation in categorical predictors. ",
-          "Try using different predictors that are not derived from the outcome variable."
-        ))
+    # Determine if regularization should be used
+    use_regularization <- isTRUE(input$surv_use_regularization)
+    
+    # Fit Cox proportional hazards model (regularized or standard)
+    if (use_regularization) {
+      # Prepare data for glmnet
+      x_matrix <- as.matrix(design_df_complete[, predictor_cols, drop = FALSE])
+      y_surv <- survival::Surv(design_df_complete$time, design_df_complete$status)
+      
+      # Determine alpha parameter
+      penalty_type <- input$surv_penalty_type %||% "lasso"
+      alpha_param <- switch(penalty_type,
+        "lasso" = 1,
+        "ridge" = 0,
+        "elasticnet" = input$surv_alpha %||% 0.5,
+        1  # default to lasso
+      )
+      
+      # Fit regularized Cox model with cross-validation to select lambda
+      cv_fit <- tryCatch(
+        {
+          glmnet::cv.glmnet(x_matrix, y_surv, family = "cox", alpha = alpha_param, nfolds = 10)
+        },
+        error = function(e) {
+          stop(paste0(
+            "Regularized Cox model fitting failed: ", conditionMessage(e), "\n\n",
+            "Try using standard Cox model (uncheck regularization) or different predictors."
+          ))
+        }
+      )
+      
+      # Use lambda.1se (more parsimonious model) or lambda.min (best CV performance)
+      # lambda.1se is generally preferred for better generalization
+      lambda_use <- cv_fit$lambda.1se
+      
+      # Extract the glmnet model at the selected lambda
+      glmnet_model <- glmnet::glmnet(x_matrix, y_surv, family = "cox", alpha = alpha_param, lambda = lambda_use)
+      
+      # Extract non-zero coefficients
+      coef_vec <- as.vector(coef(glmnet_model))
+      names(coef_vec) <- predictor_cols
+      nonzero_idx <- which(coef_vec != 0)
+      
+      if (length(nonzero_idx) == 0) {
+        stop("Regularization shrunk all coefficients to zero. Try ridge penalty or disable regularization.")
       }
-    )
+      
+      # Create a standard coxph model with selected features for compatibility
+      # This allows us to use cox.zph and other standard diagnostics
+      selected_predictors <- predictor_cols[nonzero_idx]
+      formula_str_reduced <- paste("Surv(time, status) ~", paste(selected_predictors, collapse = " + "))
+      formula_obj_reduced <- as.formula(formula_str_reduced)
+      
+      cox_model <- tryCatch(
+        {
+          survival::coxph(formula_obj_reduced, data = design_df_complete)
+        },
+        warning = function(w) {
+          warnings <<- c(warnings, paste("Cox model warning:", conditionMessage(w)))
+          survival::coxph(formula_obj_reduced, data = design_df_complete)
+        },
+        error = function(e) {
+          stop(paste0("Failed to fit Cox model with selected features: ", conditionMessage(e)))
+        }
+      )
+      
+      # Store regularization info
+      regularization_info <- list(
+        used = TRUE,
+        penalty_type = penalty_type,
+        alpha = alpha_param,
+        lambda = lambda_use,
+        lambda_min = cv_fit$lambda.min,
+        lambda_1se = cv_fit$lambda.1se,
+        n_predictors_original = length(predictor_cols),
+        n_predictors_selected = length(selected_predictors),
+        selected_predictors = selected_predictors,
+        cv_fit = cv_fit,
+        glmnet_model = glmnet_model
+      )
+      
+      warnings <- c(warnings, sprintf(
+        "Regularization (%s, \u03b1=%.2f, \u03bb=%.4f) selected %d/%d features.",
+        penalty_type, alpha_param, lambda_use, length(selected_predictors), length(predictor_cols)
+      ))
+      
+    } else {
+      # Standard Cox model without regularization
+      cox_model <- tryCatch(
+        {
+          survival::coxph(formula_obj, data = design_df_complete)
+        },
+        warning = function(w) {
+          warnings <<- c(warnings, paste("Cox model warning:", conditionMessage(w)))
+          survival::coxph(formula_obj, data = design_df_complete)
+        },
+        error = function(e) {
+          stop(paste0(
+            "Cox model fitting failed: ", conditionMessage(e), "\n\n",
+            "This often occurs when predictors are too highly correlated with the outcome, ",
+            "or when there's perfect separation in categorical predictors. ",
+            "Try using different predictors or enable regularization."
+          ))
+        }
+      )
+      
+      regularization_info <- list(used = FALSE)
+    }
 
     # Test proportional hazards assumption (Schoenfeld residuals)
     ph_test <- tryCatch(
@@ -9179,7 +9305,8 @@ server <- function(input, output, session) {
       threshold = threshold,
       split_method = split_method,
       predictor_cols = predictor_cols,
-      name_mapping = if (exists("name_mapping")) name_mapping else NULL,
+      name_mapping = name_mapping,
+      regularization = regularization_info,
       warnings = warnings,
       details = list(
         samples_before = n_before,
@@ -9220,7 +9347,7 @@ server <- function(input, output, session) {
     if ("cluster" %in% predictor_list) {
       abund <- rv$abundance_sample
 
-      # Filter to selected clusters
+      # Filter to selected clusters (if none selected, use all)
       if (!is.null(input$surv_cluster_subset) && length(input$surv_cluster_subset) > 0) {
         selected_clusters <- input$surv_cluster_subset
         keep_cols <- colnames(abund)[colnames(abund) %in% selected_clusters]
@@ -9229,13 +9356,18 @@ server <- function(input, output, session) {
         }
         abund <- abund[, keep_cols, drop = FALSE]
       }
+      # If no clusters selected, use all clusters (default behavior)
 
       abund_df <- as.data.frame(abund)
       abund_df$patient_ID <- rownames(abund_df)
       
       # Sanitize cluster column names
       cluster_cols <- setdiff(names(abund_df), "patient_ID")
-      name_mapping <- setNames(cluster_cols, cluster_cols)
+      
+      # Initialize name_mapping if NULL
+      if (is.null(name_mapping)) {
+        name_mapping <- character(0)
+      }
       
       for (col in cluster_cols) {
         new_name <- col
@@ -9246,9 +9378,13 @@ server <- function(input, output, session) {
         if (!grepl("^[A-Za-z_]", new_name)) {
           new_name <- paste0("X_", new_name)
         }
+        
+        # Always add to name_mapping (sanitized -> original)
+        name_mapping[new_name] <- col
+        
+        # Update column name if it changed
         if (new_name != col) {
           names(abund_df)[names(abund_df) == col] <- new_name
-          name_mapping[new_name] <- col
         }
       }
       
@@ -9259,6 +9395,17 @@ server <- function(input, output, session) {
     meta_predictors <- setdiff(predictor_list, "cluster")
     if (length(meta_predictors) > 0) {
       meta_subset <- meta_patient[, c("patient_ID", meta_predictors), drop = FALSE]
+      
+      # Initialize name_mapping if NULL
+      if (is.null(name_mapping)) {
+        name_mapping <- character(0)
+      }
+      
+      # Add metadata predictors to name_mapping (they don't need sanitization)
+      for (meta_col in meta_predictors) {
+        name_mapping[meta_col] <- meta_col
+      }
+      
       design_df <- merge(design_df, meta_subset, by = "patient_ID", all.x = TRUE)
     }
 
@@ -9559,7 +9706,18 @@ server <- function(input, output, session) {
     det <- s$details
 
     cat("=== Time to Event Analysis Summary ===\n\n")
-    cat("Model: Cox Proportional Hazards\n")
+    cat("Model: Cox Proportional Hazards")
+    if (!is.null(s$regularization) && s$regularization$used) {
+      penalty_name <- switch(s$regularization$penalty_type,
+        "lasso" = "Lasso (L1)",
+        "ridge" = "Ridge (L2)",
+        "elasticnet" = "Elastic Net",
+        "Regularized"
+      )
+      cat(" with ", penalty_name, "\n", sep = "")
+    } else {
+      cat("\n")
+    }
     
     if (!is.null(s$analysis_mode) && s$analysis_mode == "univariate") {
       cat("Analysis Mode: Univariate\n")
@@ -9572,6 +9730,30 @@ server <- function(input, output, session) {
     } else {
       cat("Analysis Mode: Multivariate\n")
       cat("Predictors:", paste(input$surv_predictors, collapse = ", "), "\n")
+      
+      # Show regularization details if used
+      if (!is.null(s$regularization) && s$regularization$used) {
+        cat("Regularization: \u03b1=", sprintf("%.2f", s$regularization$alpha),
+            ", \u03bb=", sprintf("%.4f", s$regularization$lambda), "\n", sep = "")
+        cat("  Selected ", s$regularization$n_predictors_selected, "/", 
+            s$regularization$n_predictors_original, " features\n", sep = "")
+        if (s$regularization$n_predictors_selected < s$regularization$n_predictors_original) {
+          # Show which features were dropped
+          dropped_features <- setdiff(
+            names(s$name_mapping)[names(s$name_mapping) %in% s$predictor_cols],
+            s$regularization$selected_predictors
+          )
+          if (length(dropped_features) > 0) {
+            # Map back to original names
+            dropped_original <- sapply(dropped_features, function(f) {
+              if (f %in% names(s$name_mapping)) s$name_mapping[[f]] else f
+            })
+            cat("  Dropped: ", paste(head(dropped_original, 5), collapse = ", "), sep = "")
+            if (length(dropped_original) > 5) cat(", ...")
+            cat("\n")
+          }
+        }
+      }
     }
     
     cat("Outcome:", input$surv_outcome, "\n")
@@ -9831,8 +10013,9 @@ server <- function(input, output, session) {
     include_all_cols = TRUE  # default to all columns for export
   }) 
   
-  surv_coef_table <- function(include_all_cols = TRUE) {
-    s <- isolate(surv_state())  # Use full state, not filtered result
+  surv_coef_table <- function(include_all_cols = TRUE, state = NULL) {
+    # Use provided state or get from reactive (without isolate to ensure reactivity)
+    s <- if (!is.null(state)) state else surv_state()
     req(s)
 
     if (!is.null(s$error) && isTRUE(s$error)) {
@@ -10076,22 +10259,51 @@ server <- function(input, output, session) {
 
       # 1. Model Summary (key-value CSV)
       summary_file <- file.path(tmpdir, paste0(prefix, "_model_summary_", subset_id, ".csv"))
+      
+      # Build summary rows
+      summary_keys <- c(
+        "Model type", "Analysis mode", "Outcome variable", "Predictors", "Risk stratification method", 
+        "Risk score threshold", "Samples before filtering", "Samples after filtering", "Samples dropped"
+      )
+      summary_values <- c(
+        "Cox Proportional Hazards",
+        tools::toTitleCase(analysis_mode),
+        input$surv_outcome,
+        predictor_text,
+        tools::toTitleCase(s$split_method %||% "median"),
+        sprintf("%.3f", s$threshold),
+        s$details$samples_before %||% NA,
+        s$details$samples_after %||% NA,
+        s$details$samples_dropped %||% NA
+      )
+      
+      # Add regularization info if used
+      if (!is.null(s$regularization) && s$regularization$used) {
+        reg_type_name <- switch(s$regularization$penalty_type,
+          "lasso" = "Lasso (L1)",
+          "ridge" = "Ridge (L2)",
+          "elasticnet" = "Elastic Net",
+          "Regularized"
+        )
+        summary_keys <- c(summary_keys, 
+          "Regularization method",
+          "Regularization alpha",
+          "Regularization lambda",
+          "Features selected",
+          "Features original"
+        )
+        summary_values <- c(summary_values,
+          reg_type_name,
+          sprintf("%.2f", s$regularization$alpha),
+          sprintf("%.4f", s$regularization$lambda),
+          s$regularization$n_predictors_selected,
+          s$regularization$n_predictors_original
+        )
+      }
+      
       summary_kv <- data.frame(
-        Key = c(
-          "Model type", "Analysis mode", "Outcome variable", "Predictors", "Risk stratification method", 
-          "Risk score threshold", "Samples before filtering", "Samples after filtering", "Samples dropped"
-        ),
-        Value = c(
-          "Cox Proportional Hazards",
-          tools::toTitleCase(analysis_mode),
-          input$surv_outcome,
-          predictor_text,
-          tools::toTitleCase(s$split_method %||% "median"),
-          sprintf("%.3f", s$threshold),
-          s$details$samples_before %||% NA,
-          s$details$samples_after %||% NA,
-          s$details$samples_dropped %||% NA
-        ),
+        Key = summary_keys,
+        Value = summary_values,
         stringsAsFactors = FALSE
       )
       write.csv(summary_kv, summary_file, row.names = FALSE)
@@ -10112,7 +10324,9 @@ server <- function(input, output, session) {
       coef_file <- file.path(tmpdir, paste0(prefix, "_model_coefficients_", subset_id, ".csv"))
       coef_df <- tryCatch(
         {
-          surv_coef_table()
+          # Use full state for univariate (all predictors) or current for multivariate
+          full_state <- surv_state()
+          surv_coef_table(include_all_cols = TRUE, state = full_state)
         },
         error = function(e) data.frame(Message = "Error extracting coefficients")
       )
