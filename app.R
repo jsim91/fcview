@@ -24,13 +24,18 @@ suppressPackageStartupMessages({
     library(nnet) # multinom() for multi-class logistic regression
     library(pROC)
     library(yardstick)
-    library(rsample) # vfold_cv(), initial_split (if you want tidy resampling)
+    library(rsample) # vfold_cv(), initial_split - tidy resampling
     library(boot) # bootstrapping CIs for AUC
     library(rlang) # tidy evaluation for !!!syms
     library(randomForest)
     library(multiROC) # for multiclass ROC curves
     library(zip) # for ZIP download handlers
-    # also requires patchwork and sccomp
+    library(parallel)
+    library(patchwork)
+    library(sccomp)
+    library(survival) # Cox proportional hazards, survfit, cox.zph
+    library(survminer) # ggsurvplot for better survival curve visualization
+    library(DT) # DataTables for interactive tables
   })
 })
 
@@ -1254,6 +1259,83 @@ ui <- navbarPage(
         textOutput("sccomp_cleared_msg")
       )
     )
+  ),
+  tabPanel(
+    "Time to Event",
+    icon = icon("chart-line"),
+    h4("Model Settings"),
+    fluidRow(
+      column(
+        3,
+        pickerInput("surv_outcome", "Time-to-event variable (continuous)", choices = NULL),
+        hr(),
+        selectInput("surv_analysis_mode", "Mode:",
+          choices = c("Multivariate" = "multivariate", "Univariate" = "univariate"),
+          selected = "multivariate"
+        ),
+        helpText("Multivariate: all predictors in one model."),
+        helpText("Univariate: test each predictor separately."),
+        hr(),
+        pickerInput("surv_predictors", "Predictor(s)", choices = NULL, multiple = TRUE),
+        conditionalPanel(
+          condition = "input.surv_predictors.includes('cluster')",
+          pickerInput("surv_cluster_subset", "Select clusters to include", choices = NULL, multiple = TRUE)
+        ),
+        hr(),
+        selectInput("surv_split_method", "Split risk score group by:",
+          choices = c("Median" = "median", "Mean" = "mean"),
+          selected = "median"
+        ),
+        checkboxInput("surv_show_ci", "Show confidence intervals", value = TRUE),
+        helpText("Use for visualization only."),
+        br(),
+        actionButton("run_surv", "Run Model", class = "btn-primary"),
+        br(), br(),
+        conditionalPanel(
+          condition = "output.hasSurvResults && input.surv_analysis_mode == 'univariate'",
+          selectInput("surv_univar_predictor_display", "Display results for:",
+            choices = NULL
+          ),
+          helpText("Select which predictor's univariate results to display.")
+        ),
+        conditionalPanel(
+          condition = "output.hasSurvResults",
+          downloadButton("export_surv_zip", "Download All Results (ZIP)"),
+          br(), br(),
+          actionButton("reset_surv", "Clear Results")
+        )
+      ),
+      column(
+        5,
+        conditionalPanel(
+          condition = "output.hasSurvResults",
+          h4("Time to Event Curve"),
+          plotOutput("surv_curve_plot", height = "500px"),
+          fluidRow(
+            column(
+              4,
+              h4("Model Summary"),
+              verbatimTextOutput("surv_summary")
+            ),
+            column(
+              8,
+              h4("Performance Metrics"),
+              tableOutput("surv_perf_table")
+            )
+          )
+        ),
+        uiOutput("surv_error_ui"),
+        textOutput("surv_cleared_msg")
+      ),
+      column(
+        4,
+        conditionalPanel(
+          condition = "output.hasSurvCoefs",
+          uiOutput("surv_coef_header"),
+          tableOutput("surv_coefs")
+        )
+      )
+    )
   )
 )
 
@@ -1295,6 +1377,7 @@ server <- function(input, output, session) {
   fs_state <- reactiveVal(NULL)
   lm_state <- reactiveVal(NULL)
   reg_state <- reactiveVal(NULL)
+  surv_state <- reactiveVal(NULL)
   # rv$log <- reactiveVal(character())
 
   # Disable tabs at startup
@@ -8513,6 +8596,1321 @@ server <- function(input, output, session) {
         width = width_val, height = height_val, units = "in", limitsize = FALSE
       )
     }
+  )
+
+  # ========== TIME TO EVENT ANALYSIS TAB LOGIC ==========
+
+  # Initialize Time to Event Analysis dropdowns
+  observeEvent(list(rv$meta_sample, rv$abundance_sample),
+    {
+      req(rv$meta_sample, rv$abundance_sample)
+
+      meta_cols <- colnames(rv$meta_sample)
+      continuous_choices <- sort(meta_cols[sapply(rv$meta_sample, is.numeric)])
+      # Exclude patient_ID, source, run_date, and cluster from continuous outcome choices
+      continuous_choices <- setdiff(continuous_choices, c("patient_ID", "source", "run_date", "cluster"))
+      predictor_choices <- sort(meta_cols)
+      # Exclude patient_ID, source, and run_date from predictor choices
+      predictor_choices <- setdiff(predictor_choices, c("patient_ID", "source", "run_date"))
+      if (!("cluster" %in% predictor_choices)) {
+        predictor_choices <- c(predictor_choices, "cluster")
+      }
+
+      updatePickerInput(session, "surv_outcome", choices = continuous_choices, selected = NULL)
+      updatePickerInput(session, "surv_predictors", choices = predictor_choices, selected = NULL)
+      updatePickerInput(session, "surv_cluster_subset",
+        choices = colnames(rv$abundance_sample),
+        selected = character(0)
+      )
+    },
+    ignoreInit = TRUE
+  )
+
+  # No threshold slider needed - split method is selected via dropdown
+
+  # Main time to event analysis function
+  run_surv <- function() {
+    req(rv$meta_sample, rv$abundance_sample, input$surv_outcome, input$surv_predictors)
+    
+    # Get analysis mode
+    analysis_mode <- input$surv_analysis_mode %||% "multivariate"
+    
+    if (analysis_mode == "univariate") {
+      return(run_surv_univariate())
+    } else {
+      return(run_surv_multivariate())
+    }
+  }
+  
+  # Multivariate analysis (original behavior)
+  run_surv_multivariate <- function() {
+    req(rv$meta_sample, rv$abundance_sample, input$surv_outcome, input$surv_predictors)
+
+    meta_patient <- rv$meta_sample
+
+    # Validate outcome variable
+    if (!(input$surv_outcome %in% colnames(meta_patient))) {
+      stop(paste0("Outcome '", input$surv_outcome, "' not found in metadata."))
+    }
+
+    outcome_raw <- meta_patient[[input$surv_outcome]]
+    outcome <- suppressWarnings(as.numeric(outcome_raw))
+
+    if (all(is.na(outcome))) {
+      stop(paste0("Outcome '", input$surv_outcome, "' cannot be converted to numeric."))
+    }
+
+    # Get split method (will calculate threshold from risk scores after model fitting)
+    split_method <- input$surv_split_method %||% "median"
+
+    # Build predictor matrix
+    predictor_list <- input$surv_predictors
+    design_df <- data.frame(patient_ID = meta_patient$patient_ID)
+
+    # Add cluster predictors if selected
+    if ("cluster" %in% predictor_list) {
+      abund <- rv$abundance_sample
+
+      # Filter to selected clusters
+      if (!is.null(input$surv_cluster_subset) && length(input$surv_cluster_subset) > 0) {
+        selected_clusters <- input$surv_cluster_subset
+        keep_cols <- colnames(abund)[colnames(abund) %in% selected_clusters]
+        if (length(keep_cols) == 0) {
+          stop("No valid clusters selected.")
+        }
+        abund <- abund[, keep_cols, drop = FALSE]
+      }
+
+      # Merge abundance with design
+      abund_df <- as.data.frame(abund)
+      abund_df$patient_ID <- rownames(abund_df)
+      
+      # Sanitize cluster column names to avoid formula issues
+      # Use custom replacements to preserve meaning: spaces->_, +->p, -->n
+      # Also create a mapping to restore original names in output tables
+      cluster_cols <- setdiff(names(abund_df), "patient_ID")
+      name_mapping <- setNames(cluster_cols, cluster_cols)  # Initialize with identity mapping
+      
+      for (col in cluster_cols) {
+        new_name <- col
+        new_name <- gsub(" ", "_", new_name)
+        new_name <- gsub("\\+", "p", new_name)
+        new_name <- gsub("-", "n", new_name)
+        # Remove any other special characters that could break formulas
+        new_name <- gsub("[^A-Za-z0-9_]", "_", new_name)
+        # Ensure it starts with a letter or underscore
+        if (!grepl("^[A-Za-z_]", new_name)) {
+          new_name <- paste0("X_", new_name)
+        }
+        if (new_name != col) {
+          names(abund_df)[names(abund_df) == col] <- new_name
+          name_mapping[new_name] <- col  # Store sanitized -> original mapping
+        }
+      }
+      
+      design_df <- merge(design_df, abund_df, by = "patient_ID", all.x = TRUE)
+    }
+
+    # Add metadata predictors
+    meta_predictors <- setdiff(predictor_list, "cluster")
+    if (length(meta_predictors) > 0) {
+      meta_subset <- meta_patient[, c("patient_ID", meta_predictors), drop = FALSE]
+      design_df <- merge(design_df, meta_subset, by = "patient_ID", all.x = TRUE)
+    }
+
+    # Attach outcome
+    design_df$time <- outcome
+
+    # Remove rows with missing values
+    n_before <- nrow(design_df)
+    design_df_complete <- design_df[complete.cases(design_df), ]
+    n_after <- nrow(design_df_complete)
+    n_dropped <- n_before - n_after
+    dropped_ids <- setdiff(design_df$patient_ID, design_df_complete$patient_ID)
+
+    if (n_after < 10) {
+      stop("Insufficient complete cases after removing missing values (n < 10).")
+    }
+
+    # For survival analysis, we need an event indicator
+    # Since we don't have event data, we'll assume all events occurred (status = 1)
+    # This is a simplification - in real survival analysis you'd have censoring info
+    design_df_complete$status <- 1
+
+    # Check if outcome variable is being used as a predictor
+    predictor_cols <- setdiff(names(design_df_complete), c("patient_ID", "time", "status"))
+    if (input$surv_outcome %in% predictor_cols) {
+      stop(paste0(
+        "The outcome variable '", input$surv_outcome, "' cannot also be used as a predictor. ",
+        "This creates perfect collinearity. Please select different predictors."
+      ))
+    }
+
+    if (length(predictor_cols) == 0) {
+      stop("No predictors available after filtering.")
+    }
+
+    # Check for high correlation between continuous predictors and outcome
+    warnings <- character(0)
+    for (pred in predictor_cols) {
+      pred_vals <- design_df_complete[[pred]]
+      
+      # For continuous predictors, check correlation with outcome
+      if (is.numeric(pred_vals) && length(unique(pred_vals)) > 10) {
+        cor_val <- tryCatch(
+          cor(pred_vals, design_df_complete$time, use = "complete.obs"),
+          error = function(e) NA
+        )
+        if (!is.na(cor_val) && abs(cor_val) > 0.95) {
+          warnings <- c(warnings, sprintf(
+            "WARNING: Predictor '%s' has very high correlation with outcome (r = %.3f). This may cause numerical instability.",
+            pred, cor_val
+          ))
+        }
+      }
+      
+      # For categorical predictors, check if groups perfectly separate outcome ranges
+      if (is.factor(pred_vals) || is.character(pred_vals)) {
+        groups <- split(design_df_complete$time, pred_vals)
+        if (length(groups) >= 2) {
+          # Check if group ranges don't overlap (perfect separation)
+          group_ranges <- lapply(groups, function(x) c(min(x, na.rm = TRUE), max(x, na.rm = TRUE)))
+          max_mins <- max(sapply(group_ranges, function(x) x[1]))
+          min_maxs <- min(sapply(group_ranges, function(x) x[2]))
+          
+          if (max_mins > min_maxs) {
+            warnings <- c(warnings, sprintf(
+              "WARNING: Categorical predictor '%s' creates perfect or near-perfect separation of outcome values. This may cause convergence issues.",
+              pred
+            ))
+          } else {
+            # Check for very high eta-squared (proportion of variance explained)
+            fit_temp <- tryCatch(
+              lm(design_df_complete$time ~ pred_vals),
+              error = function(e) NULL
+            )
+            if (!is.null(fit_temp)) {
+              r_squared <- summary(fit_temp)$r.squared
+              if (r_squared > 0.95) {
+                warnings <- c(warnings, sprintf(
+                  "WARNING: Categorical predictor '%s' explains %.1f%% of outcome variance. This creates near-perfect correlation and may cause numerical instability.",
+                  pred, r_squared * 100
+                ))
+              }
+            }
+          }
+        }
+      }
+    }
+
+    formula_str <- paste("Surv(time, status) ~", paste(predictor_cols, collapse = " + "))
+    formula_obj <- as.formula(formula_str)
+
+    # Fit Cox proportional hazards model
+    cox_model <- tryCatch(
+      {
+        survival::coxph(formula_obj, data = design_df_complete)
+      },
+      warning = function(w) {
+        warnings <<- c(warnings, paste("Cox model warning:", conditionMessage(w)))
+        survival::coxph(formula_obj, data = design_df_complete)
+      },
+      error = function(e) {
+        stop(paste0(
+          "Cox model fitting failed: ", conditionMessage(e), "\n\n",
+          "This often occurs when predictors are too highly correlated with the outcome, ",
+          "or when there's perfect separation in categorical predictors. ",
+          "Try using different predictors that are not derived from the outcome variable."
+        ))
+      }
+    )
+
+    # Test proportional hazards assumption (Schoenfeld residuals)
+    ph_test <- tryCatch(
+      {
+        survival::cox.zph(cox_model)
+      },
+      error = function(e) NULL
+    )
+
+    # Continuous model results
+    cox_summary <- summary(cox_model)
+
+    # Calculate risk scores (linear predictor) for each sample
+    risk_scores <- predict(cox_model, type = "lp")  # linear predictor
+    design_df_complete$risk_score <- risk_scores
+
+    # Calculate threshold based on risk scores using selected split method
+    threshold <- if (split_method == "mean") {
+      mean(risk_scores, na.rm = TRUE)
+    } else {
+      median(risk_scores, na.rm = TRUE)
+    }
+
+    # Dichotomize based on RISK SCORE
+    # Higher risk score = higher predicted hazard = worse prognosis
+    design_df_complete$risk_group <- ifelse(design_df_complete$risk_score > threshold, "High Risk", "Low Risk")
+    
+    # Check that we have at least 2 groups after risk stratification
+    n_groups <- length(unique(design_df_complete$risk_group))
+    if (n_groups < 2) {
+      # This should rarely happen with median/mean split, but handle edge case
+      # Try median if mean failed
+      threshold <- median(risk_scores, na.rm = TRUE)
+      design_df_complete$risk_group <- ifelse(design_df_complete$risk_score >= threshold, "High Risk", "Low Risk")
+      
+      n_groups <- length(unique(design_df_complete$risk_group))
+      if (n_groups < 2) {
+        stop("Cannot create two risk groups. All samples have identical risk scores.")
+      }
+      
+      warnings <- c(warnings, sprintf(
+        "WARNING: Mean split resulted in only 1 group. Used median split instead (threshold = %.3f).",
+        threshold
+      ))
+    }
+    
+    # Also keep outcome-based dichotomization for the logistic model
+    # Use median of outcome times for this
+    outcome_threshold <- median(design_df_complete$time, na.rm = TRUE)
+    design_df_complete$outcome_high <- ifelse(design_df_complete$time > outcome_threshold, 1, 0)
+
+    # Prepare dichotomized formula - replace time with outcome_high
+    formula_dichot_str <- paste("outcome_high ~", paste(predictor_cols, collapse = " + "))
+    formula_dichot <- as.formula(formula_dichot_str)
+
+    # Fit logistic regression for dichotomized outcome
+    dichot_model <- glm(formula_dichot, data = design_df_complete, family = binomial)
+
+    return(list(
+      analysis_mode = "multivariate",
+      cox_model = cox_model,
+      cox_summary = cox_summary,
+      ph_test = ph_test,
+      dichot_model = dichot_model,
+      data = design_df_complete,
+      threshold = threshold,
+      split_method = split_method,
+      predictor_cols = predictor_cols,
+      name_mapping = if (exists("name_mapping")) name_mapping else NULL,
+      warnings = warnings,
+      details = list(
+        samples_before = n_before,
+        samples_after = n_after,
+        samples_dropped = n_dropped,
+        dropped_ids = dropped_ids
+      )
+    ))
+  }
+  
+  # Univariate analysis - run separate model for each predictor
+  run_surv_univariate <- function() {
+    req(rv$meta_sample, rv$abundance_sample, input$surv_outcome, input$surv_predictors)
+
+    meta_patient <- rv$meta_sample
+
+    # Validate outcome variable
+    if (!(input$surv_outcome %in% colnames(meta_patient))) {
+      stop(paste0("Outcome '", input$surv_outcome, "' not found in metadata."))
+    }
+
+    outcome_raw <- meta_patient[[input$surv_outcome]]
+    outcome <- suppressWarnings(as.numeric(outcome_raw))
+
+    if (all(is.na(outcome))) {
+      stop(paste0("Outcome '", input$surv_outcome, "' cannot be converted to numeric."))
+    }
+
+    # Get split method
+    split_method <- input$surv_split_method %||% "median"
+
+    # Build full predictor matrix (same as multivariate)
+    predictor_list <- input$surv_predictors
+    design_df <- data.frame(patient_ID = meta_patient$patient_ID)
+    name_mapping <- NULL
+
+    # Add cluster predictors if selected
+    if ("cluster" %in% predictor_list) {
+      abund <- rv$abundance_sample
+
+      # Filter to selected clusters
+      if (!is.null(input$surv_cluster_subset) && length(input$surv_cluster_subset) > 0) {
+        selected_clusters <- input$surv_cluster_subset
+        keep_cols <- colnames(abund)[colnames(abund) %in% selected_clusters]
+        if (length(keep_cols) == 0) {
+          stop("No valid clusters selected.")
+        }
+        abund <- abund[, keep_cols, drop = FALSE]
+      }
+
+      abund_df <- as.data.frame(abund)
+      abund_df$patient_ID <- rownames(abund_df)
+      
+      # Sanitize cluster column names
+      cluster_cols <- setdiff(names(abund_df), "patient_ID")
+      name_mapping <- setNames(cluster_cols, cluster_cols)
+      
+      for (col in cluster_cols) {
+        new_name <- col
+        new_name <- gsub(" ", "_", new_name)
+        new_name <- gsub("\\+", "p", new_name)
+        new_name <- gsub("-", "n", new_name)
+        new_name <- gsub("[^A-Za-z0-9_]", "_", new_name)
+        if (!grepl("^[A-Za-z_]", new_name)) {
+          new_name <- paste0("X_", new_name)
+        }
+        if (new_name != col) {
+          names(abund_df)[names(abund_df) == col] <- new_name
+          name_mapping[new_name] <- col
+        }
+      }
+      
+      design_df <- merge(design_df, abund_df, by = "patient_ID", all.x = TRUE)
+    }
+
+    # Add metadata predictors
+    meta_predictors <- setdiff(predictor_list, "cluster")
+    if (length(meta_predictors) > 0) {
+      meta_subset <- meta_patient[, c("patient_ID", meta_predictors), drop = FALSE]
+      design_df <- merge(design_df, meta_subset, by = "patient_ID", all.x = TRUE)
+    }
+
+    # Attach outcome
+    design_df$time <- outcome
+
+    # Remove rows with missing values
+    n_before <- nrow(design_df)
+    design_df_complete <- design_df[complete.cases(design_df), ]
+    n_after <- nrow(design_df_complete)
+    n_dropped <- n_before - n_after
+    dropped_ids <- setdiff(design_df$patient_ID, design_df_complete$patient_ID)
+
+    if (n_after < 10) {
+      stop("Insufficient complete cases after removing missing values (n < 10).")
+    }
+
+    # Add status indicator
+    design_df_complete$status <- 1
+
+    # Get all predictor columns
+    all_predictor_cols <- setdiff(names(design_df_complete), c("patient_ID", "time", "status"))
+    
+    if (input$surv_outcome %in% all_predictor_cols) {
+      stop(paste0(
+        "The outcome variable '", input$surv_outcome, 
+        "' is also selected as a predictor. This creates circular logic. ",
+        "Please remove it from the predictor list."
+      ))
+    }
+
+    # Run separate Cox model for each predictor
+    univar_results <- list()
+    
+    for (pred_col in all_predictor_cols) {
+      tryCatch({
+        # Build formula for this predictor only
+        formula_str <- paste("Surv(time, status) ~", pred_col)
+        formula_obj <- as.formula(formula_str)
+        
+        # Fit Cox model
+        cox_model <- survival::coxph(formula_obj, data = design_df_complete)
+        cox_summary <- summary(cox_model)
+        
+        # Test proportional hazards
+        ph_test <- tryCatch(survival::cox.zph(cox_model), error = function(e) NULL)
+        
+        # Calculate risk scores
+        risk_scores <- predict(cox_model, type = "lp")
+        
+        # Calculate threshold
+        threshold <- if (split_method == "mean") {
+          mean(risk_scores, na.rm = TRUE)
+        } else {
+          median(risk_scores, na.rm = TRUE)
+        }
+        
+        # Create risk groups
+        temp_df <- design_df_complete[, c("patient_ID", "time", "status")]
+        temp_df$risk_score <- risk_scores
+        temp_df$risk_group <- ifelse(risk_scores > threshold, "High Risk", "Low Risk")
+        
+        # Check for 2 groups
+        if (length(unique(temp_df$risk_group)) < 2) {
+          threshold <- median(risk_scores, na.rm = TRUE)
+          temp_df$risk_group <- ifelse(risk_scores >= threshold, "High Risk", "Low Risk")
+        }
+        
+        # Store results for this predictor
+        univar_results[[pred_col]] <- list(
+          predictor = pred_col,
+          cox_model = cox_model,
+          cox_summary = cox_summary,
+          ph_test = ph_test,
+          data = temp_df,
+          threshold = threshold,
+          split_method = split_method
+        )
+      }, error = function(e) {
+        # Skip predictors that fail
+        NULL
+      })
+    }
+    
+    if (length(univar_results) == 0) {
+      stop("No predictors could be successfully modeled.")
+    }
+
+    return(list(
+      analysis_mode = "univariate",
+      univar_results = univar_results,
+      predictor_names = names(univar_results),
+      name_mapping = name_mapping,
+      details = list(
+        samples_before = n_before,
+        samples_after = n_after,
+        samples_dropped = n_dropped,
+        dropped_ids = dropped_ids
+      )
+    ))
+  }
+
+  observeEvent(input$run_surv, {
+    result <- tryCatch(
+      {
+        run_surv()
+      },
+      error = function(e) {
+        list(error = TRUE, message = conditionMessage(e))
+      }
+    )
+
+    if (!is.null(result) && isTRUE(result$error)) {
+      surv_state(result)
+      showNotification(paste("Time to event analysis failed:", result$message), type = "error", duration = 10)
+      return()
+    }
+
+    surv_state(result)
+    output$surv_cleared_msg <- renderText(NULL)
+    output$surv_error_ui <- renderUI(NULL)
+    
+    # If univariate mode, populate the predictor selector dropdown
+    if (!is.null(result$analysis_mode) && result$analysis_mode == "univariate") {
+      # Get display names for predictors
+      display_names <- result$predictor_names
+      if (!is.null(result$name_mapping)) {
+        display_names <- sapply(result$predictor_names, function(pn) {
+          if (pn %in% names(result$name_mapping)) {
+            result$name_mapping[[pn]]
+          } else {
+            pn
+          }
+        }, USE.NAMES = FALSE)
+      }
+      
+      # Create named vector for dropdown
+      predictor_choices <- setNames(result$predictor_names, display_names)
+      updateSelectInput(session, "surv_univar_predictor_display", 
+                       choices = predictor_choices,
+                       selected = result$predictor_names[1])
+    }
+    
+    # Display warnings if any (multivariate mode only)
+    if (!is.null(result$warnings) && length(result$warnings) > 0) {
+      showNotification(
+        HTML(paste(result$warnings, collapse = "<br><br>")),
+        type = "warning",
+        duration = 5,  # Auto-dismiss after 5 seconds
+        closeButton = TRUE
+      )
+    }
+  })
+
+  observeEvent(input$reset_surv, {
+    surv_state(NULL)
+    showNotification("Time to event analysis results cleared.", type = "message", duration = 5)
+    output$surv_cleared_msg <- renderText("Results cleared. Run time to event analysis again to see results here.")
+    output$surv_error_ui <- renderUI(NULL)
+  })
+  
+  # Helper function to get the current result to display
+  # In multivariate mode: returns the full result
+  # In univariate mode: returns the selected predictor's result
+  get_current_result <- function() {
+    s <- surv_state()
+    req(s)
+    
+    if (!is.null(s$error) && isTRUE(s$error)) {
+      return(s)
+    }
+    
+    if (!is.null(s$analysis_mode) && s$analysis_mode == "univariate") {
+      # Get selected predictor
+      selected_pred <- input$surv_univar_predictor_display
+      if (is.null(selected_pred) || !selected_pred %in% names(s$univar_results)) {
+        selected_pred <- s$predictor_names[1]  # Default to first
+      }
+      
+      # Extract that predictor's results and add metadata
+      pred_result <- s$univar_results[[selected_pred]]
+      pred_result$analysis_mode <- "univariate"
+      pred_result$selected_predictor <- selected_pred
+      pred_result$name_mapping <- s$name_mapping
+      pred_result$details <- s$details
+      pred_result$predictor_cols <- selected_pred
+      return(pred_result)
+    } else {
+      # Multivariate mode - return as is
+      return(s)
+    }
+  }
+
+  # Render error message
+  output$surv_error_ui <- renderUI({
+    s <- surv_state()
+    req(s)
+
+    if (!is.null(s$error) && isTRUE(s$error)) {
+      div(
+        style = "color: red; border: 2px solid red; padding: 10px; margin: 10px;",
+        h4("Error in Time to Event Analysis:"),
+        p(s$message),
+        h5("Suggestions:"),
+        tags$ul(
+          tags$li("Ensure sufficient samples with complete data (n >= 10)"),
+          tags$li("Check that manual threshold is within data range"),
+          tags$li("Try different predictors or outcome variable"),
+          tags$li("Verify that outcome variable is continuous")
+        )
+      )
+    }
+  })
+
+  # Time to event curve plot
+  output$surv_curve_plot <- renderPlot({
+    s <- get_current_result()
+    req(s)
+
+    if (!is.null(s$error) && isTRUE(s$error)) {
+      plot.new()
+      text(0.5, 0.5, paste("Error:", s$message), col = "red", cex = 1.2)
+      return()
+    }
+
+    req(s$data, s$threshold)
+
+    # Create risk-based groups for time to event curve
+    surv_data <- s$data
+    surv_data$group <- factor(surv_data$risk_group, levels = c("Low Risk", "High Risk"))
+    
+    # Check how many groups we actually have
+    n_groups <- length(levels(factor(surv_data$group)))
+    actual_groups <- unique(as.character(surv_data$group))
+    
+    # Handle case where we only have 1 group
+    if (length(actual_groups) < 2) {
+      plot.new()
+      text(0.5, 0.5, "Cannot create time-to-event curves: only 1 risk group present.\nTry using different predictors or a different split method.", 
+           col = "red", cex = 1.1)
+      return()
+    }
+
+    # Fit time to event curves by risk group
+    fit <- survival::survfit(Surv(time, status) ~ group, data = surv_data)
+
+    # Build plot title
+    plot_title <- if (!is.null(s$analysis_mode) && s$analysis_mode == "univariate" && !is.null(s$selected_predictor)) {
+      # Get display name for predictor
+      display_name <- s$selected_predictor
+      if (!is.null(s$name_mapping) && s$selected_predictor %in% names(s$name_mapping)) {
+        display_name <- s$name_mapping[[s$selected_predictor]]
+      }
+      sprintf("Time to Event Curves: %s (%s split)", display_name, tools::toTitleCase(s$split_method %||% "median"))
+    } else {
+      sprintf("Time to Event Curves by Predicted Risk (%s split)", tools::toTitleCase(s$split_method %||% "median"))
+    }
+    
+    # Only specify legend.labs if we have exactly 2 groups
+    plot_args <- list(
+      fit = fit,
+      data = surv_data,
+      pval = TRUE,
+      pval.method = TRUE,
+      pval.method.coord = c(0.05, 0.15),
+      pval.coord = c(0.05, 0.2),
+      pval.hjust = 0.5,
+      conf.int = isTRUE(input$surv_show_ci),
+      risk.table = FALSE,
+      xlab = "Time to Event",
+      ylab = "Event-Free Probability",
+      title = plot_title,
+      subtitle = "P-value: Log-rank test (dichotomized groups)",
+      legend.title = "Risk Group",
+      palette = c("#00BA38", "#F8766D"),
+      ggtheme = theme_minimal(base_size = 14)
+    )
+    
+    # Only add legend.labs if we have exactly 2 groups
+    if (length(actual_groups) == 2) {
+      plot_args$legend.labs <- c("Low Risk", "High Risk")
+    }
+    
+    do.call(ggsurvplot, plot_args)$plot
+  })
+
+  # Model summary
+  output$surv_summary <- renderPrint({
+    s <- get_current_result()
+    req(s)
+
+    if (!is.null(s$error) && isTRUE(s$error)) {
+      cat("Time to Event Analysis Error:\n\n")
+      cat(s$message, "\n")
+      return()
+    }
+
+    det <- s$details
+
+    cat("=== Time to Event Analysis Summary ===\n\n")
+    cat("Model: Cox Proportional Hazards\n")
+    
+    if (!is.null(s$analysis_mode) && s$analysis_mode == "univariate") {
+      cat("Analysis Mode: Univariate\n")
+      # Display original name if available
+      display_name <- s$selected_predictor
+      if (!is.null(s$name_mapping) && s$selected_predictor %in% names(s$name_mapping)) {
+        display_name <- s$name_mapping[[s$selected_predictor]]
+      }
+      cat("Predictor:", display_name, "\n")
+    } else {
+      cat("Analysis Mode: Multivariate\n")
+      cat("Predictors:", paste(input$surv_predictors, collapse = ", "), "\n")
+    }
+    
+    cat("Outcome:", input$surv_outcome, "\n")
+    cat("Risk stratification:", tools::toTitleCase(s$split_method %||% "median"), "split of risk scores\n")
+    cat("Risk score threshold:", sprintf("%.3f\n", s$threshold))
+    
+    # Add risk group counts
+    if (!is.null(s$data$risk_group)) {
+      group_counts <- table(s$data$risk_group)
+      cat("Risk groups: Low Risk n=", group_counts["Low Risk"], 
+          "; High Risk n=", group_counts["High Risk"], "\n", sep="")
+    }
+    
+    cat("\nSample counts:\n")
+    cat("  Before filtering:", det$samples_before, "\n")
+    cat("  After filtering:", det$samples_after, "\n")
+    cat("  Dropped:", det$samples_dropped, "\n")
+    if (length(det$dropped_ids) > 0) {
+      cat("  Dropped IDs:", paste(head(det$dropped_ids, 10), collapse = ", "))
+      if (length(det$dropped_ids) > 10) cat(", ...")
+      cat("\n")
+    }
+    
+    # Display warnings if any
+    if (!is.null(s$warnings) && length(s$warnings) > 0) {
+      cat("\n=== WARNINGS ===\n")
+      for (i in seq_along(s$warnings)) {
+        cat(sprintf("%d. %s\n", i, s$warnings[i]))
+      }
+      cat("\nNote: High correlation between predictors and outcome can cause\n")
+      cat("numerical instability. Consider using predictors that are measured\n")
+      cat("independently of the outcome variable.\n")
+    }
+  })
+
+  # Performance metrics table
+  build_surv_perf_table <- function(s, include_icons = TRUE) {
+    req(s, s$cox_model)
+
+    cox_summary <- s$cox_summary
+
+    # Extract coefficients for continuous model
+    coef_matrix <- cox_summary$coefficients
+    
+    # Build performance table
+    perf_rows <- list()
+
+    # Add validation warnings/status as FIRST row(s)
+    if (!is.null(s$warnings) && length(s$warnings) > 0) {
+      # Add a header row for warnings
+      warning_value <- if (include_icons) "⚠️ WARNINGS DETECTED" else "WARNINGS DETECTED"
+      perf_rows[[length(perf_rows) + 1]] <- data.frame(
+        Metric = "Model Validity Check",
+        Value = warning_value,
+        P_value = "---",
+        Interpretation = "See warnings below - model may have numerical issues",
+        stringsAsFactors = FALSE
+      )
+      
+      # Add each warning as a separate row
+      for (i in seq_along(s$warnings)) {
+        perf_rows[[length(perf_rows) + 1]] <- data.frame(
+          Metric = sprintf("  Warning %d", i),
+          Value = "---",
+          P_value = "---",
+          Interpretation = s$warnings[i],
+          stringsAsFactors = FALSE
+        )
+      }
+    } else {
+      # No warnings - model is valid
+      pass_value <- if (include_icons) "✓ PASSED" else "PASSED"
+      perf_rows[[length(perf_rows) + 1]] <- data.frame(
+        Metric = "Model Validity Check",
+        Value = pass_value,
+        P_value = "---",
+        Interpretation = "No high correlation or separation issues detected between predictors and outcome",
+        stringsAsFactors = FALSE
+      )
+    }
+
+    # Check for NA coefficients in continuous model (will show in Model Coefficients table)
+    # Don't add individual predictor metrics to Performance Metrics table
+
+    # Proportional hazards test (Schoenfeld residuals)
+    if (!is.null(s$ph_test)) {
+      global_p <- s$ph_test$table["GLOBAL", "p"]
+      perf_rows[[length(perf_rows) + 1]] <- data.frame(
+        Metric = "Schoenfeld Test (Global)",
+        Value = "---",
+        P_value = if (global_p < 0.001) formatC(global_p, format = "e", digits = 2) else sprintf("%.4f", global_p),
+        Interpretation = "Tests proportional hazards assumption; p > 0.05 suggests assumption holds",
+        stringsAsFactors = FALSE
+      )
+      
+      # Count predictors failing Schoenfeld test (p < 0.05)
+      n_predictors <- nrow(s$ph_test$table) - 1  # exclude GLOBAL row
+      failed_predictors <- sum(s$ph_test$table[1:n_predictors, "p"] < 0.05, na.rm = TRUE)
+      
+      interpretation_text <- if (failed_predictors == 0) {
+        "All predictors satisfy proportional hazards assumption"
+      } else if (failed_predictors == 1) {
+        "1 predictor violates proportional hazards assumption (p < 0.05). Consider removing this predictor or using time-varying coefficients. See Model Feature Performance table for details."
+      } else {
+        sprintf("%d predictors violate proportional hazards assumption (p < 0.05). Consider removing these predictors or using time-varying coefficients. See Model Feature Performance table for details.", failed_predictors)
+      }
+      
+      status_value <- if (include_icons) {
+        if (failed_predictors == 0) "✓ 0 Failed" else sprintf("⚠️ %d Failed", failed_predictors)
+      } else {
+        if (failed_predictors == 0) "0 Failed" else sprintf("%d Failed", failed_predictors)
+      }
+      
+      perf_rows[[length(perf_rows) + 1]] <- data.frame(
+        Metric = "Predictors Failing Schoenfeld Test",
+        Value = status_value,
+        P_value = "---",
+        Interpretation = interpretation_text,
+        stringsAsFactors = FALSE
+      )
+      # Individual Schoenfeld tests are now in Model Coefficients table
+    } else {
+      perf_rows[[length(perf_rows) + 1]] <- data.frame(
+        Metric = "Schoenfeld Test",
+        Value = "---",
+        P_value = "N/A",
+        Interpretation = "Could not compute proportional hazards test",
+        stringsAsFactors = FALSE
+      )
+    }
+
+    # Add Cox model p-value (for continuous predictor effect)
+    if (!is.null(s$predictor_cols) && length(s$predictor_cols) > 0) {
+      # Get p-value from Cox model for the predictor (univariate has 1 predictor)
+      coef_matrix <- s$cox_summary$coefficients
+      if (nrow(coef_matrix) == 1) {
+        # Univariate mode - single predictor
+        cox_p <- coef_matrix[1, "Pr(>|z|)"]
+        perf_rows[[length(perf_rows) + 1]] <- data.frame(
+          Metric = "Cox Model P-value (Continuous)",
+          Value = "---",
+          P_value = if (cox_p < 0.001) formatC(cox_p, format = "e", digits = 2) else sprintf("%.4f", cox_p),
+          Interpretation = "Tests whether predictor significantly affects hazard as continuous variable in Cox model",
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+
+    # Add dichotomized group counts - one row per group
+    group_counts <- table(s$data$risk_group)
+    
+    # Check if we have both groups
+    low_count <- if ("Low Risk" %in% names(group_counts)) as.character(group_counts["Low Risk"]) else "0"
+    high_count <- if ("High Risk" %in% names(group_counts)) as.character(group_counts["High Risk"]) else "0"
+    
+    # Low Risk group
+    perf_rows[[length(perf_rows) + 1]] <- data.frame(
+      Metric = "Risk Group: Low Risk",
+      Value = low_count,
+      P_value = "---",
+      Interpretation = "Number of samples predicted as low risk based on model",
+      stringsAsFactors = FALSE
+    )
+    
+    # High Risk group
+    perf_rows[[length(perf_rows) + 1]] <- data.frame(
+      Metric = "Risk Group: High Risk",
+      Value = high_count,
+      P_value = "---",
+      Interpretation = "Number of samples predicted as high risk based on model",
+      stringsAsFactors = FALSE
+    )
+
+    # Log-rank test for dichotomized curves - only if we have 2 groups
+    logrank_test <- tryCatch(
+      {
+        if (length(unique(s$data$risk_group)) >= 2) {
+          survdiff_result <- survival::survdiff(Surv(time, status) ~ risk_group, data = s$data)
+          logrank_p <- 1 - pchisq(survdiff_result$chisq, length(survdiff_result$n) - 1)
+          list(success = TRUE, p_value = logrank_p)
+        } else {
+          list(success = FALSE, message = "Only 1 risk group present")
+        }
+      },
+      error = function(e) {
+        list(success = FALSE, message = conditionMessage(e))
+      }
+    )
+    
+    if (logrank_test$success) {
+      perf_rows[[length(perf_rows) + 1]] <- data.frame(
+        Metric = "Log-rank Test P-value (Dichotomized)",
+        Value = "---",
+        P_value = if (logrank_test$p_value < 0.001) formatC(logrank_test$p_value, format = "e", digits = 2) else sprintf("%.4f", logrank_test$p_value),
+        Interpretation = "Tests curve separation after dichotomizing by risk score. May differ from Cox p-value due to information loss from dichotomization. This p-value appears on the plot.",
+        stringsAsFactors = FALSE
+      )
+    } else {
+      perf_rows[[length(perf_rows) + 1]] <- data.frame(
+        Metric = "Log-rank Test (Risk-based Curves)",
+        Value = "---",
+        P_value = "N/A",
+        Interpretation = paste("Cannot compute:", logrank_test$message),
+        stringsAsFactors = FALSE
+      )
+    }
+
+    # Sample info
+    det <- s$details
+    perf_rows[[length(perf_rows) + 1]] <- data.frame(
+      Metric = "Samples before filtering",
+      Value = as.character(det$samples_before),
+      P_value = "---",
+      Interpretation = "Count of samples before removing missing values",
+      stringsAsFactors = FALSE
+    )
+
+    perf_rows[[length(perf_rows) + 1]] <- data.frame(
+      Metric = "Samples after filtering",
+      Value = as.character(det$samples_after),
+      P_value = "---",
+      Interpretation = "Count of samples used in analysis",
+      stringsAsFactors = FALSE
+    )
+
+    perf_rows[[length(perf_rows) + 1]] <- data.frame(
+      Metric = "Samples dropped",
+      Value = as.character(det$samples_dropped),
+      P_value = "---",
+      Interpretation = "Number of samples removed due to missing values",
+      stringsAsFactors = FALSE
+    )
+
+    perf_table <- do.call(rbind, perf_rows)
+    
+    # Wrap interpretation text to make it less wide (only at whitespace)
+    perf_table$Interpretation <- sapply(perf_table$Interpretation, function(text) {
+      paste(strwrap(text, width = 50), collapse = "\n")
+    }, USE.NAMES = FALSE)
+    
+    perf_table
+  }
+
+  output$surv_perf_table <- renderTable({
+    s <- get_current_result()
+    req(s)
+
+    if (!is.null(s$error) && isTRUE(s$error)) {
+      return(data.frame(Message = "Error in analysis - see message above"))
+    }
+
+    build_surv_perf_table(s)
+  }, rownames = FALSE, striped = TRUE)
+
+  # Model coefficients table
+  surv_coef_table <- reactive({
+    include_all_cols = TRUE  # default to all columns for export
+  }) 
+  
+  surv_coef_table <- function(include_all_cols = TRUE) {
+    s <- isolate(surv_state())  # Use full state, not filtered result
+    req(s)
+
+    if (!is.null(s$error) && isTRUE(s$error)) {
+      return(NULL)
+    }
+    
+    # Check if univariate mode
+    if (!is.null(s$analysis_mode) && s$analysis_mode == "univariate") {
+      # Build table with all univariate results
+      all_results <- list()
+      
+      for (pred_name in names(s$univar_results)) {
+        pred_result <- s$univar_results[[pred_name]]
+        coef_matrix <- pred_result$cox_summary$coefficients
+        
+        # Get display name
+        display_name <- pred_name
+        if (!is.null(s$name_mapping) && pred_name %in% names(s$name_mapping)) {
+          display_name <- s$name_mapping[[pred_name]]
+        }
+        
+        # Calculate log-rank p-value for this predictor
+        logrank_p <- tryCatch({
+          if (length(unique(pred_result$data$risk_group)) >= 2) {
+            survdiff_result <- survival::survdiff(Surv(time, status) ~ risk_group, data = pred_result$data)
+            1 - pchisq(survdiff_result$chisq, length(survdiff_result$n) - 1)
+          } else {
+            NA_real_
+          }
+        }, error = function(e) NA_real_)
+        
+        # Extract coefficients
+        all_results[[pred_name]] <- data.frame(
+          Feature = display_name,
+          Coefficient = coef_matrix[1, "coef"],
+          HazardRatio = coef_matrix[1, "exp(coef)"],
+          SE = coef_matrix[1, "se(coef)"],
+          Z_value = coef_matrix[1, "z"],
+          P_value_Cox = coef_matrix[1, "Pr(>|z|)"],
+          P_value_Logrank = logrank_p,
+          Schoenfeld_P = if (!is.null(pred_result$ph_test)) {
+            pred_result$ph_test$table[1, "p"]
+          } else {
+            NA_real_
+          },
+          stringsAsFactors = FALSE
+        )
+      }
+      
+      coef_df <- do.call(rbind, all_results)
+      rownames(coef_df) <- NULL
+      
+      # Format p-values
+      coef_df$P_value_Cox <- sapply(coef_df$P_value_Cox, function(p) {
+        if (is.na(p)) return(NA_character_)
+        if (p < 0.001) formatC(p, format = "e", digits = 2) else sprintf("%.4f", p)
+      })
+      
+      coef_df$P_value_Logrank <- sapply(coef_df$P_value_Logrank, function(p) {
+        if (is.na(p)) return(NA_character_)
+        if (p < 0.001) formatC(p, format = "e", digits = 2) else sprintf("%.4f", p)
+      })
+      
+      coef_df$Schoenfeld_P <- sapply(coef_df$Schoenfeld_P, function(p) {
+        if (is.na(p)) return(NA_character_)
+        if (p < 0.001) formatC(p, format = "e", digits = 2) else sprintf("%.4f", p)
+      })
+      
+      # Order by absolute coefficient
+      coef_df <- coef_df[order(-abs(coef_df$Coefficient)), ]
+      
+      # Remove technical columns if requested
+      if (!include_all_cols) {
+        coef_df <- coef_df[, !(names(coef_df) %in% c("Coefficient", "SE", "Z_value"))]
+      }
+      
+      return(coef_df)
+    }
+    
+    # Multivariate mode - use get_current_result
+    s <- get_current_result()
+    req(s, s$cox_model)
+
+    coef_matrix <- s$cox_summary$coefficients
+
+    # Store sanitized names before restoration (these match Schoenfeld test results)
+    sanitized_names <- rownames(coef_matrix)
+    
+    # Restore original names using name_mapping if available
+    feature_names <- rownames(coef_matrix)
+    if (!is.null(s$name_mapping)) {
+      feature_names <- sapply(feature_names, function(fn) {
+        if (fn %in% names(s$name_mapping)) {
+          s$name_mapping[[fn]]
+        } else {
+          fn
+        }
+      }, USE.NAMES = FALSE)
+    }
+    
+    coef_df <- data.frame(
+      Feature = feature_names,
+      Coefficient = coef_matrix[, "coef"],
+      HazardRatio = coef_matrix[, "exp(coef)"],
+      SE = coef_matrix[, "se(coef)"],
+      Z_value = coef_matrix[, "z"],
+      P_value_Cox = coef_matrix[, "Pr(>|z|)"],
+      stringsAsFactors = FALSE
+    )
+
+    # Add Schoenfeld test p-values if available (use sanitized names for lookup)
+    if (!is.null(s$ph_test)) {
+      schoenfeld_p <- rep(NA_real_, nrow(coef_df))
+      for (i in 1:nrow(coef_df)) {
+        san_name <- sanitized_names[i]  # Use sanitized name for lookup
+        if (san_name %in% rownames(s$ph_test$table)) {
+          schoenfeld_p[i] <- s$ph_test$table[san_name, "p"]
+        }
+      }
+      coef_df$Schoenfeld_P <- schoenfeld_p
+    } else {
+      coef_df$Schoenfeld_P <- NA_real_
+    }
+
+    # Format p-values
+    coef_df$P_value_Cox <- sapply(coef_df$P_value_Cox, function(p) {
+      if (is.na(p)) return(NA_character_)
+      if (p < 0.001) formatC(p, format = "e", digits = 2) else sprintf("%.4f", p)
+    })
+    
+    coef_df$Schoenfeld_P <- sapply(coef_df$Schoenfeld_P, function(p) {
+      if (is.na(p)) return(NA_character_)
+      if (p < 0.001) formatC(p, format = "e", digits = 2) else sprintf("%.4f", p)
+    })
+
+    # Order by absolute coefficient
+    coef_df <- coef_df[order(-abs(coef_df$Coefficient)), ]
+
+    # Remove technical columns if requested
+    if (!include_all_cols) {
+      coef_df <- coef_df[, !(names(coef_df) %in% c("Coefficient", "SE", "Z_value"))]
+    }
+    
+    coef_df
+  }
+
+  output$surv_coefs <- renderTable({
+    surv_coef_table(include_all_cols = FALSE)
+  })
+  
+  # Dynamic header for coefficients table
+  output$surv_coef_header <- renderUI({
+    s <- surv_state()
+    if (!is.null(s) && !is.null(s$analysis_mode) && s$analysis_mode == "univariate") {
+      tagList(
+        h4("Model Feature Performance (univariate)"),
+        helpText("Showing univariate Cox model results for each predictor independently. Each predictor was tested in a separate model.")
+      )
+    } else {
+      tagList(
+        h4("Model Feature Performance (multivariate)"),
+        helpText("Showing results from a single model with all predictors included together.")
+      )
+    }
+  })
+
+  output$hasSurvResults <- reactive({
+    s <- surv_state()
+    !is.null(s) && is.null(s$error)
+  })
+  outputOptions(output, "hasSurvResults", suspendWhenHidden = FALSE)
+
+  output$hasSurvCoefs <- reactive({
+    s <- surv_state()
+    if (is.null(s) || !is.null(s$error)) {
+      return(FALSE)
+    }
+    # Check for multivariate mode or univariate mode
+    if (!is.null(s$analysis_mode) && s$analysis_mode == "univariate") {
+      return(!is.null(s$univar_results) && length(s$univar_results) > 0)
+    } else {
+      return(!is.null(s$cox_model))
+    }
+  })
+  outputOptions(output, "hasSurvCoefs", suspendWhenHidden = FALSE)
+
+  # ZIP download handler
+  output$export_surv_zip <- downloadHandler(
+    filename = function() {
+      subset_id <- rv$subset_id %||% "000000000"
+      outcome <- gsub("\\s+", "_", tolower(input$surv_outcome %||% "outcome"))
+      s <- surv_state()
+      mode_suffix <- if (!is.null(s$analysis_mode) && s$analysis_mode == "univariate") "univar" else "multivar"
+      
+      # Add predictor name for univariate mode
+      if (!is.null(s$analysis_mode) && s$analysis_mode == "univariate" && !is.null(input$surv_univar_predictor_display)) {
+        predictor_name <- input$surv_univar_predictor_display
+        # Get display name if available
+        if (!is.null(s$name_mapping) && predictor_name %in% names(s$name_mapping)) {
+          predictor_name <- s$name_mapping[[predictor_name]]
+        }
+        # Sanitize for filename
+        predictor_name <- gsub("[^A-Za-z0-9_-]", "_", predictor_name)
+        paste0("time_to_event_cox_", outcome, "_", mode_suffix, "_", predictor_name, "_", subset_id, ".zip")
+      } else {
+        paste0("time_to_event_cox_", outcome, "_", mode_suffix, "_", subset_id, ".zip")
+      }
+    },
+    content = function(file) {
+      subset_id <- rv$subset_id %||% "000000000"
+      s <- get_current_result()
+      req(s, s$cox_model)
+
+      outcome <- gsub("\\s+", "_", tolower(input$surv_outcome %||% "outcome"))
+      
+      # Determine mode and predictors
+      analysis_mode <- if (!is.null(s$analysis_mode)) s$analysis_mode else "multivariate"
+      mode_suffix <- if (analysis_mode == "univariate") "univar" else "multivar"
+      
+      # Get predictor text and sanitized name for filename
+      predictor_text <- if (analysis_mode == "univariate") {
+        display_name <- s$selected_predictor
+        if (!is.null(s$name_mapping) && s$selected_predictor %in% names(s$name_mapping)) {
+          display_name <- s$name_mapping[[s$selected_predictor]]
+        }
+        display_name
+      } else {
+        paste(input$surv_predictors, collapse = "; ")
+      }
+      
+      # Build prefix with predictor name for univariate
+      if (analysis_mode == "univariate") {
+        predictor_filename <- gsub("[^A-Za-z0-9_-]", "_", predictor_text)
+        prefix <- paste0("time_to_event_cox_", outcome, "_", mode_suffix, "_", predictor_filename)
+      } else {
+        prefix <- paste0("time_to_event_cox_", outcome, "_", mode_suffix)
+      }
+
+      tmpdir <- tempdir()
+      files <- c()
+
+      # 1. Model Summary (key-value CSV)
+      summary_file <- file.path(tmpdir, paste0(prefix, "_model_summary_", subset_id, ".csv"))
+      summary_kv <- data.frame(
+        Key = c(
+          "Model type", "Analysis mode", "Outcome variable", "Predictors", "Risk stratification method", 
+          "Risk score threshold", "Samples before filtering", "Samples after filtering", "Samples dropped"
+        ),
+        Value = c(
+          "Cox Proportional Hazards",
+          tools::toTitleCase(analysis_mode),
+          input$surv_outcome,
+          predictor_text,
+          tools::toTitleCase(s$split_method %||% "median"),
+          sprintf("%.3f", s$threshold),
+          s$details$samples_before %||% NA,
+          s$details$samples_after %||% NA,
+          s$details$samples_dropped %||% NA
+        ),
+        stringsAsFactors = FALSE
+      )
+      write.csv(summary_kv, summary_file, row.names = FALSE)
+      files <- c(files, summary_file)
+
+      # 2. Performance Metrics
+      perf_file <- file.path(tmpdir, paste0(prefix, "_performance_metrics_", subset_id, ".csv"))
+      perf_df <- tryCatch(
+        {
+          build_surv_perf_table(s, include_icons = FALSE)
+        },
+        error = function(e) data.frame(Message = "Error extracting performance metrics")
+      )
+      write.csv(perf_df, perf_file, row.names = FALSE)
+      files <- c(files, perf_file)
+
+      # 3. Model Coefficients
+      coef_file <- file.path(tmpdir, paste0(prefix, "_model_coefficients_", subset_id, ".csv"))
+      coef_df <- tryCatch(
+        {
+          surv_coef_table()
+        },
+        error = function(e) data.frame(Message = "Error extracting coefficients")
+      )
+      write.csv(coef_df, coef_file, row.names = FALSE)
+      files <- c(files, coef_file)
+
+      # 4. Time to Event Curve (PDF)
+      curve_file <- file.path(tmpdir, paste0(prefix, "_time_to_event_curve_", subset_id, ".pdf"))
+      tryCatch(
+        {
+          surv_data <- s$data
+          surv_data$group <- factor(surv_data$risk_group, levels = c("Low Risk", "High Risk"))
+          
+          # Check if we have at least 2 groups
+          actual_groups <- unique(as.character(surv_data$group))
+          
+          if (length(actual_groups) < 2) {
+            # Only 1 group - create error plot
+            pdf(curve_file, width = 8, height = 6)
+            plot.new()
+            text(0.5, 0.5, "Cannot create time-to-event curves:\nonly 1 risk group present", cex = 1.2, col = "red")
+            dev.off()
+          } else {
+            # We have 2 groups - proceed with plotting
+            fit <- survival::survfit(Surv(time, status) ~ group, data = surv_data)
+            
+            # Build plot title
+            plot_title <- if (!is.null(s$analysis_mode) && s$analysis_mode == "univariate" && !is.null(s$selected_predictor)) {
+              # Get display name for predictor
+              display_name <- s$selected_predictor
+              if (!is.null(s$name_mapping) && s$selected_predictor %in% names(s$name_mapping)) {
+                display_name <- s$name_mapping[[s$selected_predictor]]
+              }
+              sprintf("Time to Event Curves: %s (%s split)", display_name, tools::toTitleCase(s$split_method %||% "median"))
+            } else {
+              sprintf("Time to Event Curves by Predicted Risk (%s split)", tools::toTitleCase(s$split_method %||% "median"))
+            }
+            
+            plot_args <- list(
+              fit = fit,
+              data = surv_data,
+              pval = TRUE,
+              pval.method = TRUE,
+              pval.method.coord = c(0.05, 0.15),
+              pval.coord = c(0.05, 0.2),
+              pval.hjust = 0.5,
+              conf.int = isTRUE(input$surv_show_ci),
+              risk.table = TRUE,
+              risk.table.height = 0.25,
+              xlab = "Time to Event",
+              ylab = "Event-Free Probability",
+              title = plot_title,
+              subtitle = "P-value: Log-rank test (dichotomized groups)",
+              legend.title = "Risk Group",
+              palette = c("#00BA38", "#F8766D"),
+              ggtheme = theme_minimal(base_size = 14)
+            )
+            
+            # Only add legend.labs if we have exactly 2 groups
+            if (length(actual_groups) == 2) {
+              plot_args$legend.labs <- c("Low Risk", "High Risk")
+            }
+            
+            surv_plot <- do.call(ggsurvplot, plot_args)
+            
+            ggsave(curve_file,
+              plot = surv_plot$plot,
+              device = if (capabilities("cairo")) cairo_pdf else pdf,
+              width = 8, height = 6, units = "in"
+            )
+          }
+        },
+        error = function(e) {
+          pdf(curve_file, width = 8, height = 6)
+          plot.new()
+          text(0.5, 0.5, paste("Error creating time-to-event curve:", conditionMessage(e)), cex = 0.9, col = "red")
+          dev.off()
+        }
+      )
+      files <- c(files, curve_file)
+
+      # Bundle into zip
+      zip::zip(zipfile = file, files = files, mode = "cherry-pick")
+    },
+    contentType = "application/zip"
   )
 }
 
