@@ -906,6 +906,7 @@ ui <- navbarPage(
         selectInput("cat_max_facets", "Facet columns", choices = 2:6, selected = 4),
         selectInput("cat_plot_type", "Plot type", choices = c("Boxplot" = "box", "Violin" = "violin"), selected = "box"),
         uiOutput("cat_points_ui"),
+        checkboxInput("cat_show_xaxis_labels", "Show x-axis labels", value = FALSE),
         br(),
         actionButton("cat_populate_colors", "Populate colors for selected group variable"),
         br(),
@@ -1031,8 +1032,31 @@ ui <- navbarPage(
           condition = "input.lm_predictors.includes('cluster')",
           pickerInput("lm_cluster_subset", "Select clusters to include", choices = NULL, multiple = TRUE)
         ),
+        hr(),
         radioButtons("lm_model_type", "Model type",
           choices = c("Logistic Regression", "Elastic Net", "Random Forest")
+        ),
+        conditionalPanel(
+          condition = "input.lm_model_type == 'Logistic Regression'",
+          checkboxInput("lm_use_regularization", "Apply regularization (glmnet)", value = FALSE),
+          helpText("Adds penalty to reduce overfitting with many/correlated predictors.")
+        ),
+        conditionalPanel(
+          condition = "input.lm_model_type == 'Logistic Regression' && input.lm_use_regularization",
+          selectInput("lm_penalty_type", "Penalty type:",
+            choices = c("Lasso (L1, feature selection)" = "lasso",
+                        "Ridge (L2, shrinkage only)" = "ridge",
+                        "Elastic Net (L1+L2 mix)" = "elasticnet"),
+            selected = "lasso"
+          ),
+          helpText("Lasso can shrink coefficients to zero (automatic feature selection).")
+        ),
+        conditionalPanel(
+          condition = "input.lm_model_type == 'Logistic Regression' && input.lm_use_regularization && input.lm_penalty_type == 'elasticnet'",
+          sliderInput("lm_regularization_alpha", "Elastic net mixing (α):",
+            min = 0, max = 1, value = 0.5, step = 0.1
+          ),
+          helpText("α=0: pure ridge, α=1: pure lasso, 0<α<1: elastic net mix.")
         ),
         conditionalPanel(
           condition = "input.lm_model_type == 'Elastic Net'",
@@ -1040,6 +1064,7 @@ ui <- navbarPage(
             min = 0, max = 1, value = 0.5, step = 0.05
           )
         ),
+        hr(),
         radioButtons("lm_validation", "Validation strategy",
           choices = c("Train/Test split", "k-fold CV", "Leave-One-Out")
         ),
@@ -1106,8 +1131,31 @@ ui <- navbarPage(
           condition = "input.reg_predictors.includes('cluster')",
           pickerInput("reg_cluster_subset", "Select clusters to include", choices = NULL, multiple = TRUE)
         ),
+        hr(),
         radioButtons("reg_model_type", "Model type",
           choices = c("Linear Regression", "Ridge Regression", "Elastic Net", "Random Forest")
+        ),
+        conditionalPanel(
+          condition = "input.reg_model_type == 'Linear Regression'",
+          checkboxInput("reg_use_regularization", "Apply regularization (glmnet)", value = FALSE),
+          helpText("Adds penalty to reduce overfitting with many/correlated predictors.")
+        ),
+        conditionalPanel(
+          condition = "input.reg_model_type == 'Linear Regression' && input.reg_use_regularization",
+          selectInput("reg_penalty_type", "Penalty type:",
+            choices = c("Lasso (L1, feature selection)" = "lasso",
+                        "Ridge (L2, shrinkage only)" = "ridge",
+                        "Elastic Net (L1+L2 mix)" = "elasticnet"),
+            selected = "lasso"
+          ),
+          helpText("Lasso can shrink coefficients to zero (automatic feature selection).")
+        ),
+        conditionalPanel(
+          condition = "input.reg_model_type == 'Linear Regression' && input.reg_use_regularization && input.reg_penalty_type == 'elasticnet'",
+          sliderInput("reg_regularization_alpha", "Elastic net mixing (α):",
+            min = 0, max = 1, value = 0.5, step = 0.1
+          ),
+          helpText("α=0: pure ridge, α=1: pure lasso, 0<α<1: elastic net mix.")
         ),
         conditionalPanel(
           condition = "input.reg_model_type == 'Elastic Net'",
@@ -1115,6 +1163,7 @@ ui <- navbarPage(
             min = 0, max = 1, value = 0.5, step = 0.05
           )
         ),
+        hr(),
         radioButtons("reg_validation", "Validation strategy",
           choices = c("Train/Test split", "k-fold CV", "Leave-One-Out")
         ),
@@ -1190,7 +1239,7 @@ ui <- navbarPage(
             )
           ),
           pickerInput("sccomp_formula_vars", "Additional covariates (optional)", choices = NULL, multiple = TRUE),
-          checkboxInput("sccomp_interactions", "Include interactions", FALSE)
+          checkboxInput("sccomp_interactions", "Use interactions instead of additive effects in model formula.", FALSE)
         ),
         conditionalPanel(
           condition = "input.sccomp_formula_mode == 'custom'",
@@ -1206,11 +1255,18 @@ ui <- navbarPage(
           ),
           helpText("Specify reference levels as: variable=level; separated by semicolons. Example: condition=Control; treatment=Placebo")
         ),
+        selectInput("sccomp_inference_method", "Inference method",
+          choices = c("Pathfinder" = "pathfinder",
+                      "HMC" = "hmc",
+                      "Variational" = "variational"),
+          selected = "pathfinder"
+        ),
+        helpText("Pathfinder is fastest; HMC is most accurate but slower; Variational is intermediate."),
         sliderInput("sccomp_cores", "Number of cores",
           min = 1, max = parallel::detectCores(),
           value = max(1, parallel::detectCores() - 2), step = 1
         ),
-        actionButton("run_sccomp", "Run sccomp_estimate", class = "btn-primary"),
+        actionButton("run_sccomp", "Run sccomp", class = "btn-primary"),
         br(), br(),
         conditionalPanel(
           condition = "output.hasSccompResults",
@@ -1222,7 +1278,7 @@ ui <- navbarPage(
           textInput("sccomp_contrast", "Contrast specification",
             placeholder = "e.g., `conditionTreated` - `conditionControl`"
           ),
-          actionButton("run_sccomp_test", "Run sccomp_test", class = "btn-secondary"),
+          actionButton("run_sccomp_test", "Run contrast", class = "btn-secondary"),
           br(), br(),
           downloadButton("export_sccomp_results", "Export results as CSV"),
           br(), br(),
@@ -1325,6 +1381,16 @@ ui <- navbarPage(
         ),
         checkboxInput("surv_show_ci", "Show confidence intervals", value = TRUE),
         helpText("Use time to event curve figure for visualization only. Continuous model results are more powerful."),
+        hr(),
+        h5("Risk Group Colors"),
+        colourpicker::colourInput("surv_color_low_risk", "Low Risk color:",
+          value = "#87CEEB", # Sky blue (colorblind friendly)
+          showColour = "both"
+        ),
+        colourpicker::colourInput("surv_color_high_risk", "High Risk color:",
+          value = "#FF69B4", # Hot pink (colorblind friendly)
+          showColour = "both"
+        ),
         br(),
         actionButton("run_surv", "Run Model", class = "btn-primary"),
         br(), br(),
@@ -4418,6 +4484,7 @@ server <- function(input, output, session) {
       facet_cols = as.numeric(input$cat_max_facets),
       plot_type = plot_type_selected,
       point_mode = point_mode_selected,
+      show_xaxis_labels = input$cat_show_xaxis_labels,
       colors = if (!is.null(rv$cat_colors)) rv$cat_colors else NULL
     )
   })
@@ -4686,7 +4753,16 @@ server <- function(input, output, session) {
         ggplot2::labs(x = group_var, y = "Frequency") +
         ggplot2::theme(
           strip.text.x = ggplot2::element_text(margin = ggplot2::margin(t = 1.1, b = 1.1)),
-          axis.text.x = ggplot2::element_text(angle = 45, hjust = 1) # rotate facet x-axis labels 45 degrees
+          axis.text.x = if (isTRUE(cp$show_xaxis_labels)) {
+            ggplot2::element_text(angle = 45, hjust = 1)
+          } else {
+            ggplot2::element_blank()
+          },
+          axis.ticks.x = if (isTRUE(cp$show_xaxis_labels)) {
+            ggplot2::element_line()
+          } else {
+            ggplot2::element_blank()
+          }
         )
 
       # Apply manual fill scale; points use black border so no color scale required for border
@@ -6074,11 +6150,16 @@ server <- function(input, output, session) {
     null_acc <- mean(y == majority_class)
 
     # Choose model method
-    method <- switch(input$lm_model_type,
-      "Logistic Regression" = "multinom",
-      "Elastic Net"         = "glmnet",
-      "Random Forest"       = "rf"
-    )
+    # If Logistic Regression with regularization, use glmnet instead of multinom
+    method <- if (input$lm_model_type == "Logistic Regression" && isTRUE(input$lm_use_regularization)) {
+      "glmnet"
+    } else {
+      switch(input$lm_model_type,
+        "Logistic Regression" = "multinom",
+        "Elastic Net"         = "glmnet",
+        "Random Forest"       = "rf"
+      )
+    }
     cat("Running model type:", method, "\n")
 
     validation <- input$lm_validation
@@ -6106,7 +6187,18 @@ server <- function(input, output, session) {
         testMat <- model.matrix(~ . - 1, data = testX)
         storage.mode(trainMat) <- "double"
         storage.mode(testMat) <- "double"
-        alpha_val <- input$lm_alpha %||% 0.5
+        
+        # Determine alpha: either from regularized logistic or elastic net slider
+        if (input$lm_model_type == "Logistic Regression" && isTRUE(input$lm_use_regularization)) {
+          alpha_val <- switch(input$lm_penalty_type,
+            "lasso" = 1,
+            "ridge" = 0,
+            "elasticnet" = input$lm_regularization_alpha %||% 0.5
+          )
+        } else {
+          alpha_val <- input$lm_alpha %||% 0.5
+        }
+        
         model <- tryCatch(
           {
             caret::train(
@@ -6197,7 +6289,18 @@ server <- function(input, output, session) {
     if (method == "glmnet") {
       Xmat <- model.matrix(~ . - 1, data = X)
       storage.mode(Xmat) <- "double"
-      alpha_val <- input$lm_alpha %||% 0.5
+      
+      # Determine alpha: either from regularized logistic or elastic net slider
+      if (input$lm_model_type == "Logistic Regression" && isTRUE(input$lm_use_regularization)) {
+        alpha_val <- switch(input$lm_penalty_type,
+          "lasso" = 1,
+          "ridge" = 0,
+          "elasticnet" = input$lm_regularization_alpha %||% 0.5
+        )
+      } else {
+        alpha_val <- input$lm_alpha %||% 0.5
+      }
+      
       model <- caret::train(
         x = Xmat, y = y,
         method = "glmnet",
@@ -6706,11 +6809,17 @@ server <- function(input, output, session) {
         }
       }
 
+      # Filter out features with 0 coefficients (these were selected out by regularization)
+      df <- df[abs(df$StandardizedCoef) > 1e-6, ]
+      
+      # Calculate odds ratios for logistic regression (glmnet can be used for classification)
+      df$OddsRatio <- exp(df$OriginalCoef)
+      
       # Enforce column order
       if ("Class" %in% names(df)) {
-        df <- df[, c("Class", "Feature", "StandardizedCoef", "OriginalCoef")]
+        df <- df[, c("Class", "Feature", "StandardizedCoef", "OriginalCoef", "OddsRatio")]
       } else {
-        df <- df[, c("Feature", "StandardizedCoef", "OriginalCoef")]
+        df <- df[, c("Feature", "StandardizedCoef", "OriginalCoef", "OddsRatio")]
       }
       df <- order_features(df, "StandardizedCoef")
       rownames(df) <- NULL
@@ -6732,7 +6841,9 @@ server <- function(input, output, session) {
 
         # No standardization for glm/multinom, so standardized = original
         df_long$StandardizedCoef <- df_long$OriginalCoef
-        df <- df_long[, c("Class", "Feature", "StandardizedCoef", "OriginalCoef")]
+        # Add odds ratios for logistic regression
+        df_long$OddsRatio <- exp(df_long$OriginalCoef)
+        df <- df_long[, c("Class", "Feature", "StandardizedCoef", "OriginalCoef", "OddsRatio")]
       } else {
         # Binary logistic regression: named vector of coefficients (predictors)
         df <- data.frame(
@@ -6741,7 +6852,9 @@ server <- function(input, output, session) {
           stringsAsFactors = FALSE
         )
         df$StandardizedCoef <- df$OriginalCoef
-        df <- df[, c("Feature", "StandardizedCoef", "OriginalCoef")]
+        # Add odds ratios for binary logistic regression
+        df$OddsRatio <- exp(df$OriginalCoef)
+        df <- df[, c("Feature", "StandardizedCoef", "OriginalCoef", "OddsRatio")]
       }
       # Remove backticks from feature names
       df$Feature <- gsub("`", "", df$Feature, fixed = TRUE)
@@ -6792,14 +6905,24 @@ server <- function(input, output, session) {
       req(s, s$model)
 
       if (s$model$method %in% c("glm", "glmnet", "multinom")) {
-        coef_table()
+        tbl <- coef_table()
+        # Format OddsRatio column with scientific notation if <= 0.001 or >= 100
+        if (!is.null(tbl) && "OddsRatio" %in% names(tbl)) {
+          tbl$OddsRatio <- ifelse(
+            abs(tbl$OddsRatio) >= 100 | abs(tbl$OddsRatio) <= 0.001,
+            formatC(tbl$OddsRatio, format = "e", digits = 2),
+            as.character(signif(tbl$OddsRatio, 3))
+          )
+        }
+        tbl
       } else if (s$model$method == "rf") {
         rf_importance()
       } else {
         data.frame(Message = "Feature importance not available for this model type.")
       }
     },
-    digits = 3
+    digits = 3,
+    sanitize.text.function = function(x) x
   )
 
   output$hasLMResults <- reactive({
@@ -6874,8 +6997,12 @@ server <- function(input, output, session) {
       }
 
       if (!is.null(feat_df) && nrow(feat_df) > 0) {
-        # Enforce column order
-        if (all(c("Class", "Feature", "StandardizedCoef", "OriginalCoef") %in% names(feat_df))) {
+        # Enforce column order - include OddsRatio if present
+        if (all(c("Class", "Feature", "StandardizedCoef", "OriginalCoef", "OddsRatio") %in% names(feat_df))) {
+          feat_df <- feat_df[, c("Class", "Feature", "StandardizedCoef", "OriginalCoef", "OddsRatio")]
+        } else if (all(c("Feature", "StandardizedCoef", "OriginalCoef", "OddsRatio") %in% names(feat_df))) {
+          feat_df <- feat_df[, c("Feature", "StandardizedCoef", "OriginalCoef", "OddsRatio")]
+        } else if (all(c("Class", "Feature", "StandardizedCoef", "OriginalCoef") %in% names(feat_df))) {
           feat_df <- feat_df[, c("Class", "Feature", "StandardizedCoef", "OriginalCoef")]
         } else if (all(c("Feature", "StandardizedCoef", "OriginalCoef") %in% names(feat_df))) {
           feat_df <- feat_df[, c("Feature", "StandardizedCoef", "OriginalCoef")]
@@ -6985,12 +7112,17 @@ server <- function(input, output, session) {
     null_rmse <- sqrt(mean((y - mean(y))^2))
 
     # Choose model method
-    method <- switch(input$reg_model_type,
-      "Linear Regression"  = "lm",
-      "Ridge Regression"   = "glmnet",
-      "Elastic Net"        = "glmnet",
-      "Random Forest"      = "rf"
-    )
+    # If Linear Regression with regularization, use glmnet instead of lm
+    method <- if (input$reg_model_type == "Linear Regression" && isTRUE(input$reg_use_regularization)) {
+      "glmnet"
+    } else {
+      switch(input$reg_model_type,
+        "Linear Regression"  = "lm",
+        "Ridge Regression"   = "glmnet",
+        "Elastic Net"        = "glmnet",
+        "Random Forest"      = "rf"
+      )
+    }
     cat("Running regression model type:", method, "\n")
 
     validation <- input$reg_validation
@@ -7039,7 +7171,19 @@ server <- function(input, output, session) {
         trainY <- if (trainY_sd > 0) (trainY_orig - trainY_mean) / trainY_sd else trainY_orig
         y_scale_params <- list(mean = trainY_mean, sd = trainY_sd)
 
-        alpha_val <- if (input$reg_model_type == "Ridge Regression") 0 else (input$reg_alpha %||% 0.5)
+        # Determine alpha: either from regularized linear regression, ridge, or elastic net slider
+        if (input$reg_model_type == "Linear Regression" && isTRUE(input$reg_use_regularization)) {
+          alpha_val <- switch(input$reg_penalty_type,
+            "lasso" = 1,
+            "ridge" = 0,
+            "elasticnet" = input$reg_regularization_alpha %||% 0.5
+          )
+        } else if (input$reg_model_type == "Ridge Regression") {
+          alpha_val <- 0
+        } else {
+          alpha_val <- input$reg_alpha %||% 0.5
+        }
+        
         model <- tryCatch(
           {
             caret::train(
@@ -7184,7 +7328,19 @@ server <- function(input, output, session) {
       y_scaled <- if (y_sd > 0) (y - y_mean) / y_sd else y
       y_scale_params <- list(mean = y_mean, sd = y_sd)
 
-      alpha_val <- if (input$reg_model_type == "Ridge Regression") 0 else (input$reg_alpha %||% 0.5)
+      # Determine alpha: either from regularized linear regression, ridge, or elastic net slider
+      if (input$reg_model_type == "Linear Regression" && isTRUE(input$reg_use_regularization)) {
+        alpha_val <- switch(input$reg_penalty_type,
+          "lasso" = 1,
+          "ridge" = 0,
+          "elasticnet" = input$reg_regularization_alpha %||% 0.5
+        )
+      } else if (input$reg_model_type == "Ridge Regression") {
+        alpha_val <- 0
+      } else {
+        alpha_val <- input$reg_alpha %||% 0.5
+      }
+      
       model <- caret::train(
         x = Xmat, y = y_scaled,
         method = "glmnet",
@@ -7534,6 +7690,9 @@ server <- function(input, output, session) {
         )
       }
 
+      # Filter out features with 0 coefficients (these were selected out by regularization)
+      df <- df[abs(df$StandardizedCoef) > 1e-6, ]
+      
       df <- df[, c("Feature", "StandardizedCoef", "OriginalCoef")]
       df <- order_features(df, "StandardizedCoef")
       rownames(df) <- NULL
@@ -8208,6 +8367,7 @@ server <- function(input, output, session) {
             cell_group = "cell_group",
             abundance = "count",
             bimodal_mean_variability_association = FALSE,
+            inference_method = input$sccomp_inference_method,
             cores = input$sccomp_cores
           )
           message("sccomp_estimate completed successfully")
@@ -8378,6 +8538,7 @@ server <- function(input, output, session) {
 
       # Check if c_FDR column exists (from sccomp_test)
       if ("c_FDR" %in% colnames(test_res)) {
+        test_res <- test_res %>% dplyr::filter(!grepl("Intercept", parameter, ignore.case = TRUE))
         sig_clusters <- sum(test_res$c_FDR < 0.05, na.rm = TRUE)
         cat("Significant clusters (FDR < 0.05):", sig_clusters, "/", nrow(test_res), "\n")
       } else {
@@ -8388,6 +8549,7 @@ server <- function(input, output, session) {
 
     # If contrast test was run
     if (!is.null(s$test_result)) {
+      s$test_result <- s$test_result %>% dplyr::filter(!grepl("Intercept", parameter, ignore.case = TRUE))
       cat("\nContrast test performed\n")
       if ("c_FDR" %in% colnames(s$test_result)) {
         test_sig <- sum(s$test_result$c_FDR < 0.05, na.rm = TRUE)
@@ -9624,6 +9786,10 @@ server <- function(input, output, session) {
   output$surv_curve_plot <- renderPlot({
     s <- get_current_result()
     req(s)
+    
+    # Add explicit reactive dependencies for real-time color updates
+    low_risk_color <- input$surv_color_low_risk
+    high_risk_color <- input$surv_color_high_risk
 
     if (!is.null(s$error) && isTRUE(s$error)) {
       plot.new()
@@ -9680,7 +9846,7 @@ server <- function(input, output, session) {
       title = plot_title,
       subtitle = "P-value: Log-rank test (dichotomized groups)",
       legend.title = "Risk Group",
-      palette = c("#00BA38", "#F8766D"),
+      palette = c(low_risk_color %||% "#87CEEB", high_risk_color %||% "#FF69B4"),
       ggtheme = theme_minimal(base_size = 14)
     )
     
@@ -10393,7 +10559,7 @@ server <- function(input, output, session) {
               title = plot_title,
               subtitle = "P-value: Log-rank test (dichotomized groups)",
               legend.title = "Risk Group",
-              palette = c("#00BA38", "#F8766D"),
+              palette = c(input$surv_color_low_risk %||% "#87CEEB", input$surv_color_high_risk %||% "#FF69B4"),
               ggtheme = theme_minimal(base_size = 14)
             )
             
