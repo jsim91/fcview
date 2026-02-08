@@ -830,7 +830,13 @@ ui <- navbarPage(
           selected = "viridis"
         ),
         br(),
-        downloadButton("export_heatmap_pdf", "Export heatmap as PDF")
+        downloadButton("export_heatmap_pdf", "Export heatmap as PDF"),
+        hr(),
+        h4("Cluster Collections"),
+        helpText("Create collections of clusters to restrict testing in Testing, Categorical, and Continuous tabs."),
+        uiOutput("cluster_collections_ui"),
+        br(),
+        actionButton("add_collection", "Add Collection", icon = icon("plus"))
       ),
       column(
         9, 
@@ -862,6 +868,7 @@ ui <- navbarPage(
         ),
         pickerInput("group_var", "Categorical metadata", choices = NULL, options = list(`none-selected-text` = "None")),
         pickerInput("cont_var", "Continuous metadata", choices = NULL, options = list(`none-selected-text` = "None")),
+        uiOutput("test_collections_ui"),
         uiOutput("test_type_ui"),
         uiOutput("paired_test_indicator_ui"),
         selectInput("p_adj_method", "P‑value adjustment method",
@@ -896,6 +903,7 @@ ui <- navbarPage(
         3,
         pickerInput("cat_entity", "Entity", choices = c("Clusters", "Celltypes"), selected = "Clusters"),
         pickerInput("cat_group_var", "Categorical metadata", choices = NULL, options = list(`none-selected-text` = "None")),
+        uiOutput("cat_collections_ui"),
         uiOutput("cat_test_type_ui"),
         uiOutput("paired_cat_indicator_ui"),
         uiOutput("cat_pairing_check_ui"),
@@ -941,6 +949,7 @@ ui <- navbarPage(
         3,
         pickerInput("cont_entity", "Entity", choices = c("Clusters", "Celltypes"), selected = "Clusters"),
         pickerInput("cont_group_var", "Continuous metadata", choices = NULL, options = list(`none-selected-text` = "None")),
+        uiOutput("cont_collections_ui"),
         selectInput("cont_p_adj_method", "P‑value adjustment method",
           choices = c("BH", "bonferroni", "BY", "fdr"), selected = "BH"
         ),
@@ -1464,7 +1473,10 @@ server <- function(input, output, session) {
     subset_summary = NULL, # Summary of subsetting results
     subset_id = "000000000", # Unique ID for current subset - "000000000" means no subsetting applied
     # Cluster annotation engine
-    celltype_annotations = list() # List of celltype -> cluster assignments
+    celltype_annotations = list(), # List of celltype -> cluster assignments
+    # Cluster collections
+    cluster_collections = list(), # List of collection_name -> cluster vector
+    cluster_collections_cached = list() # Cached collections for use in other tabs
   )
   cat_plot_cache <- reactiveVal(NULL)
   cont_plot_cache <- reactiveVal(NULL)
@@ -1476,6 +1488,7 @@ server <- function(input, output, session) {
   reg_state <- reactiveVal(NULL)
   surv_state <- reactiveVal(NULL)
   celltype_id_counter <- reactiveVal(0) # Counter for unique celltype IDs
+  collection_id_counter <- reactiveVal(0) # Counter for unique collection IDs
   # rv$log <- reactiveVal(character())
 
   # Disable tabs at startup
@@ -2948,28 +2961,8 @@ server <- function(input, output, session) {
     })
   })
   
-  # Update annotations in real-time as user makes changes
-  observe({
-    if (length(rv$celltype_annotations) == 0) return()
-    
-    lapply(names(rv$celltype_annotations), function(ann_id) {
-      # Update name
-      observeEvent(input[[paste0("celltype_name_", ann_id)]], {
-        if (!is.null(rv$celltype_annotations[[ann_id]])) {
-          rv$celltype_annotations[[ann_id]]$name <- input[[paste0("celltype_name_", ann_id)]]
-        }
-      }, ignoreInit = TRUE)
-      
-      # Update cluster assignments
-      observeEvent(input[[paste0("celltype_clusters_", ann_id)]], {
-        if (!is.null(rv$celltype_annotations[[ann_id]])) {
-          rv$celltype_annotations[[ann_id]]$clusters <- input[[paste0("celltype_clusters_", ann_id)]]
-        }
-      }, ignoreInit = TRUE)
-    })
-  })
-  
   # Update dropdown choices to prevent duplicate cluster assignments
+  # This observer reads current input values and updates choices for OTHER annotations
   observe({
     if (length(rv$celltype_annotations) == 0) return()
     
@@ -2978,7 +2971,7 @@ server <- function(input, output, session) {
     
     # For each annotation, update its dropdown choices
     lapply(ann_ids, function(current_ann_id) {
-      # Get clusters selected in OTHER annotations
+      # Get clusters selected in OTHER annotations by reading input values directly
       clusters_selected_elsewhere <- character(0)
       for (other_ann_id in setdiff(ann_ids, current_ann_id)) {
         selected <- input[[paste0("celltype_clusters_", other_ann_id)]]
@@ -3008,6 +3001,20 @@ server <- function(input, output, session) {
     if (length(rv$celltype_annotations) == 0) {
       showNotification("No cell type annotations defined.", type = "warning")
       return()
+    }
+    
+    # First, update rv$celltype_annotations with current input values
+    ann_ids <- names(rv$celltype_annotations)
+    for (ann_id in ann_ids) {
+      name_input <- input[[paste0("celltype_name_", ann_id)]]
+      clusters_input <- input[[paste0("celltype_clusters_", ann_id)]]
+      
+      if (!is.null(name_input) && !is.null(rv$celltype_annotations[[ann_id]])) {
+        rv$celltype_annotations[[ann_id]]$name <- name_input
+      }
+      if (!is.null(clusters_input) && !is.null(rv$celltype_annotations[[ann_id]])) {
+        rv$celltype_annotations[[ann_id]]$clusters <- clusters_input
+      }
     }
     
     # Validate: check for empty names
@@ -3063,6 +3070,116 @@ server <- function(input, output, session) {
     } else {
       rv$cluster_map <- NULL
       showNotification("No cluster assignments made.", type = "warning")
+    }
+  })
+
+  # ========== CLUSTER COLLECTIONS ==========
+  
+  output$cluster_collections_ui <- renderUI({
+    if (length(rv$cluster_collections) == 0) {
+      return(tags$p(style = "color: #999; font-style: italic;", "Click 'Add Collection' to create cluster collections."))
+    }
+    
+    clusters <- available_clusters()
+    if (length(clusters) == 0) {
+      return(tags$p(style = "color: #dc3545;", "No clusters available. Load data with cluster assignments."))
+    }
+    
+    coll_ids <- names(rv$cluster_collections)
+    
+    collection_uis <- lapply(coll_ids, function(coll_id) {
+      coll <- rv$cluster_collections[[coll_id]]
+      
+      tags$div(
+        id = paste0("collection_container_", coll_id),
+        style = "border: 1px solid #ddd; padding: 8px; margin-bottom: 8px; border-radius: 4px; background-color: #f9f9f9;",
+        fluidRow(
+          column(
+            4,
+            textInput(paste0("collection_name_", coll_id), "Collection Name", value = coll$name, placeholder = "e.g., T cell subsets")
+          ),
+          column(
+            7,
+            pickerInput(
+              paste0("collection_clusters_", coll_id),
+              "Clusters",
+              choices = as.character(clusters),
+              selected = coll$clusters,
+              multiple = TRUE,
+              options = list(
+                `actions-box` = TRUE,
+                `selected-text-format` = "count > 3",
+                `count-selected-text` = "{0} clusters"
+              )
+            )
+          ),
+          column(
+            1,
+            br(),
+            actionButton(paste0("remove_collection_", coll_id), "",
+              icon = icon("trash"), class = "btn-danger btn-sm",
+              style = "margin-top: 5px;"
+            )
+          )
+        )
+      )
+    })
+    
+    tagList(collection_uis)
+  })
+  
+  # Add collection button
+  observeEvent(input$add_collection, {
+    clusters <- available_clusters()
+    if (length(clusters) == 0) {
+      showNotification("No clusters available. Load data with cluster assignments first.", type = "error")
+      return()
+    }
+    
+    new_id <- collection_id_counter() + 1
+    collection_id_counter(new_id)
+    
+    rv$cluster_collections[[as.character(new_id)]] <- list(
+      id = new_id,
+      name = paste0("Collection ", new_id),
+      clusters = character(0)
+    )
+  })
+  
+  # Remove collection buttons (dynamic observers)
+  observe({
+    if (length(rv$cluster_collections) == 0) return()
+    
+    lapply(names(rv$cluster_collections), function(coll_id) {
+      observeEvent(input[[paste0("remove_collection_", coll_id)]],
+        {
+          rv$cluster_collections[[coll_id]] <- NULL
+        },
+        ignoreInit = TRUE
+      )
+    })
+  })
+  
+  # Cache collections when user navigates away from Annotation tab
+  # Read current input values to capture any edits made by user
+  observeEvent(input$main_tab, {
+    if (input$main_tab != "Annotation") {
+      # Update rv$cluster_collections with current input values before caching
+      if (length(rv$cluster_collections) > 0) {
+        coll_ids <- names(rv$cluster_collections)
+        for (coll_id in coll_ids) {
+          name_input <- input[[paste0("collection_name_", coll_id)]]
+          clusters_input <- input[[paste0("collection_clusters_", coll_id)]]
+          
+          if (!is.null(name_input) && !is.null(rv$cluster_collections[[coll_id]])) {
+            rv$cluster_collections[[coll_id]]$name <- name_input
+          }
+          if (!is.null(clusters_input) && !is.null(rv$cluster_collections[[coll_id]])) {
+            rv$cluster_collections[[coll_id]]$clusters <- clusters_input
+          }
+        }
+      }
+      rv$cluster_collections_cached <- rv$cluster_collections
     }
   })
 
@@ -3188,6 +3305,75 @@ server <- function(input, output, session) {
         selected = "Pairwise Wilcoxon"
       )
     }
+  })
+  
+  # Render collection filter UI for Testing tab
+  output$test_collections_ui <- renderUI({
+    collections <- rv$cluster_collections_cached
+    if (length(collections) == 0) {
+      return(NULL)
+    }
+    
+    coll_choices <- names(collections)
+    names(coll_choices) <- sapply(collections, function(x) x$name)
+    
+    pickerInput(
+      "test_collections",
+      "Filter by collections (optional)",
+      choices = coll_choices,
+      selected = character(0),
+      multiple = TRUE,
+      options = list(
+        `none-selected-text` = "All clusters/celltypes",
+        `actions-box` = TRUE
+      )
+    )
+  })
+  
+  # Render collection filter UI for Categorical tab
+  output$cat_collections_ui <- renderUI({
+    collections <- rv$cluster_collections_cached
+    if (length(collections) == 0) {
+      return(NULL)
+    }
+    
+    coll_choices <- names(collections)
+    names(coll_choices) <- sapply(collections, function(x) x$name)
+    
+    pickerInput(
+      "cat_collections",
+      "Filter by collections (optional)",
+      choices = coll_choices,
+      selected = character(0),
+      multiple = TRUE,
+      options = list(
+        `none-selected-text` = "All clusters/celltypes",
+        `actions-box` = TRUE
+      )
+    )
+  })
+  
+  # Render collection filter UI for Continuous tab
+  output$cont_collections_ui <- renderUI({
+    collections <- rv$cluster_collections_cached
+    if (length(collections) == 0) {
+      return(NULL)
+    }
+    
+    coll_choices <- names(collections)
+    names(coll_choices) <- sapply(collections, function(x) x$name)
+    
+    pickerInput(
+      "cont_collections",
+      "Filter by collections (optional)",
+      choices = coll_choices,
+      selected = character(0),
+      multiple = TRUE,
+      options = list(
+        `none-selected-text` = "All clusters/celltypes",
+        `actions-box` = TRUE
+      )
+    )
   })
 
   # Render test type options for Categorical tab based on pairing feasibility
@@ -3590,6 +3776,99 @@ server <- function(input, output, session) {
     contentType = "application/pdf"
   )
 
+  # ========== HELPER: GET COLLECTIONS INFO ==========
+  
+  # Helper function to get cluster->collections mapping
+  get_cluster_collections_map <- function() {
+    collections <- rv$cluster_collections_cached
+    if (length(collections) == 0) {
+      return(list())
+    }
+    
+    # Build map: cluster -> list of collection names
+    cluster_map <- list()
+    for (coll_id in names(collections)) {
+      coll <- collections[[coll_id]]
+      coll_name <- coll$name
+      for (cl in coll$clusters) {
+        if (is.null(cluster_map[[cl]])) {
+          cluster_map[[cl]] <- character(0)
+        }
+        cluster_map[[cl]] <- c(cluster_map[[cl]], coll_name)
+      }
+    }
+    cluster_map
+  }
+  
+  # Helper function to filter entities (clusters or celltypes) by selected collections
+  filter_entities_by_collections <- function(entities, selected_coll_ids, entity_type = "Clusters") {
+    if (is.null(selected_coll_ids) || length(selected_coll_ids) == 0) {
+      return(entities) # No filtering, return all
+    }
+    
+    collections <- rv$cluster_collections_cached
+    if (length(collections) == 0) {
+      return(entities)
+    }
+    
+    # Get all clusters from selected collections
+    selected_clusters <- character(0)
+    for (coll_id in selected_coll_ids) {
+      coll_id_char <- as.character(coll_id)
+      if (!is.null(collections[[coll_id_char]])) {
+        selected_clusters <- c(selected_clusters, collections[[coll_id_char]]$clusters)
+      }
+    }
+    selected_clusters <- unique(selected_clusters)
+    
+    if (length(selected_clusters) == 0) {
+      showNotification(paste0("No clusters found in selected collection(s). Collection IDs: ", paste(selected_coll_ids, collapse = ", ")), type = "warning")
+      return(character(0)) # No clusters in selected collections
+    }
+    
+    if (entity_type == "Celltypes") {
+      # Filter celltypes: only include celltypes that have at least one cluster in selected collections
+      if (is.null(rv$cluster_map)) {
+        return(entities)
+      }
+      
+      # Get celltypes that have clusters in selected collections
+      # cluster_map$cluster is integer, selected_clusters is character
+      cm <- rv$cluster_map
+      selected_clusters_int <- suppressWarnings(as.integer(selected_clusters))
+      selected_clusters_int <- selected_clusters_int[!is.na(selected_clusters_int)]
+      
+      if (length(selected_clusters_int) == 0) {
+        showNotification("Could not convert collection clusters to integers for celltype filtering", type = "warning")
+        return(character(0))
+      }
+      
+      cm_filtered <- cm[cm$cluster %in% selected_clusters_int, ]
+      valid_celltypes <- unique(cm_filtered$celltype)
+      
+      result <- intersect(as.character(entities), as.character(valid_celltypes))
+      if (length(result) == 0) {
+        showNotification(paste0("No celltypes match the selected collection(s). Selected clusters: ", paste(selected_clusters, collapse = ", ")), type = "warning")
+      }
+      return(result)
+    } else {
+      # Filter clusters: only include clusters that are in selected collections
+      # Ensure both sides are character and handle potential whitespace/formatting issues
+      entities_char <- trimws(as.character(entities))
+      selected_char <- trimws(as.character(selected_clusters))
+      
+      result <- intersect(entities_char, selected_char)
+      if (length(result) == 0) {
+        showNotification(
+          paste0("No clusters match. Available: [", paste(head(entities_char, 5), collapse = ", "), 
+                 "...] vs Collection: [", paste(selected_char, collapse = ", "), "]"),
+          type = "warning", duration = 10
+        )
+      }
+      return(result)
+    }
+  }
+
   # Store results + adj_col name from the run
   run_tests <- eventReactive(input$run_test, {
     req(rv$meta_sample, rv$abundance_sample)
@@ -3693,6 +3972,14 @@ server <- function(input, output, session) {
     # Long format
     abund_long <- merged %>%
       tidyr::pivot_longer(cols = colnames(abund), names_to = "entity", values_to = "freq")
+    
+    # Filter entities by selected collections
+    selected_coll_ids <- input$test_collections
+    if (!is.null(selected_coll_ids) && length(selected_coll_ids) > 0) {
+      all_entities <- unique(abund_long$entity)
+      filtered_entities <- filter_entities_by_collections(all_entities, selected_coll_ids, test_entity_run)
+      abund_long <- abund_long[abund_long$entity %in% filtered_entities, ]
+    }
 
     # Determine if we're using paired tests - check both if pairing is enabled AND feasible
     use_pairing <- FALSE
@@ -3914,6 +4201,44 @@ server <- function(input, output, session) {
     if (nrow(res) && "p" %in% names(res) && nzchar(p_adj_method_run)) {
       adj_col <- paste0(tolower(p_adj_method_run), "_padj")
       res[[adj_col]] <- p.adjust(res$p, method = p_adj_method_run)
+    }
+    
+    # Add collection column
+    if (nrow(res)) {
+      cluster_coll_map <- get_cluster_collections_map()
+      
+      # Map entity -> clusters (if celltypes) -> collections
+      res$collection <- sapply(res$entity, function(ent) {
+        if (test_entity_run == "Celltypes") {
+          # Get clusters for this celltype
+          if (!is.null(rv$cluster_map)) {
+            cm <- rv$cluster_map
+            entity_clusters <- cm$cluster[cm$celltype == ent]
+            # Get all collections for these clusters
+            all_colls <- character(0)
+            for (cl in entity_clusters) {
+              cl_str <- as.character(cl)
+              if (!is.null(cluster_coll_map[[cl_str]])) {
+                all_colls <- c(all_colls, cluster_coll_map[[cl_str]])
+              }
+            }
+            all_colls <- unique(all_colls)
+            if (length(all_colls) > 0) {
+              return(paste(all_colls, collapse = ", "))
+            }
+          }
+        } else {
+          # Clusters - direct lookup
+          ent_str <- as.character(ent)
+          if (!is.null(cluster_coll_map[[ent_str]])) {
+            colls <- cluster_coll_map[[ent_str]]
+            if (length(colls) > 0) {
+              return(paste(colls, collapse = ", "))
+            }
+          }
+        }
+        return(NA_character_)
+      })
     }
 
     list(df = res, adj_col = adj_col)
@@ -4272,6 +4597,14 @@ server <- function(input, output, session) {
 
     # Filter NA frequencies first (before any other operations)
     abund_long <- abund_long[!is.na(abund_long$freq), ]
+    
+    # Filter entities by selected collections
+    selected_coll_ids <- input$cat_collections
+    if (!is.null(selected_coll_ids) && length(selected_coll_ids) > 0) {
+      all_entities <- unique(abund_long$entity)
+      filtered_entities <- filter_entities_by_collections(all_entities, selected_coll_ids, input$cat_entity)
+      abund_long <- abund_long[abund_long$entity %in% filtered_entities, ]
+    }
 
     # Clean entity names once (more efficient than gsub on every row)
     if (any(grepl("\n", abund_long$entity, fixed = TRUE))) {
@@ -4632,6 +4965,10 @@ server <- function(input, output, session) {
       facet_cols <- cp$facet_cols
       plot_type <- cp$plot_type %||% input$cat_plot_type %||% "box"
       point_mode <- cp$point_mode %||% input$cat_points %||% "draw"
+      
+      # Cap facet_cols at the number of unique entities to prevent width skewing
+      n_entities <- length(unique(abund_long$entity))
+      facet_cols <- min(facet_cols, n_entities)
 
       # Validate grouping variable
       if (is.null(group_var) || !nzchar(group_var) || !(group_var %in% colnames(abund_long))) {
@@ -4943,6 +5280,8 @@ server <- function(input, output, session) {
       n_facets <- length(unique(gg$data$entity))
       ncol_facets <- cp$facet_cols
       if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+      # Cap at actual number of entities to prevent stretching
+      ncol_facets <- min(ncol_facets, n_facets)
       nrow_facets <- ceiling(n_facets / ncol_facets)
 
       # Increase height for pairwise comparisons to accommodate brackets
@@ -4956,8 +5295,11 @@ server <- function(input, output, session) {
       if (is.null(gg) || is.null(cp)) {
         return(400)
       }
+      n_facets <- length(unique(gg$data$entity))
       ncol_facets <- cp$facet_cols
       if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+      # Cap at actual number of entities to prevent stretching
+      ncol_facets <- min(ncol_facets, n_facets)
 
       # Increase width for pairwise comparisons to accommodate annotations
       is_pairwise <- !is.null(cp$test_type) && cp$test_type == "Pairwise Wilcoxon"
@@ -5042,6 +5384,14 @@ server <- function(input, output, session) {
       dplyr::mutate(entity = gsub("\\n", " ", entity)) %>%
       dplyr::filter(!is.na(freq))
 
+    # Filter by cluster collections if selected
+    selected_coll_ids <- input$cont_collections
+    if (!is.null(selected_coll_ids) && length(selected_coll_ids) > 0) {
+      all_entities <- unique(abund_long$entity)
+      filtered_entities <- filter_entities_by_collections(all_entities, selected_coll_ids, input$cont_entity)
+      abund_long <- abund_long[abund_long$entity %in% filtered_entities, ]
+    }
+
     # Capture inputs at Generate time
     cont_var <- input$cont_group_var
     transpose_flag <- isTRUE(input$cont_transpose)
@@ -5117,6 +5467,10 @@ server <- function(input, output, session) {
       use_adj_p <- cp$use_adj_p
       facet_cols <- cp$facet_cols
       transpose_flag <- cp$transpose %||% FALSE
+      
+      # Cap facet_cols at the number of unique entities to prevent width skewing
+      n_entities <- length(unique(abund_long$entity))
+      facet_cols <- min(facet_cols, n_entities)
 
       # Validate continuous variable
       if (is.null(cont_var) || !nzchar(cont_var) || !(cont_var %in% colnames(abund_long))) {
@@ -5204,6 +5558,8 @@ server <- function(input, output, session) {
       n_facets <- length(unique(gg$data$entity))
       ncol_facets <- cp$facet_cols
       if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+      # Cap at actual number of entities to prevent stretching
+      ncol_facets <- min(ncol_facets, n_facets)
       nrow_facets <- ceiling(n_facets / ncol_facets)
       200 * nrow_facets
     },
@@ -5213,8 +5569,11 @@ server <- function(input, output, session) {
       if (is.null(gg) || is.null(cp)) {
         return(400)
       }
+      n_facets <- length(unique(gg$data$entity))
       ncol_facets <- cp$facet_cols
       if (is.na(ncol_facets) || ncol_facets < 1) ncol_facets <- 1
+      # Cap at actual number of entities to prevent stretching
+      ncol_facets <- min(ncol_facets, n_facets)
       225 * ncol_facets
     }
   )
